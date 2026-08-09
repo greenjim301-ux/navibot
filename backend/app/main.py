@@ -29,6 +29,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_vary_origin(request, call_next):
+    """给所有响应补 Vary: Origin。
+
+    allow_origins=["*"] 时 Starlette 的 CORSMiddleware 走"简单模式", 只加
+    Access-Control-Allow-Origin, 不加 Vary —— 于是同一个 URL 的两份响应(带 Origin
+    的有 CORS 头, 不带的没有)在浏览器缓存里无法区分。实际后果: 地图列表页用普通
+    <img> 加载过 topview.png 之后, 俯视图里 Konva 以 CORS 模式请求同一个 URL 会
+    命中那份没有 CORS 头的缓存, 直接报 "No 'Access-Control-Allow-Origin' header
+    is present", 而服务端其实一直在正常发头。
+
+    前端那边也已经统一加了 crossOrigin, 两条都做是因为这个坑太隐蔽: 以后任何人
+    新写一个不带 crossOrigin 的 <img> 都会把缓存再污染一次。
+    """
+    response = await call_next(request)
+    vary = response.headers.get("vary")
+    if not vary:
+        response.headers["vary"] = "Origin"
+    elif "origin" not in vary.lower():
+        response.headers["vary"] = f"{vary}, Origin"
+    return response
+
 ws_manager = WebSocketManager()
 route_manager: RouteManager | None = None
 ros_bridge: RosBridge | None = None

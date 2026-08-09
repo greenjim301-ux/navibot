@@ -164,9 +164,15 @@ function MapCard({
     <Card className="gap-0 overflow-hidden py-0">
       <div className="relative flex h-32 items-center justify-center overflow-hidden bg-muted">
         {ready ? (
+          // crossOrigin 必须加, 而且必须和 TopView 里 useImage(url, "anonymous") 一致。
+          // 这张缩略图和俯视图用的是同一个 URL: 这里不带 crossOrigin 的话, 浏览器会
+          // 把一份"没有 CORS 头"的响应放进缓存, 之后 Konva 以 CORS 模式请求同一个
+          // URL 时命中这份缓存, 就报 "No 'Access-Control-Allow-Origin' header is
+          // present" —— 服务端明明发了头也没用, 因为压根没再发请求。
           <img
             src={mapAssetUrl(map.name, "topview.png")}
             alt={`${map.name} 俯视图`}
+            crossOrigin="anonymous"
             className="h-full w-full object-contain"
           />
         ) : (
