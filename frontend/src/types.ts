@@ -40,6 +40,13 @@ export interface NavStatus {
   updated_at: number;
 }
 
+/** 机器狗实际走过的一个位置 (odom 系, z 是机体高度) */
+export interface TrailPoint {
+  x: number;
+  y: number;
+  z: number;
+}
+
 export interface PathPoint {
   x: number;
   y: number;

@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Eye, Save } from "lucide-react";
-import { createRoute, listMaps, planPath } from "../api";
+import { Save } from "lucide-react";
+import { createRoute, listMaps } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
 import { PointCloudView } from "../components/PointCloudView";
-import type { MapInfo, PathSegment, Waypoint } from "../types";
+import type { MapInfo, Waypoint } from "../types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -21,7 +21,6 @@ export default function RouteCreatePage() {
   const [maps, setMaps] = useState<MapInfo[] | null>(null);
   const [mapName, setMapName] = useState<string>("");
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
-  const [referencePath, setReferencePath] = useState<PathSegment[] | null>(null);
   const [routeName, setRouteName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,32 +42,10 @@ export default function RouteCreatePage() {
   // 换地图时之前画的点就没意义了(坐标只在原地图里成立)
   useEffect(() => {
     setWaypoints([]);
-    setReferencePath(null);
     setNotice(null);
   }, [mapName]);
 
-  const canPreview = waypoints.length >= 2;
   const canSave = waypoints.length >= 1 && routeName.trim().length > 0;
-
-  async function handlePreview() {
-    if (!canPreview) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const segments = await planPath(mapName, waypoints);
-      setReferencePath(segments);
-      const bad = segments.filter((s) => !s.planned).length;
-      setNotice(
-        bad > 0
-          ? `有 ${bad} 段找不到连通路径，已用橙色虚线直连表示，那段不是可行路线。`
-          : null,
-      );
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function handleSave() {
     if (!canSave) return;
@@ -92,7 +69,7 @@ export default function RouteCreatePage() {
         backTo="/routes"
         backLabel="路线管理"
         title="新增路线"
-        description="选地图 → 在俯视图点选导航点 → 查看路线 → 命名保存"
+        description="选地图 → 在俯视图点选导航点 → 命名保存"
       />
 
       {error && (
@@ -138,10 +115,6 @@ export default function RouteCreatePage() {
                 <span className="mr-2 text-sm text-muted-foreground">
                   已选 <strong className="text-foreground">{waypoints.length}</strong> 个导航点
                 </span>
-                <Button variant="outline" disabled={!canPreview || busy} onClick={handlePreview}>
-                  <Eye />
-                  查看路线
-                </Button>
                 <Button disabled={!canSave || busy} onClick={handleSave}>
                   <Save />
                   保存
@@ -149,7 +122,7 @@ export default function RouteCreatePage() {
                 <Button
                   variant="ghost"
                   disabled={waypoints.length === 0 || busy}
-                  onClick={() => { setWaypoints([]); setReferencePath(null); setNotice(null); }}
+                  onClick={() => { setWaypoints([]); setNotice(null); }}
                 >
                   清空
                 </Button>
@@ -168,18 +141,16 @@ export default function RouteCreatePage() {
               <section>
                 <h2 className="mb-2 text-sm font-medium text-muted-foreground">
                   俯视图（左键添加导航点，右键点圆点删除）
-                  {referencePath && "　·　青色实线为参考路线"}
                 </h2>
                 <TopView
-              showStandable
+                  showStandable
                   mapName={mapName}
                   meta={info.topview_meta}
                   waypoints={waypoints}
-                  onChangeWaypoints={(wps) => { setWaypoints(wps); setReferencePath(null); }}
+                  onChangeWaypoints={setWaypoints}
                   editable
                   status={null}
                   showSafety={false}
-                  referencePath={referencePath}
                   maxWidth={1000}
                   maxHeight={480}
                 />
@@ -187,14 +158,13 @@ export default function RouteCreatePage() {
 
               <section>
                 <h2 className="mb-2 text-sm font-medium text-muted-foreground">
-                  3D 预览{referencePath ? "（青色实线为参考路线）" : "（点上方「查看路线」生成参考路线）"}
+                  3D 预览
                 </h2>
                 <div className="h-[520px] w-full overflow-hidden rounded-xl border">
                   <PointCloudView
                     mapName={mapName}
                     meta={info.topview_meta}
                     waypoints={waypoints}
-                    referencePath={referencePath}
                   />
                 </div>
               </section>

@@ -6,15 +6,16 @@ import { Line2 } from "three/examples/jsm/lines/Line2.js";
 import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { mapAssetUrl } from "../api";
-import type { NavStatus, PathSegment, TopviewMeta, Waypoint } from "../types";
+import type { NavStatus, TopviewMeta, TrailPoint, Waypoint } from "../types";
 
 interface Props {
   mapName: string;
   meta: TopviewMeta;
   waypoints?: Waypoint[];
   status?: NavStatus | null;
-  /** 基于障碍栅格算出来的"大概"参考路线 (世界坐标折线), 仅供 3D 预览展示 */
-  referencePath?: PathSegment[] | null;
+  /** 机器狗实际走过的轨迹 (世界坐标, 含 z)。由页面按位姿累积后传进来 —— 这里
+   *  只负责画, 不持有状态, 页面才知道什么时候该清空(比如开始新一轮导航)。 */
+  trail?: TrailPoint[] | null;
   /** 是否提供"镜头跟随机器狗"开关 (预览页没有实时位姿, 不需要) */
   enableFollow?: boolean;
 }
@@ -36,14 +37,14 @@ function parsePCW1(buf: ArrayBuffer) {
 }
 
 export function PointCloudView({
-  mapName, meta, waypoints = [], status = null, referencePath = null, enableFollow = false,
+  mapName, meta, waypoints = [], status = null, trail = null, enableFollow = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const markersGroupRef = useRef<THREE.Group | null>(null);
   const robotMeshRef = useRef<THREE.Mesh | null>(null);
   const pathGroupRef = useRef<THREE.Group | null>(null);
   const pathMarkersRef = useRef<THREE.Group | null>(null);
-  const pathMaterialsRef = useRef<{ planned: LineMaterial; unplanned: LineMaterial } | null>(null);
+  const pathMaterialsRef = useRef<LineMaterial | null>(null);
 
   const [following, setFollowing] = useState(enableFollow);
   // 渲染循环里要读这两个值, 用 ref 拿最新值, 避免它们变化就重建整个场景
@@ -124,20 +125,13 @@ export function PointCloudView({
     scene.add(robotMesh);
     robotMeshRef.current = robotMesh;
 
-    // 参考路线用 Line2 (fat line) 画, 普通 THREE.Line 的 LineBasicMaterial 在大多数
+    // 轨迹用 Line2 (fat line) 画。普通 THREE.Line 的 LineBasicMaterial 在大多数
     // 平台(含 Chrome)上根本不支持线宽, 只会渲染成 1px 细线, 在点云里几乎看不见。
-    // 两套材质: 青色实线 = 真的绕开障碍规划出来的; 橙色虚线 = 那一段不连通,
-    // 只能直连(会穿墙), 必须视觉上区分开, 不能让用户以为那是能走的路。
-    const plannedMaterial = new LineMaterial({
-      color: 0x22d3ee, linewidth: 1.75, transparent: true, opacity: 0.95, depthTest: false,
+    const trailMaterial = new LineMaterial({
+      color: 0x22c55e, linewidth: 2.0, transparent: true, opacity: 0.95, depthTest: false,
     });
-    const unplannedMaterial = new LineMaterial({
-      color: 0xf59e0b, linewidth: 1.75, transparent: true, opacity: 0.9, depthTest: false,
-      dashed: true, dashSize: 0.25, gapSize: 0.2,
-    });
-    plannedMaterial.resolution.set(width, height);
-    unplannedMaterial.resolution.set(width, height);
-    pathMaterialsRef.current = { planned: plannedMaterial, unplanned: unplannedMaterial };
+    trailMaterial.resolution.set(width, height);
+    pathMaterialsRef.current = trailMaterial;
 
     const pathGroup = new THREE.Group();
     scene.add(pathGroup);
@@ -195,8 +189,7 @@ export function PointCloudView({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
-      plannedMaterial.resolution.set(w, h);
-      unplannedMaterial.resolution.set(w, h);
+      trailMaterial.resolution.set(w, h);
     }
     window.addEventListener("resize", handleResize);
 
@@ -208,8 +201,7 @@ export function PointCloudView({
       points?.geometry.dispose();
       (points?.material as THREE.Material | undefined)?.dispose();
       pathGroup.children.forEach((c) => (c as Line2).geometry.dispose());
-      plannedMaterial.dispose();
-      unplannedMaterial.dispose();
+      trailMaterial.dispose();
       renderer.dispose();
       container.removeChild(renderer.domElement);
     };
@@ -254,8 +246,8 @@ export function PointCloudView({
   useEffect(() => {
     const group = pathGroupRef.current;
     const markers = pathMarkersRef.current;
-    const materials = pathMaterialsRef.current;
-    if (!group || !markers || !materials) return;
+    const material = pathMaterialsRef.current;
+    if (!group || !markers || !material) return;
 
     group.children.forEach((c) => (c as Line2).geometry.dispose());
     group.clear();
@@ -266,37 +258,19 @@ export function PointCloudView({
     });
     markers.clear();
 
-    if (!referencePath || referencePath.length === 0) return;
+    if (!trail || trail.length < 2) return;
 
-    // 每个点用它自己的地面高度抬 0.2m 画。用统一的 meta.floor_z 会让整条楼梯段
-    // 画成一条平线, 看着像穿楼板 —— floor_z 现在只是"主平面高度", 不再代表整图。
-    // p.z 为 null 表示该点不在认证可站立区(高度未知), 退回 floor_z 兜底。
-    const LIFT = 0.2;
-    const zOf = (p: { z: number | null }) => (p.z ?? meta.floor_z) + LIFT;
-
-    referencePath.forEach((seg) => {
-      if (seg.points.length < 2) return;
-      const flat: number[] = [];
-      seg.points.forEach((p) => flat.push(p.x, p.y, zOf(p)));
-
-      const geometry = new LineGeometry();
-      geometry.setPositions(flat);
-      const line = new Line2(geometry, seg.planned ? materials.planned : materials.unplanned);
-      line.computeLineDistances();
-      line.renderOrder = 10;
-      group.add(line);
-
-      // 转折点小球, 线本身不好分辨时也能看出轨迹走向
-      seg.points.forEach((p) => {
-        const dot = new THREE.Mesh(
-          new THREE.SphereGeometry(0.045, 10, 10),
-          new THREE.MeshBasicMaterial({ color: seg.planned ? 0x22d3ee : 0xf59e0b }),
-        );
-        dot.position.set(p.x, p.y, zOf(p));
-        markers.add(dot);
-      });
-    });
-  }, [referencePath, meta.floor_z]);
+    // 轨迹点带各自的 z (odom 系机体高度), 直接用, 不做任何抬升 —— 它就是机器狗
+    // 机体走过的位置。上下楼梯时这条线会自然地爬升。
+    const flat: number[] = [];
+    trail.forEach((p) => flat.push(p.x, p.y, p.z));
+    const geometry = new LineGeometry();
+    geometry.setPositions(flat);
+    const line = new Line2(geometry, material);
+    line.computeLineDistances();
+    line.renderOrder = 10;
+    group.add(line);
+  }, [trail]);
 
   const hasPose = Boolean(status?.robot_pose);
 

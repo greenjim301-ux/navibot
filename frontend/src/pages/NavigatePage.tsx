@@ -1,13 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { MapPin, Play, Pause, Square, Snowflake, TriangleAlert } from "lucide-react";
-import { cancelRoute, estop, getRoute, pauseRoute, planPath, resumeRoute, submitRoute } from "../api";
+import { MapPin, Play, Pause, Square, TriangleAlert } from "lucide-react";
+import { cancelRoute, getRoute, pauseRoute, resumeRoute, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
 import { PointCloudView } from "../components/PointCloudView";
 import { PageHeader } from "../components/PageHeader";
-import type { PathSegment, Waypoint } from "../types";
+import type { TrailPoint, Waypoint } from "../types";
 import { poseUnreliable } from "../types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,6 +38,12 @@ const STATE_VARIANT: Record<string, "secondary" | "default" | "outline" | "destr
   estopped: "destructive",
 };
 
+// 轨迹采样阈值: odom 是 200Hz 的, 每帧都记会瞬间堆出几万个点且肉眼看不出区别。
+// 按位移采样, 0.05m 一个点在 3D 里已经是平滑曲线了。
+const TRAIL_MIN_STEP_M = 0.05;
+// 轨迹点数上限, 防止长时间挂着页面把内存吃掉。超了从头丢。
+const TRAIL_MAX_POINTS = 5000;
+
 const DIALOG_TOPVIEW_WIDTH = 760;
 const DIALOG_TOPVIEW_HEIGHT = 500;
 
@@ -52,8 +58,9 @@ export default function NavigatePage() {
   const { info, error: metaError, loading } = useMapInfo(name);
 
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
-  const [referencePath, setReferencePath] = useState<PathSegment[] | null>(null);
-  const [pathWarning, setPathWarning] = useState<string | null>(null);
+  // 机器狗实际走过的轨迹。只在这一页累积: 换页面/刷新就没了, 因为它表达的是
+  // "这一趟走了哪儿", 不是需要持久化的数据。
+  const [trail, setTrail] = useState<TrailPoint[]>([]);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -80,15 +87,20 @@ export default function NavigatePage() {
       .catch((e) => setActionError(String(e)));
   }, [savedRouteId]);
 
-  // 导航跑完了, 那条参考路线就是过期信息(机器狗已经走完了), 清掉免得留在图上
-  // 让人以为还有任务在进行。只在状态真正变成 succeeded 的那一次触发, 所以之后
-  // 重新"设置路线"画出来的新路线不会被误清。
+  // 累积机器狗实际走过的位置。一直记(不限于执行中), 这样跑完之后那条线还留在
+  // 图上能回看; 开始下一趟时由 handleStart 清空。
+  const pose = status?.robot_pose;
   useEffect(() => {
-    if (state === "succeeded") {
-      setReferencePath(null);
-      setPathWarning(null);
-    }
-  }, [state]);
+    if (!pose) return;
+    setTrail((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && Math.hypot(pose.x - last.x, pose.y - last.y, pose.z - last.z) < TRAIL_MIN_STEP_M) {
+        return prev;
+      }
+      const next = [...prev, { x: pose.x, y: pose.y, z: pose.z }];
+      return next.length > TRAIL_MAX_POINTS ? next.slice(next.length - TRAIL_MAX_POINTS) : next;
+    });
+  }, [pose?.x, pose?.y, pose?.z]);
 
   async function run<T>(fn: () => Promise<T>) {
     setBusy(true);
@@ -102,47 +114,21 @@ export default function NavigatePage() {
     }
   }
 
-  /** 起点用机器狗当前位置, 这样只设一个导航点也能算出路线 */
-  async function computeReferencePath(wps: Waypoint[]): Promise<void> {
-    const points = status?.robot_pose
-      ? [{ x: status.robot_pose.x, y: status.robot_pose.y, yaw: status.robot_pose.yaw }, ...wps]
-      : wps;
-    if (points.length < 2) {
-      setReferencePath(null);
-      setPathWarning(null);
-      return;
-    }
-    const segments = await planPath(name, points);
-    setReferencePath(segments);
-    const bad = segments.filter((s) => !s.planned).length;
-    setPathWarning(
-      bad > 0
-        ? `有 ${bad} 段找不到可走的路径，已用橙色虚线直连表示——那段不是可行路线。` +
-          `常见原因：门口没扫全、房间未连通；如果这一段要上下楼梯，还可能是`+
-          `楼梯两端之间没有连续的可站立区，试着在楼梯口再加一个导航点。`
-        : null,
-    );
-  }
-
   function openRouteDialog() {
     setDraft(waypoints);
     setDialogOpen(true);
   }
 
-  /** 弹窗"提交": 草稿生效 + 画出参考路线, 然后关掉弹窗 */
+  /** 弹窗"提交": 草稿生效, 关掉弹窗 */
   function handleSubmitRoute() {
-    return run(async () => {
-      setWaypoints(draft);
-      await computeReferencePath(draft);
-      setDialogOpen(false);
-    });
+    setWaypoints(draft);
+    setDialogOpen(false);
   }
 
   function handleStart() {
-    // 没有参考路线就先算一条再下发, 让机器狗动起来之前用户先看到它大概会怎么走。
-    // 常见场景: 上一趟跑完后参考路线被清掉了, 直接重跑同一条路线时这里会补上。
+    // 开新一趟之前先把上一趟的轨迹清掉 —— 两趟叠在一起分不清哪段是这次走的
     return run(async () => {
-      if (!referencePath) await computeReferencePath(waypoints);
+      setTrail([]);
       await submitRoute(waypoints, name);
     });
   }
@@ -213,19 +199,6 @@ export default function NavigatePage() {
                 </Button>
               )}
 
-              {/* 不叫"紧急停止": navi_mode=2 没有外部急停接口, 这里发的是
-                  /planning/go2_execution_frozen —— 只是让 planner 不再推进轨迹
-                  时间, 不等于断电或立即制动。真正的硬急停在 unitree_bridge 那层。
-                  按钮文案照实写, 免得有人拿它当急停按钮用。 */}
-              <Button
-                size="sm"
-                variant="destructive"
-                title="冻结轨迹执行。注意: 这不是硬急停, 不会断电或立即制动"
-                onClick={() => run(estop)}
-              >
-                <Snowflake />
-                冻结执行
-              </Button>
             </>
           )
         }
@@ -234,12 +207,6 @@ export default function NavigatePage() {
       {(metaError || actionError) && (
         <div className="mb-3 shrink-0 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
           {metaError ?? actionError}
-        </div>
-      )}
-
-      {pathWarning && (
-        <div className="mb-3 shrink-0 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
-          {pathWarning}
         </div>
       )}
 
@@ -259,7 +226,7 @@ export default function NavigatePage() {
             meta={info.topview_meta}
             waypoints={waypoints}
             status={status}
-            referencePath={referencePath}
+            trail={trail}
             enableFollow
           />
         </div>
@@ -303,8 +270,7 @@ export default function NavigatePage() {
               status={status}
               showSafety={draftShowSafety}
               showStandable={draftShowStandable}
-              referencePath={referencePath}
-              maxWidth={DIALOG_TOPVIEW_WIDTH}
+                maxWidth={DIALOG_TOPVIEW_WIDTH}
               maxHeight={DIALOG_TOPVIEW_HEIGHT}
             />
 

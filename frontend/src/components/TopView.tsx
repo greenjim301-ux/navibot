@@ -3,7 +3,7 @@ import { Stage, Layer, Image as KonvaImage, Circle, Line, Text, RegularPolygon, 
 import useImage from "use-image";
 import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import type { NavStatus, PathSegment, TopviewMeta, Waypoint } from "../types";
+import type { NavStatus, TopviewMeta, Waypoint } from "../types";
 import { mapAssetUrl } from "../api";
 import { pixelToWorld, worldToPixel } from "../types";
 
@@ -18,8 +18,6 @@ interface Props {
   /** 叠加"可站立区"提示层: 绿色的地方才有可信的落脚高度, 导航点应该放在这里面。
    *  离开这一层放点, 后端只能就近取高程(1m 内), 再远就无法确定 z 而报错。 */
   showStandable?: boolean;
-  /** 后端算出的绕障参考路线, 传了就画在图上(并隐藏途经点之间的直连虚线) */
-  referencePath?: PathSegment[] | null;
   maxWidth?: number;
   /** 画布可视高度上限, 内容超出的部分靠拖拽/缩放查看, 不传则不限制高度 */
   maxHeight?: number;
@@ -52,7 +50,7 @@ function centerOnOrigin(meta: TopviewMeta): TopviewMeta {
 
 export function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status, showSafety, showStandable = false,
-  referencePath = null, maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight,
+  maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight,
 }: Props) {
   const [topviewImg] = useImage(mapAssetUrl(mapName, "topview.png"), "anonymous");
   const [safetyImg] = useImage(mapAssetUrl(mapName, "topview_safety.png"), "anonymous");
@@ -175,19 +173,6 @@ export function TopView({
     return [p.col * baseScale, p.row * baseScale];
   });
 
-  // 参考路线按段转成画布坐标。颜色跟 3D 预览保持一致: 青色实线 = 规划出来的,
-  // 橙色虚线 = 那一段不连通只能直连(会穿墙), 两边看到的是同一套语义。
-  const refSegments = (referencePath ?? [])
-    .filter((seg) => seg.points.length >= 2)
-    .map((seg) => ({
-      planned: seg.planned,
-      points: seg.points.flatMap((pt) => {
-        const p = worldToPixel(centeredMeta, pt.x, pt.y);
-        return [p.col * baseScale, p.row * baseScale];
-      }),
-    }));
-  const hasRefPath = refSegments.length > 0;
-
   const btnStyle: CSSProperties = {
     width: 26, height: 26, lineHeight: "24px", padding: 0,
     background: "rgba(255,255,255,0.9)", border: "1px solid #ccc", borderRadius: 4,
@@ -273,23 +258,10 @@ export function TopView({
               listening={false}
             />
 
-            {/* 有参考路线时就不画途经点之间的直连虚线了, 两条线叠在一起容易误读成
-                "要走直线"; 顺序信息已经由途经点上的编号表达了 */}
-            {!hasRefPath && linePoints.length >= 4 && (
+            {/* 途经点之间的直连虚线只表达顺序, 不代表真会走直线 */}
+            {linePoints.length >= 4 && (
               <Line points={linePoints} stroke="#2376e5" strokeWidth={2} dash={[6, 4]} />
             )}
-            {refSegments.map((seg, i) => (
-              <Line
-                key={`ref-${i}`}
-                points={seg.points}
-                stroke={seg.planned ? "#22d3ee" : "#f59e0b"}
-                strokeWidth={2.5}
-                dash={seg.planned ? undefined : [7, 5]}
-                lineJoin="round"
-                lineCap="round"
-                listening={false}
-              />
-            ))}
             {waypoints.map((wp, idx) => {
               const p = worldToPixel(centeredMeta, wp.x, wp.y);
               const px = p.col * baseScale;
