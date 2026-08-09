@@ -50,6 +50,29 @@ UNKNOWN_COST = 6.0
 # 的保证来源, 但也等效于额外多膨胀了半个粗格 —— 粗格取 10cm 时成功率只有
 # 86%, 取 6cm 就是 100%(实测 100 组随机点对, 0 穿墙, 平均 99ms), 所以定 6cm。
 PLAN_RESOLUTION_M = 0.06
+# 相邻格允许的最大高差。超过就是物理上迈不过去 —— 没有这条硬约束, A* 会直接从
+# 楼梯底下的地面格"跳"到正上方 1.4m 的楼梯平台格(它们在 xy 上就是邻居), 规划出
+# 一条穿楼板的路。
+#
+# 定 0.50 是量出来的, 不是推出来的: 高程虽然按"相邻 0.1m 格高差 <= 0.25m"生成,
+# 但补洞取邻域均值、多值面collapse 取最低面都会放大差值, 实测认证格之间相邻高差
+# 最大到 0.45m(38 对超过 0.30)。按 0.30 卡会把真楼梯也堵死 —— 实测梯口到平台在
+# 连通性上明明通, 却因为这条约束规划不出来。这条约束要挡的是 1.35m 的跨层跳跃,
+# 不是管楼梯本身的不规则, 留到 0.50 两头都够。
+MAX_STEP_M = 0.50
+# 爬升的额外代价 (每米)。取 4.0 时爬一级楼梯(约 0.17m)每格多花 0.68, 和平地
+# 每格 1.0 同量级 —— 有平路就走平路, 但该上楼梯时不会绕远路躲开。
+CLIMB_WEIGHT = 4.0
+# 参考路线上判定"这一段在爬楼梯"的坡度阈值, 和 elevation.py 的 stair_slope 一致
+STAIR_SLOPE = 0.30
+# 起终点高差超过这个值就算"跨层路段", 走更严的规则 (见 plan_reference_path)
+LEVEL_STEP_M = 0.30
+# 判定路段属于哪一层时, 允许从点击位置往外找多远的认证高程。用户点几乎不会正好
+# 落在认证格上, 只看点击那一格的话跨层路段会被当成同层, 严格规则就形同虚设。
+LEVEL_PROBE_M = 1.0
+# 参考路线上一处"楼梯"至少要爬这么高才算数。地面本身的起伏和噪声能让 0.5m 的
+# 短边算出 0.3 以上的坡度, 不设下限的话平地上会报出一堆 0.15m 的假楼梯。
+MIN_STAIR_RISE_M = 0.30
 
 
 def _block_reduce(arr: np.ndarray, factor: int, func) -> np.ndarray:
@@ -63,7 +86,8 @@ def _block_reduce(arr: np.ndarray, factor: int, func) -> np.ndarray:
 
 
 class MapGrid:
-    def __init__(self, occupancy: np.ndarray, meta: dict) -> None:
+    def __init__(self, occupancy: np.ndarray, meta: dict,
+                 elevation: Optional[np.ndarray] = None) -> None:
         self.meta = meta
         src_resolution: float = meta["resolution_m_per_px"]
         b = meta["world_bounds"]
@@ -113,6 +137,69 @@ class MapGrid:
         # 少了这个偏移量, 粗格坐标算出来是块的左上角而不是中心, 会有半块的
         # 系统性偏差(实测 3cm), 足够让折线正好压在墙格上。
         self.cell_offset_m = (factor - 1) / 2 * src_resolution
+
+        # 高程: 原始的那一份留着按世界坐标查(给路点算 z), 另外按最近邻重采样一份
+        # 到规划栅格上(给 A* 算爬升代价)。两者网格不同, 不能混用。
+        self.elev_src: Optional[np.ndarray] = None
+        self.elev_resolution: float = 0.0
+        self.elev: Optional[np.ndarray] = None
+        self.certified: Optional[np.ndarray] = None
+        if elevation is not None and meta.get("elevation"):
+            self.elev_src = elevation
+            self.elev_resolution = meta["elevation"]["resolution_m_per_cell"]
+            xs = self.x_min + self.cell_offset_m + np.arange(self.width) * self.resolution
+            ys = self.y_max - self.cell_offset_m - np.arange(self.height) * self.resolution
+            ec = np.clip(((xs - self.x_min) / self.elev_resolution).astype(np.int64), 0, elevation.shape[1] - 1)
+            er = np.clip(((self.y_max - ys) / self.elev_resolution).astype(np.int64), 0, elevation.shape[0] - 1)
+            self.elev = elevation[np.ix_(er, ec)].astype(np.float64)
+            self.certified = np.isfinite(self.elev)
+
+    def elevation_at(self, x: float, y: float) -> Optional[float]:
+        """某个世界坐标处的可站立高度, 不可站立返回 None。"""
+        if self.elev_src is None:
+            return None
+        col = int((x - self.x_min) / self.elev_resolution)
+        row = int((self.y_max - y) / self.elev_resolution)
+        if col < 0 or row < 0 or row >= self.elev_src.shape[0] or col >= self.elev_src.shape[1]:
+            return None
+        z = float(self.elev_src[row, col])
+        return z if math.isfinite(z) else None
+
+    def nearest_certified_elevation(self, x: float, y: float,
+                                     radius_m: float = LEVEL_PROBE_M) -> Optional[float]:
+        """点击位置附近的认证高程 (自己那一格没有就就近找)。"""
+        z = self.elevation_at(x, y)
+        if z is not None or self.elev_src is None:
+            return z
+        col = int((x - self.x_min) / self.elev_resolution)
+        row = int((self.y_max - y) / self.elev_resolution)
+        rad = max(1, int(round(radius_m / self.elev_resolution)))
+        h, w = self.elev_src.shape
+        r0, r1 = max(0, row - rad), min(h, row + rad + 1)
+        c0, c1 = max(0, col - rad), min(w, col + rad + 1)
+        patch = self.elev_src[r0:r1, c0:c1]
+        ok = np.isfinite(patch)
+        if not ok.any():
+            return None
+        rr, cc = np.nonzero(ok)
+        d = (rr + r0 - row) ** 2 + (cc + c0 - col) ** 2
+        return float(patch[rr[np.argmin(d)], cc[np.argmin(d)]])
+
+    def climb_penalty(self, cc: int, cr: int, nc: int, nr: int) -> Optional[float]:
+        """这一步的爬升附加代价; 返回 None 表示高差太大, 物理上迈不过去。
+
+        两端只要有一端没有可信高程就不判 —— 未知高度上强行禁行会把本来能走的
+        路切断, 而这条参考路线只是示意, 真正的地形判断在 SCAN-Planner 那边。
+        """
+        if self.elev is None:
+            return 0.0
+        z0, z1 = self.elev[cr, cc], self.elev[nr, nc]
+        if not (np.isfinite(z0) and np.isfinite(z1)):
+            return 0.0
+        dz = abs(float(z1) - float(z0))
+        if dz > MAX_STEP_M:
+            return None
+        return CLIMB_WEIGHT * dz
 
     def blocked_at(self, inflation_m: float) -> np.ndarray:
         """按给定膨胀半径导出禁行掩膜。inflation=0 时只有真实障碍格子禁行。"""
@@ -217,7 +304,10 @@ def _astar(grid: MapGrid, blocked: np.ndarray, start: Tuple[int, int],
             nidx = nr * w + nc
             if nidx in closed:
                 continue
-            tentative = g_score[cur] + base * grid.step_cost(nc, nr)
+            climb = grid.climb_penalty(cc, cr, nc, nr)
+            if climb is None:      # 高差太大, 迈不过去
+                continue
+            tentative = g_score[cur] + base * grid.step_cost(nc, nr) + climb
             if tentative < g_score.get(nidx, math.inf):
                 g_score[nidx] = tentative
                 came_from[nidx] = cur
@@ -237,6 +327,29 @@ def _astar(grid: MapGrid, blocked: np.ndarray, start: Tuple[int, int],
     return path
 
 
+def _segment_elevation_ok(grid: MapGrid, a: Tuple[float, float], b: Tuple[float, float],
+                           tol_m: float = 0.10) -> bool:
+    """这一段拉直之后, 中间的地面高度还贴着直线吗?
+
+    拉直只校验碰不碰障碍是不够的: 楼梯在 xy 上就是一条直线, 障碍校验完全通过,
+    于是整段楼梯被拉成首尾两个点 —— 3D 里那条线就直接从楼梯中间穿过去了, 看着
+    像穿楼板。这里再要求中途采样点的实际地面高度和线性插值差不超过 tol。
+    """
+    if grid.elev_src is None:
+        return True
+    za, zb = grid.elevation_at(*a), grid.elevation_at(*b)
+    if za is None or zb is None:
+        return True
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    steps = max(2, int(math.ceil(length / max(grid.elev_resolution, 1e-6))))
+    for i in range(1, steps):
+        t = i / steps
+        z = grid.elevation_at(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        if z is not None and abs(z - (za + (zb - za) * t)) > tol_m:
+            return False
+    return True
+
+
 def _simplify_verified(grid: MapGrid, inflation_m: float,
                         path: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """把锯齿状栅格路径拉成干净折线, 但每一段拉直都在原始分辨率上校验过。
@@ -251,9 +364,8 @@ def _simplify_verified(grid: MapGrid, inflation_m: float,
     out = [path[0]]
     anchor = 0
     for i in range(2, len(path)):
-        if not grid.world_segment_clear(
-            grid.cell_to_world(*path[anchor]), grid.cell_to_world(*path[i]), inflation_m
-        ):
+        a, b = grid.cell_to_world(*path[anchor]), grid.cell_to_world(*path[i])
+        if not grid.world_segment_clear(a, b, inflation_m) or not _segment_elevation_ok(grid, a, b):
             out.append(path[i - 1])
             anchor = i - 1
     out.append(path[-1])
@@ -271,12 +383,17 @@ def load_grid(map_name: str) -> MapGrid:
     if not occ_path.is_file() or not meta_path.is_file():
         raise FileNotFoundError(f"地图 '{map_name}' 缺少占据栅格, 需要重新预处理")
 
+    # 缓存键要把 elevation.npy 也算进去, 否则只重算高程时缓存不会失效
     mtime = occ_path.stat().st_mtime
+    if (assets / "elevation.npy").is_file():
+        mtime = max(mtime, (assets / "elevation.npy").stat().st_mtime)
     cached = _grid_cache.get(map_name)
     if cached and cached[0] == mtime:
         return cached[1]
 
-    grid = MapGrid(np.load(occ_path), json.loads(meta_path.read_text()))
+    elev_path = assets / "elevation.npy"
+    elevation = np.load(elev_path) if elev_path.is_file() else None
+    grid = MapGrid(np.load(occ_path), json.loads(meta_path.read_text()), elevation)
     _grid_cache[map_name] = (mtime, grid)
     return grid
 
@@ -303,10 +420,29 @@ def plan_reference_path(map_name: str, points: List[Tuple[float, float]]) -> Lis
         start_cell = grid.world_to_cell(*start_w)
         goal_cell = grid.world_to_cell(*goal_w)
 
+        # 跨层路段(起终点高差明显)必须全程走在认证过的可站立区内。
+        #
+        # 同层路段可以借道未知区(代价高但允许), 因为未知多半只是地面没扫全。
+        # 跨层就不行: 高差约束只在两端都有高程时才成立, 而认证区是条贴着轨迹的
+        # 窄带 —— 实测路线会绕开楼梯、从旁边的未知区平走过去, 再"平地飞升"落到
+        # 0.74m 的楼梯平台上。试过把高程往未知区外推来堵这个洞, 外推半径小了堵
+        # 不住、大了伏诺伊边界到处是断崖直接规划不出任何路线, 没有稳定的中间值。
+        # 与其猜, 不如要求跨层必须有证据: 走不通就如实报 planned=False, 前端画
+        # 橙色虚线并提示, 而不是画一条看着能走、实际穿楼板的线。
+        z_a = grid.nearest_certified_elevation(*start_w)
+        z_b = grid.nearest_certified_elevation(*goal_w)
+        cross_level = (
+            grid.certified is not None and z_a is not None and z_b is not None
+            and abs(z_b - z_a) > LEVEL_STEP_M
+        )
+        seg_masks = masks
+        if cross_level:
+            seg_masks = [(inf, blocked | ~grid.certified) for inf, blocked in masks]
+
         # 从"离墙远一点"开始试, 规划不出来就逐级放宽, 尽量别让整段退化成直连穿墙
         raw = None
         used = None
-        for inflation, blocked in masks:
+        for inflation, blocked in seg_masks:
             a = grid.nearest_free(blocked, *start_cell)
             b = grid.nearest_free(blocked, *goal_cell)
             if a is None or b is None:
@@ -317,10 +453,17 @@ def plan_reference_path(map_name: str, points: List[Tuple[float, float]]) -> Lis
                 break
 
         if raw is None or used is None:
-            logger.info("map=%s 第 %d 段所有膨胀级别都规划失败(不连通), 退化成直连", map_name, i)
+            if cross_level:
+                logger.info("map=%s 第 %d 段跨层(%.2f -> %.2f)但认证可站立区内不连通, "
+                            "报失败而不是画一条穿楼板的直线", map_name, i, z_a, z_b)
+            else:
+                logger.info("map=%s 第 %d 段所有膨胀级别都规划失败(不连通), 退化成直连", map_name, i)
             segments.append({
                 "planned": False,
-                "points": [{"x": start_w[0], "y": start_w[1]}, {"x": goal_w[0], "y": goal_w[1]}],
+                "points": [
+                    {"x": start_w[0], "y": start_w[1], "z": grid.elevation_at(*start_w)},
+                    {"x": goal_w[0], "y": goal_w[1], "z": grid.elevation_at(*goal_w)},
+                ],
             })
             continue
 
@@ -330,10 +473,83 @@ def plan_reference_path(map_name: str, points: List[Tuple[float, float]]) -> Lis
         # 折线严格用规划出来的格子中心, 不拿用户点击的原始坐标去替换首尾 ——
         # 那一小段没经过任何碰撞检查, 用户点在墙边时就会穿墙。吸附最多偏
         # 半个规划格(~5cm), 视觉上可以忽略, 但能保证整条折线都是验证过的。
-        pts = [
-            {"x": x, "y": y}
-            for x, y in (grid.cell_to_world(*cell) for cell in _simplify_verified(grid, used[0], raw))
-        ]
+        pts = []
+        for x, y in (grid.cell_to_world(*cell) for cell in _simplify_verified(grid, used[0], raw)):
+            # z 给的是地面高度而不是机体高度: 前端画线时自己抬 0.2m, 下发导航点时
+            # 才加实测的 delta_sensor_m。两个用途的基准不一样, 混在一起早晚出错。
+            pts.append({"x": x, "y": y, "z": grid.elevation_at(x, y)})
         segments.append({"planned": True, "points": pts})
 
     return segments
+
+
+def find_stair_crossings(segments: List[dict], slope_thresh: float = STAIR_SLOPE,
+                          margin_m: float = 0.4,
+                          min_rise_m: float = MIN_STAIR_RISE_M) -> List[dict]:
+    """在规划好的参考路线上找出爬升段, 给出每段楼梯的进/出口。
+
+    为什么需要这个: navi_mode=2 的局部规划视野只有 3.5m (planning_horizon), 一个
+    直接落在楼上的目标点会让全局轨迹一头撞向楼板。在楼梯上下两端各放一个导航点,
+    机器狗才会先走到梯口、摆正、再上。
+
+    返回 [{"enter": {x,y,z}, "exit": {x,y,z}, "rise": 高差}], 顺序同路线。
+    enter/exit 各自从爬升段两端外退 margin_m, 让狗有一段直线approach。
+    """
+    pts = [p for seg in segments if seg["planned"] for p in seg["points"]]
+    if len(pts) < 3:
+        return []
+
+    # 弧长必须按累积距离算, 不能按点序号: 简化后的折线点距很不均匀, 按序号算
+    # 坡度会在短边上炸掉 (elevation.py 里踩过同样的坑)。
+    arc = [0.0]
+    for a, b in zip(pts[:-1], pts[1:]):
+        arc.append(arc[-1] + math.hypot(b["x"] - a["x"], b["y"] - a["y"]))
+
+    crossings: List[dict] = []
+    i = 0
+    while i < len(pts) - 1:
+        za, zb = pts[i].get("z"), pts[i + 1].get("z")
+        ds = arc[i + 1] - arc[i]
+        if za is None or zb is None or ds < 1e-6 or abs(zb - za) / ds < slope_thresh:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(pts) - 1:
+            z0, z1 = pts[j].get("z"), pts[j + 1].get("z")
+            d = arc[j + 1] - arc[j]
+            if z0 is None or z1 is None or d < 1e-6 or abs(z1 - z0) / d < slope_thresh:
+                break
+            j += 1
+        rise = float((pts[j].get("z") or 0.0) - (pts[i].get("z") or 0.0))
+        if abs(rise) >= min_rise_m:
+            crossings.append({
+                "enter": _point_at_arc(pts, arc, arc[i] - margin_m),
+                "exit": _point_at_arc(pts, arc, arc[j] + margin_m),
+                "rise": round(rise, 3),
+            })
+        i = j + 1
+
+    # 一段楼梯中间只要有一级踏面平一点, 上面的循环就会把它切成两处。合并挨得
+    # 很近的相邻结果, 否则一道楼梯会被插进四个导航点。
+    merged: List[dict] = []
+    for c in crossings:
+        if merged and math.hypot(c["enter"]["x"] - merged[-1]["exit"]["x"],
+                                  c["enter"]["y"] - merged[-1]["exit"]["y"]) <= 2 * margin_m:
+            merged[-1]["exit"] = c["exit"]
+            merged[-1]["rise"] = round(merged[-1]["rise"] + c["rise"], 3)
+        else:
+            merged.append(c)
+    return merged
+
+
+def _point_at_arc(pts: List[dict], arc: List[float], s: float) -> dict:
+    """折线上弧长 s 处的点 (超出两端就取端点)。"""
+    s = min(max(s, arc[0]), arc[-1])
+    k = max(1, int(np.searchsorted(arc, s)))
+    span = arc[k] - arc[k - 1]
+    t = 0.0 if span < 1e-9 else (s - arc[k - 1]) / span
+    a, b = pts[k - 1], pts[k]
+    z = None
+    if a.get("z") is not None and b.get("z") is not None:
+        z = a["z"] + (b["z"] - a["z"]) * t
+    return {"x": a["x"] + (b["x"] - a["x"]) * t, "y": a["y"] + (b["y"] - a["y"]) * t, "z": z}
