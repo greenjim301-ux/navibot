@@ -20,3 +20,6 @@ web_assets/
 data/
 
 *.log
+
+# 本地便签, 不进版本库
+claude-session.txt
