@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { MapPin, Play, Pause, Square, OctagonAlert } from "lucide-react";
+import { MapPin, Play, Pause, Square, Snowflake, TriangleAlert } from "lucide-react";
 import { cancelRoute, estop, getRoute, pauseRoute, planPath, resumeRoute, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
@@ -8,10 +8,12 @@ import { TopView } from "../components/TopView";
 import { PointCloudView } from "../components/PointCloudView";
 import { PageHeader } from "../components/PageHeader";
 import type { PathSegment, Waypoint } from "../types";
+import { poseUnreliable } from "../types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
+import { Input } from "@/components/ui/input";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from "@/components/ui/dialog";
@@ -59,6 +61,7 @@ export default function NavigatePage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [draft, setDraft] = useState<Waypoint[]>([]);
   const [draftShowSafety, setDraftShowSafety] = useState(false);
+  const [draftShowStandable, setDraftShowStandable] = useState(true);
 
   const { status, connected } = useNavStatus();
 
@@ -114,7 +117,9 @@ export default function NavigatePage() {
     const bad = segments.filter((s) => !s.planned).length;
     setPathWarning(
       bad > 0
-        ? `有 ${bad} 段在地图上找不到连通路径（可能门口没扫全或房间未连通），已用橙色虚线直连表示，那段不是可行路线。`
+        ? `有 ${bad} 段找不到可走的路径，已用橙色虚线直连表示——那段不是可行路线。` +
+          `常见原因：门口没扫全、房间未连通；如果这一段要上下楼梯，还可能是`+
+          `楼梯两端之间没有连续的可站立区，试着在楼梯口再加一个导航点。`
         : null,
     );
   }
@@ -152,6 +157,13 @@ export default function NavigatePage() {
           <span className="flex items-center gap-2">
             <span className={`inline-block size-2 rounded-full ${connected ? "bg-green-500" : "bg-destructive"}`} />
             {connected ? "已连接" : "未连接"}
+            {/* 定位失败时地图上所有绝对坐标都不可信, 这时候下发导航点是危险的 */}
+            {poseUnreliable(status?.robot_pose) && (
+              <Badge variant="destructive" className="gap-1">
+                <TriangleAlert className="size-3" />
+                定位失败
+              </Badge>
+            )}
             <Badge variant={STATE_VARIANT[state] ?? "secondary"}>{STATE_LABEL[state] ?? state}</Badge>
             {state === "running" && status && (
               <span className="font-mono text-xs">
@@ -201,9 +213,18 @@ export default function NavigatePage() {
                 </Button>
               )}
 
-              <Button size="sm" variant="destructive" onClick={() => run(estop)}>
-                <OctagonAlert />
-                紧急停止
+              {/* 不叫"紧急停止": navi_mode=2 没有外部急停接口, 这里发的是
+                  /planning/go2_execution_frozen —— 只是让 planner 不再推进轨迹
+                  时间, 不等于断电或立即制动。真正的硬急停在 unitree_bridge 那层。
+                  按钮文案照实写, 免得有人拿它当急停按钮用。 */}
+              <Button
+                size="sm"
+                variant="destructive"
+                title="冻结轨迹执行。注意: 这不是硬急停, 不会断电或立即制动"
+                onClick={() => run(estop)}
+              >
+                <Snowflake />
+                冻结执行
               </Button>
             </>
           )
@@ -261,10 +282,16 @@ export default function NavigatePage() {
                 {locked ? "共" : "已选"} <strong className="text-foreground">{draft.length}</strong> 个导航点
                 {locked && "（数字为途经顺序）"}
               </span>
-              <label className="flex items-center gap-1.5 text-xs">
-                安全边距
-                <Switch checked={draftShowSafety} onCheckedChange={setDraftShowSafety} />
-              </label>
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-1.5 text-xs">
+                  可站立区
+                  <Switch checked={draftShowStandable} onCheckedChange={setDraftShowStandable} />
+                </label>
+                <label className="flex items-center gap-1.5 text-xs">
+                  安全边距
+                  <Switch checked={draftShowSafety} onCheckedChange={setDraftShowSafety} />
+                </label>
+              </div>
             </div>
 
             <TopView
@@ -275,10 +302,41 @@ export default function NavigatePage() {
               editable={!locked}
               status={status}
               showSafety={draftShowSafety}
+              showStandable={draftShowStandable}
               referencePath={referencePath}
               maxWidth={DIALOG_TOPVIEW_WIDTH}
               maxHeight={DIALOG_TOPVIEW_HEIGHT}
             />
+
+            {draft.length > 0 && (
+              <div className="max-h-28 space-y-1 overflow-y-auto rounded-lg border p-2">
+                <p className="px-1 text-[11px] text-muted-foreground">
+                  抬高 z：机器狗爬不上某级台阶时把那个点的 z 往上调
+                  （SCAN-Planner 官方建议的做法）。留 0 就用地面高度自动算。
+                </p>
+                {draft.map((wp, i) => (
+                  <div key={i} className="flex items-center gap-2 px-1 text-xs">
+                    <span className="w-5 shrink-0 text-center font-mono text-muted-foreground">{i + 1}</span>
+                    <span className="w-28 shrink-0 font-mono text-muted-foreground">
+                      {wp.x.toFixed(2)}, {wp.y.toFixed(2)}
+                    </span>
+                    <span className="shrink-0 text-muted-foreground">抬高</span>
+                    <Input
+                      type="number"
+                      step="0.05"
+                      disabled={locked}
+                      className="h-7 w-20 font-mono text-xs"
+                      value={wp.z_offset ?? 0}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setDraft(draft.map((w, k) => (k === i ? { ...w, z_offset: Number.isFinite(v) ? v : 0 } : w)));
+                      }}
+                    />
+                    <span className="shrink-0 text-muted-foreground">m</span>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <DialogFooter>
               {locked ? (

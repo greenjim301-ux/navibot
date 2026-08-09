@@ -268,11 +268,16 @@ export function PointCloudView({
 
     if (!referencePath || referencePath.length === 0) return;
 
-    const z = meta.floor_z + 0.2;
+    // 每个点用它自己的地面高度抬 0.2m 画。用统一的 meta.floor_z 会让整条楼梯段
+    // 画成一条平线, 看着像穿楼板 —— floor_z 现在只是"主平面高度", 不再代表整图。
+    // p.z 为 null 表示该点不在认证可站立区(高度未知), 退回 floor_z 兜底。
+    const LIFT = 0.2;
+    const zOf = (p: { z: number | null }) => (p.z ?? meta.floor_z) + LIFT;
+
     referencePath.forEach((seg) => {
       if (seg.points.length < 2) return;
       const flat: number[] = [];
-      seg.points.forEach((p) => flat.push(p.x, p.y, z));
+      seg.points.forEach((p) => flat.push(p.x, p.y, zOf(p)));
 
       const geometry = new LineGeometry();
       geometry.setPositions(flat);
@@ -287,7 +292,7 @@ export function PointCloudView({
           new THREE.SphereGeometry(0.045, 10, 10),
           new THREE.MeshBasicMaterial({ color: seg.planned ? 0x22d3ee : 0xf59e0b }),
         );
-        dot.position.set(p.x, p.y, z);
+        dot.position.set(p.x, p.y, zOf(p));
         markers.add(dot);
       });
     });

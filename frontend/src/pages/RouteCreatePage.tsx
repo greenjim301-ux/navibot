@@ -171,6 +171,7 @@ export default function RouteCreatePage() {
                   {referencePath && "　·　青色实线为参考路线"}
                 </h2>
                 <TopView
+              showStandable
                   mapName={mapName}
                   meta={info.topview_meta}
                   waypoints={waypoints}

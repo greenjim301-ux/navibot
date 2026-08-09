@@ -2,6 +2,10 @@ export interface Waypoint {
   x: number;
   y: number;
   yaw: number;
+  /** 相对该点地面的高度微调 (m)。后端下发时用 "地面高程 + 实测 odom 离地高度 +
+   *  z_offset" 现算绝对 z —— 路线里不存绝对 z, 见 backend/app/models.py。
+   *  SCAN-Planner 的 README 明确写了爬不上楼梯就抬 z, 所以这个要暴露给用户。 */
+  z_offset?: number;
 }
 
 export type TaskState =
@@ -16,8 +20,13 @@ export type TaskState =
 export interface RobotPose {
   x: number;
   y: number;
+  /** odom 系机体高度 (不是离地高度) */
+  z: number;
   yaw: number;
   stamp: number;
+  /** 定位质量 (odom covariance[0], 0~0.99)。>=0.99 表示定位失败 —— 此时地图上
+   *  所有绝对坐标的导航点都不可信, 必须显眼地告诉用户。 */
+  cov: number;
 }
 
 export interface NavStatus {
@@ -34,6 +43,8 @@ export interface NavStatus {
 export interface PathPoint {
   x: number;
   y: number;
+  /** 该点的地面高度 (不是机体高度)。画线时自己抬一点; null = 该点不在认证可站立区。 */
+  z: number | null;
 }
 
 export interface PathSegment {
@@ -70,6 +81,17 @@ export interface TopviewMeta {
   ceiling_z: number;
   hazard_z_range: [number, number];
   source_file: string;
+  /** 只有带建图轨迹、能提取出高程面的地图才有 */
+  elevation?: {
+    resolution_m_per_cell: number;
+    width: number;
+    height: number;
+    /** 实测的 odom 离地高度, 导航点 z = 地面高程 + 这个值 + z_offset */
+    delta_sensor_m: number;
+    band_m: [number, number];
+    overlap_cells: number;
+    stats: Record<string, unknown>;
+  };
 }
 
 export interface PointcloudMeta {
@@ -97,4 +119,10 @@ export function pixelToWorld(meta: TopviewMeta, col: number, row: number) {
     x: x_min + col * meta.resolution_m_per_px,
     y: y_max - row * meta.resolution_m_per_px,
   };
+}
+
+/** 定位是否已经不可信 (见 RobotPose.cov) */
+export const POSE_COV_BAD = 0.99;
+export function poseUnreliable(pose: RobotPose | null | undefined): boolean {
+  return Boolean(pose && pose.cov >= POSE_COV_BAD);
 }

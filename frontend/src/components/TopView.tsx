@@ -15,6 +15,9 @@ interface Props {
   editable: boolean;
   status: NavStatus | null;
   showSafety: boolean;
+  /** 叠加"可站立区"提示层: 绿色的地方才有可信的落脚高度, 导航点应该放在这里面。
+   *  离开这一层放点, 后端只能就近取高程(1m 内), 再远就无法确定 z 而报错。 */
+  showStandable?: boolean;
   /** 后端算出的绕障参考路线, 传了就画在图上(并隐藏途经点之间的直连虚线) */
   referencePath?: PathSegment[] | null;
   maxWidth?: number;
@@ -48,11 +51,13 @@ function centerOnOrigin(meta: TopviewMeta): TopviewMeta {
 }
 
 export function TopView({
-  mapName, meta, waypoints, onChangeWaypoints, editable, status, showSafety,
+  mapName, meta, waypoints, onChangeWaypoints, editable, status, showSafety, showStandable = false,
   referencePath = null, maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight,
 }: Props) {
   const [topviewImg] = useImage(mapAssetUrl(mapName, "topview.png"), "anonymous");
   const [safetyImg] = useImage(mapAssetUrl(mapName, "topview_safety.png"), "anonymous");
+  // 旧版预处理产物没有这张图, useImage 取不到就是 undefined, 不影响其它图层
+  const [standableImg] = useImage(mapAssetUrl(mapName, "topview_standable.png"), "anonymous");
   const stageRef = useRef<Konva.Stage>(null);
   const contentGroupRef = useRef<Konva.Group>(null);
 
@@ -215,6 +220,15 @@ export function TopView({
             {topviewImg && (
               <KonvaImage
                 image={topviewImg}
+                x={imgOffset.col * baseScale}
+                y={imgOffset.row * baseScale}
+                width={meta.width * baseScale}
+                height={meta.height * baseScale}
+              />
+            )}
+            {showStandable && standableImg && (
+              <KonvaImage
+                image={standableImg}
                 x={imgOffset.col * baseScale}
                 y={imgOffset.row * baseScale}
                 width={meta.width * baseScale}
