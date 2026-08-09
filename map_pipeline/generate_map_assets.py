@@ -2,36 +2,75 @@
 """
 离线地图资产生成脚本。
 
-输入: mapdata/<room>/dense_cloud_map.pcd (稠密重建点云, 含法线)
-输出 (web_assets/map/ 下):
-  topview.png        俯视图 (高程配色 + 模拟光影, 正交投影, RGBA)
-  topview_meta.json   俯视图的坐标元数据 (分辨率/原点/世界坐标范围等), 占据栅格共用这份几何信息
-  occupancy.npy      占据栅格 (uint8: 0未知/1可通行/2障碍), 后端寻路用的权威数据
-  pointcloud.bin      降采样后的点云二进制 (position float32 + color uint8), 供前端 3D 预览
+输入: mapdata/<room>/ 下的
+  dense_cloud_map.pcd     稠密重建点云
+  keyframe_info_3d.txt    建图轨迹 (HandBot-S1 关键帧位姿), 高程提取的种子
+输出 (web_assets/map/<room>/ 下):
+  topview.png             俯视图 (两色平面图, 楼梯按抬升着色, 正交投影, RGBA)
+  topview_safety.png      安全边距提示层 (障碍膨胀), 供 UI 叠加
+  topview_standable.png   可站立区提示层, 供 UI 标出"哪里能放导航点"
+  topview_meta.json       坐标元数据, 占据栅格与高程栅格共用这份几何信息
+  elevation.npy           逐格可站立高度 (float32, NaN=不可站立), 见 elevation.py
+  overlaps.json           同一格存在多个可站立高度的自检结果 (非空 = 单值表示不够用)
+  occupancy.npy           占据栅格 (uint8: 0不可站立/1可通行/2障碍), 后端寻路读它
+  pointcloud.bin          降采样点云 (PCW1), 供前端 3D 预览
   pointcloud_meta.json
 
-俯视图渲染方式 (严格正交投影, 相机依然是垂直往下看, 点击坐标换算不受影响):
-  1. z 直方图峰值法定位地面/天花板高度 (不依赖法线, 这份 PCD 的法线字段读取有 bug)
-  2. 去掉天花板(留出一段余量)后的点云里, 每个栅格取最高点, 得到一张"从正上方
-     往下看到的表面高度场" (类似 GIS 里的数字表面模型 DSM)
-  3. 按高度做渐变配色 (蓝->绿->黄->红), 再叠一层根据局部坡度算的斜射光影
-     (hillshade, 地图晕渲图常见手法), 让平面图有立体感
-  4. 障碍带密度投影仍用于计算"已探索区域"掩膜和安全边距提示层(供 UI 参考),
-     只是不再直接决定俯视图的颜色
+关于"地面"的表示方式 —— 这是整个脚本的核心:
+  早先假设整张图只有一个地面高度 (一个 floor_z), 带楼梯的地图会彻底算错: z 直方图
+  的上下半各取一峰, 中点落在两层之间, "下半最高峰"取到的是一层天花板 —— 实测把一栋
+  两层楼判成"层高 0.26m 的房间", 障碍带扫在天花板上, 俯视图里一根墙都没有。
+  现在改成由 elevation.py 提取逐格可站立高度, 楼梯就是高程连续爬升的一条窄带。
+  floor_z 退化为"主平面高度", 只用来定天花板裁剪线和给不可站立的格子兜底渲染。
+
+俯视图渲染 (严格正交投影, 相机垂直往下看, 点击坐标换算不受影响):
+  1. 每个点按它所在格自己的地面高度判定"贴地层"和"身体高度带", 而不是全局 floor_z
+  2. 两色平面图: 地面浅灰, 障碍带内按密度加深 (彩虹高程配色实测更难看, 已弃用)
+  3. 只给"比本层地面高出一截"的格子叠暖色 —— 平层上高程没有信息量, 楼梯上它就是
+     全部信息
+  4. 光影(hillshade)默认关闭, 实测浮雕效果反而影响清晰度
 """
 import argparse
 import json
 import struct
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import open3d as o3d
 from PIL import Image, ImageFilter
 
+from elevation import ElevationParams, build_elevation, load_trajectory
+
 # occupancy.npy 的取值语义 (后端寻路读这个文件, 跟 backend/app/path_planner.py 保持一致)
 OCC_UNKNOWN = 0
 OCC_FREE = 1
 OCC_OCCUPIED = 2
+
+# 楼梯着色的抬升区间 (m, 相对本层地面): 低于 MIN 不上色(地面起伏/门槛),
+# 到 FULL 时颜色最深。只影响观感。
+STAIR_TINT_MIN_M = 0.08
+STAIR_TINT_FULL_M = 1.20
+
+
+def detect_ceiling(points: np.ndarray, floor_z: float, min_room_height: float = 1.2) -> float:
+    """在 floor_z 之上找天花板 (z 直方图上离地最远的显著峰)。
+
+    不能沿用"z 直方图上下半各取一峰": 带楼梯的图里中点会落在两层之间, 下半的最高峰
+    是一层天花板而不是地面 —— 实测这份图被判成"层高 0.26m 的房间"。有了可信的
+    floor_z 之后, 从 floor_z + min_room_height 往上找峰就稳了。
+    """
+    z = points[:, 2]
+    z_hi = float(np.percentile(z, 99.5))
+    lo = floor_z + min_room_height
+    band = z[(z >= lo) & (z <= z_hi)]
+    if band.size < 100:
+        return floor_z + 2.4
+    hist, edges = np.histogram(band, bins=120)
+    centers = (edges[:-1] + edges[1:]) / 2
+    return float(centers[np.argmax(hist)])
 
 
 def detect_floor_ceiling(points: np.ndarray) -> tuple[float, float]:
@@ -57,6 +96,14 @@ def detect_floor_ceiling(points: np.ndarray) -> tuple[float, float]:
     floor_z = float(centers[np.argmax(lower_hist)])
     ceiling_z = float(centers[np.argmax(upper_hist)])
     return floor_z, ceiling_z
+
+
+def upsample_nearest(arr: np.ndarray, src_res: float, dst_res: float, dst_h: int, dst_w: int) -> np.ndarray:
+    """把高程栅格最近邻放大到俯视图网格。两个网格共用 (x_min, y_max) 原点, 所以
+    直接按比例取整索引即可。"""
+    rows = np.minimum((np.arange(dst_h) * dst_res / src_res).astype(np.int64), arr.shape[0] - 1)
+    cols = np.minimum((np.arange(dst_w) * dst_res / src_res).astype(np.int64), arr.shape[1] - 1)
+    return arr[np.ix_(rows, cols)]
 
 
 def robust_xy_bounds(points: np.ndarray, pad: float = 0.3, lo=0.5, hi=99.5):
@@ -155,9 +202,22 @@ def hillshade(height_grid: np.ndarray, resolution: float, blur_px: int, strength
 
 def generate_topview(points, x_min, x_max, y_min, y_max, floor_z, ceiling_cutoff, resolution,
                       hazard_low, hazard_high, density_clip_pct, safety_margin_m,
-                      shade_strength, height_blur_px, occupancy_min_points):
+                      shade_strength, height_blur_px, occupancy_min_points,
+                      elev_fine=None):
+    """elev_fine: 与俯视图同网格的逐格可站立高度 (NaN=不可站立)。
+
+    有它的时候, 贴地层和障碍带都相对该格自己的地面算, 楼梯上的障碍判定才是对的;
+    没有它(或该格是 NaN)时退回全局 floor_z —— 这只影响"给人看"的那张图, 占据栅格
+    在 NaN 的格子上一律记未知, 不会拿猜出来的地面去做规划。
+    """
     width = int(np.ceil((x_max - x_min) / resolution))
     height = int(np.ceil((y_max - y_min) / resolution))
+
+    if elev_fine is None:
+        elev_fine = np.full((height, width), np.nan, dtype=np.float32)
+    standable = np.isfinite(elev_fine)
+    # 渲染用的参考地面: 不可站立的格子退回全局 floor_z, 保证整张平面图还是完整的
+    ref_grid = np.where(standable, elev_fine, floor_z).astype(np.float64)
 
     def to_pixel(pts_xy):
         col = ((pts_xy[:, 0] - x_min) / resolution).astype(np.int64)
@@ -165,17 +225,23 @@ def generate_topview(points, x_min, x_max, y_min, y_max, floor_z, ceiling_cutoff
         valid = (col >= 0) & (col < width) & (row >= 0) & (row < height)
         return col[valid], row[valid]
 
+    # 所有点先落格, 再按各自格子的参考地面判定高度带 —— 楼梯上"离地 5~60cm"
+    # 和平地上不是同一个绝对高度, 用全局 floor_z 会把楼梯整段判成障碍。
+    all_col = ((points[:, 0] - x_min) / resolution).astype(np.int64)
+    all_row = ((y_max - points[:, 1]) / resolution).astype(np.int64)
+    inb = (all_col >= 0) & (all_col < width) & (all_row >= 0) & (all_row < height)
+    pc, pr, pz = all_col[inb], all_row[inb], points[inb, 2]
+    rel_z = pz - ref_grid[pr, pc]
+
     # 地面参考层: 贴地薄层, 只要有没有点即可 (存在性), 用于画出房间大致轮廓
-    floor_mask = (points[:, 2] >= floor_z - 0.03) & (points[:, 2] <= floor_z + 0.05)
-    floor_col, floor_row = to_pixel(points[floor_mask][:, :2])
+    floor_sel = (rel_z >= -0.03) & (rel_z <= 0.05)
     floor_density = np.zeros((height, width), dtype=np.float64)
-    np.add.at(floor_density, (floor_row, floor_col), 1.0)
+    np.add.at(floor_density, (pr[floor_sel], pc[floor_sel]), 1.0)
 
     # 障碍层: 机器狗身体高度带内做密度投影 (只用来算 known 掩膜和安全边距层, 不再用来上色)
-    hazard_mask = (points[:, 2] >= floor_z + hazard_low) & (points[:, 2] <= floor_z + hazard_high)
-    haz_col, haz_row = to_pixel(points[hazard_mask][:, :2])
+    haz_sel = (rel_z >= hazard_low) & (rel_z <= hazard_high)
     hazard_density = np.zeros((height, width), dtype=np.float64)
-    np.add.at(hazard_density, (haz_row, haz_col), 1.0)
+    np.add.at(hazard_density, (pr[haz_sel], pc[haz_sel]), 1.0)
 
     clip_val = np.percentile(hazard_density[hazard_density > 0], density_clip_pct) if np.any(hazard_density > 0) else 1.0
     hazard_norm = np.clip(hazard_density / max(clip_val, 1e-6), 0.0, 1.0)
@@ -215,6 +281,18 @@ def generate_topview(points, x_min, x_max, y_min, y_max, floor_z, ceiling_cutoff
     else:
         shaded_color = base_color.astype(np.uint8)
 
+    # 楼梯/台阶着色: 只给"比本层地面高出一截"的格子上色, 平层依然是干净的两色图。
+    # 高程在平层上没有信息量(之前试过整图彩虹配色, 反而把地面/障碍的边界切碎了),
+    # 但在楼梯上它就是全部信息, 所以按"相对本地地面的抬升"而不是绝对高度上色。
+    if standable.any():
+        rise = np.where(standable, elev_fine - floor_z, 0.0)
+        tint = np.clip((rise - STAIR_TINT_MIN_M) / max(STAIR_TINT_FULL_M - STAIR_TINT_MIN_M, 1e-6), 0.0, 1.0)
+        tint = np.where(standable, tint, 0.0)[..., None]
+        stair_color = np.array([214.0, 118.0, 46.0], dtype=np.float32)
+        shaded_color = np.clip(
+            shaded_color * (1.0 - tint) + stair_color * tint, 0, 255
+        ).astype(np.uint8)
+
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
     rgba[..., :3] = shaded_color
     rgba[..., 3] = np.where(known, 255, 0)
@@ -222,8 +300,17 @@ def generate_topview(points, x_min, x_max, y_min, y_max, floor_z, ceiling_cutoff
     # 占据栅格: 给寻路用的权威数据, 跟上面那些"给人看的渲染"完全分开。
     # 直接用障碍带内的原始点数做绝对阈值判定 (而不是给渲染用的百分位归一化
     # hazard_norm), 这样配色怎么调都不会影响寻路。语义:
-    #   OCC_UNKNOWN=0 没扫到 / OCC_FREE=1 可通行 / OCC_OCCUPIED=2 有障碍
-    occupancy = np.where(known, OCC_FREE, OCC_UNKNOWN).astype(np.uint8)
+    #   OCC_FREE=1     可站立(有可信落脚高度)且身体高度带内无障碍
+    #   OCC_UNKNOWN=0  没有可信落脚高度, 但也没扫到障碍 (未扫到的地板 / 认证不到的角落)
+    #   OCC_OCCUPIED=2 身体高度带内有障碍
+    #
+    # FREE 的基底是 standable 而不是 known: known 只说明"这里扫到过东西", 不代表
+    # 狗站得上去 —— 多层场景里天花板、桌面都是 known 的。
+    #
+    # 但 OCCUPIED 不能只在 standable 里标。试过那样, 结果墙全成了 UNKNOWN(墙当然
+    # 不可站立), 而 UNKNOWN 在寻路里只是软代价, 路线就能穿墙而过。障碍就是障碍,
+    # 和站不站得上去无关。
+    occupancy = np.where(standable, OCC_FREE, OCC_UNKNOWN).astype(np.uint8)
     occupancy[hazard_density >= occupancy_min_points] = OCC_OCCUPIED
 
     topview_img = Image.fromarray(rgba, mode="RGBA")
@@ -241,7 +328,16 @@ def generate_topview(points, x_min, x_max, y_min, y_max, floor_z, ceiling_cutoff
     safety_rgba[..., 3] = (safety_arr.astype(np.float32) * 0.35).astype(np.uint8)
     safety_img_out = Image.fromarray(safety_rgba, mode="RGBA")
 
-    return topview_img, safety_img_out, occupancy, width, height
+    # 可站立区叠加层: 前端切换显示"哪里能放导航点"。单独一张而不是画进底图,
+    # 是为了不动已经调顺眼的平面图配色 —— 跟 safety 层同样的处理。
+    stand_rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    stand_rgba[..., 0] = 34
+    stand_rgba[..., 1] = 170
+    stand_rgba[..., 2] = 110
+    stand_rgba[..., 3] = np.where(standable, 70, 0).astype(np.uint8)
+    stand_img_out = Image.fromarray(stand_rgba, mode="RGBA")
+
+    return topview_img, safety_img_out, stand_img_out, occupancy, width, height
 
 
 def export_pointcloud_bin(pcd: o3d.geometry.PointCloud, out_path: Path, voxel_size: float, max_points: int,
@@ -303,6 +399,14 @@ def main():
     ap.add_argument("--denoise-std-ratio", type=float, default=2.0,
                      help="去噪阈值: 平均邻居距离超出全局均值多少个标准差就判定为离群点, "
                           "越小去得越狠")
+    ap.add_argument("--elevation", action=argparse.BooleanOptionalAction, default=True,
+                     help="是否提取逐格可站立高程面 (需要同目录下的建图轨迹)。关掉就退回"
+                          "整图一个 floor_z 的单层假设, 带楼梯的地图会算错")
+    ap.add_argument("--elev-resolution", type=float, default=0.10,
+                     help="高程栅格 m/格。比俯视图粗是有意的: 地面是全场采样最差的面, "
+                          "再细就没有统计意义 (见 elevation.py)")
+    ap.add_argument("--elev-fill-dist", type=int, default=1,
+                     help="高程补扫描空洞的扩散格数, 0=不补。补得多连通性好但会凭空造地面")
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -314,6 +418,11 @@ def main():
     pcd = o3d.io.read_point_cloud(str(in_path))
     points = np.asarray(pcd.points)
     print(f"      点数={len(points)}")
+
+    # 高程提取吃原始点云, 不吃去噪后的。统计离群点剔除是为渲染服务的(压掉墙面
+    # 毛刺), 但地面是全场采样最稀的面, 稀疏点正好符合"离群"的定义 —— 实测去噪
+    # 后可站立面积从 18.2 掉到 12.3 m2 (-33%), Δ 的 IQR 也从 0.074 涨到 0.093。
+    points_raw = points
 
     if args.denoise:
         print(f"[2/6] 统计离群点去噪 (neighbors={args.denoise_neighbors}, std_ratio={args.denoise_std_ratio})...")
@@ -327,31 +436,63 @@ def main():
     else:
         print("[2/6] 跳过去噪 (--no-denoise)")
 
-    print("[3/6] 检测地面/天花板高度 (z 直方图峰值法)...")
-    floor_z, ceiling_z = detect_floor_ceiling(points)
-    print(f"      floor_z={floor_z:.3f}  ceiling_z={ceiling_z:.3f}  room_height={ceiling_z - floor_z:.3f}")
-
-    print("[4/6] 计算鲁棒 XY 边界并生成俯视图...")
+    print("[3/6] 计算鲁棒 XY 边界...")
     x_min, x_max, y_min, y_max = robust_xy_bounds(points)
     print(f"      x=[{x_min:.2f},{x_max:.2f}] y=[{y_min:.2f},{y_max:.2f}]")
+
+    print("[4/6] 提取可站立高程面...")
+    elev_result = None
+    trajectory = load_trajectory(in_path.parent) if args.elevation else None
+    if trajectory is None:
+        if args.elevation:
+            print("      ! 没找到建图轨迹 (keyframe_info_3d.txt / keyframe_pos_3d.pcd),")
+            print("        退回整图一个 floor_z 的单层假设 —— 这份图若有楼梯, 结果不可信")
+        floor_z, ceiling_z = detect_floor_ceiling(points)
+    else:
+        params = ElevationParams(resolution=args.elev_resolution, fill_max_dist=args.elev_fill_dist)
+        elev_result = build_elevation(points_raw, trajectory, (x_min, x_max, y_min, y_max), params)
+        for k, v in elev_result.stats.items():
+            print(f"      {k:22s} {v}")
+        # floor_z 从此只是"主平面高度", 用来定天花板裁剪线和给渲染兜底,
+        # 不再承担"整图地面就在这个高度"的含义 —— 那个含义已经由 elevation 承担。
+        floor_z = float(np.nanmedian(elev_result.elevation))
+        ceiling_z = detect_ceiling(points, floor_z)
+        if elev_result.overlaps:
+            print(f"      ! {len(elev_result.overlaps)} 个格子存在多个可站立高度 "
+                  f"(折返楼梯/夹层), 单值 elevation.npy 已不足以描述这张图, "
+                  f"详见 overlaps.json")
+    print(f"      floor_z={floor_z:.3f}  ceiling_z={ceiling_z:.3f}  room_height={ceiling_z - floor_z:.3f}")
 
     # 俯视图和 3D 预览用同一个"看进屋里"的天花板裁剪线, 避免俯视图配色时把
     # 天花板当成全屋最高点、把真正的家具/地面高度都压缩到色阶底部。
     ceiling_cutoff = (ceiling_z - args.preview_ceiling_margin) if args.preview_hide_ceiling else ceiling_z + 1.0
     print(f"      俯视图/3D预览统一裁剪线: z < {ceiling_cutoff:.3f}")
 
-    topview_img, safety_img, occupancy, width, height = generate_topview(
+    print("[5/6] 生成俯视图与占据栅格...")
+    width = int(np.ceil((x_max - x_min) / args.resolution))
+    height = int(np.ceil((y_max - y_min) / args.resolution))
+    elev_fine = None
+    if elev_result is not None:
+        elev_fine = upsample_nearest(elev_result.elevation, args.elev_resolution,
+                                      args.resolution, height, width)
+        np.save(out_dir / "elevation.npy", elev_result.elevation)
+        (out_dir / "overlaps.json").write_text(
+            json.dumps(elev_result.overlaps, indent=2, ensure_ascii=False))
+
+    topview_img, safety_img, stand_img, occupancy, width, height = generate_topview(
         points, x_min, x_max, y_min, y_max, floor_z, ceiling_cutoff, args.resolution,
         args.hazard_low, args.hazard_high, args.density_clip_pct, args.safety_margin,
         args.shade_strength, args.height_blur_px, args.occupancy_min_points,
+        elev_fine=elev_fine,
     )
     topview_img.save(out_dir / "topview.png")
     safety_img.save(out_dir / "topview_safety.png")
+    stand_img.save(out_dir / "topview_standable.png")
     np.save(out_dir / "occupancy.npy", occupancy)
     n_free = int((occupancy == OCC_FREE).sum())
     n_occ = int((occupancy == OCC_OCCUPIED).sum())
     print(f"      俯视图尺寸: {width}x{height} px, 分辨率={args.resolution} m/px")
-    print(f"      占据栅格: 可通行 {n_free}, 障碍 {n_occ}, 未知 {width * height - n_free - n_occ}")
+    print(f"      占据栅格: 可通行 {n_free}, 障碍 {n_occ}, 不可站立 {width * height - n_free - n_occ}")
 
     meta = {
         "resolution_m_per_px": args.resolution,
@@ -365,9 +506,21 @@ def main():
         "world_to_pixel": "col = round((x - x_min) / resolution); row = round((y_max - y) / resolution)",
         "source_file": args.input,
     }
+    if elev_result is not None:
+        meta["elevation"] = {
+            "resolution_m_per_cell": args.elev_resolution,
+            "width": int(elev_result.elevation.shape[1]),
+            "height": int(elev_result.elevation.shape[0]),
+            # 导航点的 z 用 elevation + delta_sensor_m 算, 不要写死。这个值是从建图
+            # 轨迹实测出来的 "odom 离地高度", 会随 hand-lio 的 lidar_t_body 外参变化。
+            "delta_sensor_m": elev_result.delta_sensor_m,
+            "band_m": list(elev_result.band),
+            "overlap_cells": len(elev_result.overlaps),
+            "stats": elev_result.stats,
+        }
     (out_dir / "topview_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
 
-    print("[5/6] 导出 3D 预览点云 (降采样)...")
+    print("[6/6] 导出 3D 预览点云 (降采样)...")
     z_cutoff = ceiling_cutoff if args.preview_hide_ceiling else None
     if z_cutoff is not None:
         print(f"      3D 预览裁掉天花板: 保留 z < {z_cutoff:.3f}")
@@ -389,7 +542,7 @@ def main():
     (out_dir / "pointcloud_meta.json").write_text(json.dumps(pc_meta, indent=2, ensure_ascii=False))
     print(f"      导出点数: {n_out}")
 
-    print("[6/6] 完成。输出目录:", out_dir)
+    print("完成。输出目录:", out_dir)
 
 
 if __name__ == "__main__":

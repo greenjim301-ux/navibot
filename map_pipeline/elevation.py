@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from scipy.ndimage import maximum_filter, uniform_filter
+from scipy.ndimage import binary_erosion, maximum_filter, uniform_filter
 
 N8 = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -127,6 +127,27 @@ class ElevationParams:
     掩膜里, 前端应该和有证据的格子区分开。"""
 
     fill_min_neighbors: int = 2
+
+    corroborate_radius: float = 1.5
+    corroborate_tol: float = 0.25
+    """收尾校验: 每个可站立格的高度, 必须有一个 corroborate_radius 之内、高度差在
+    corroborate_tol 之内的轨迹种子给它背书, 否则丢掉。
+
+    前面那些逐格规则都是局部的, 攒够了距离总能漂出去: 生长从楼梯区带着 0.5m 左右的
+    高度escape 出来, 再靠补洞跨过空地, 就能在真实地面上方 1m 处摊开近 900 格假地面。
+    更糟的是它处在阈值边缘 —— 仅仅把 xy 边界挪 0.3m (去噪前/后取百分位的差别),
+    这片假地面就从 59 格变成 897 格。局部规则修不动这种问题, 只能上一条全局的:
+    高程是不是可信, 由"狗有没有在附近那个高度上站过"说了算。
+
+    代价是离轨迹超过 corroborate_radius 的地方一律不认, 可站立面积会变小。这是
+    有意的 —— 想要更大的可用区域, 让狗多走两圈比调阈值可靠。"""
+
+    min_overlap_width_cells: int = 1
+    """判定"这一格真有第二个可站立面"时, 该面所在连通块要能经受住几次腐蚀。
+
+    墙面上局部的采样空隙会被当成一小片有净空的平台, 生成细条状的伪第二层
+    (实测这份图报了 92 格, 查下来是一根从 -0.63 连到 1.12 的竖直墙柱)。真正的
+    夹层/折返楼梯至少有机器狗那么宽, 腐蚀一圈还在; 细条会被抹掉。"""
 
 
 @dataclass
@@ -277,6 +298,7 @@ def build_elevation(
     anchor: dict[tuple[int, int, int], int] = {}
     queue: deque[tuple[int, int, int, int]] = deque()
     seed_bins: list[int] = []
+    seed_h_grid = np.full((height, width), np.nan, np.float32)
     fallback = 0
     for x, y, zt in in_grid:
         r, c = to_rc(x, y)
@@ -289,6 +311,7 @@ def build_elevation(
             continue
         cells[(r, c)].append(b)
         anchor[(r, c, b)] = b
+        seed_h_grid[r, c] = to_z(b)
         queue.append((r, c, b, b))
 
     band_lo = to_z(min(seed_bins)) - p.band_tol
@@ -368,20 +391,43 @@ def build_elevation(
         grow()
 
     elevation = np.full((height, width), np.nan, np.float32)
-    overlaps = []
+    extra = np.zeros((height, width), bool)
+    _before_corroborate = 0
     for (r, c), bins in cells.items():
         heights = sorted(to_z(b) for b in bins)
         elevation[r, c] = heights[0]
         if len(heights) > 1:
-            overlaps.append(
-                {
-                    "row": int(r),
-                    "col": int(c),
-                    "x": float(x_min + c * res),
-                    "y": float(y_max - r * res),
-                    "heights": [round(h, 3) for h in heights],
-                }
-            )
+            extra[r, c] = True
+
+    # 收尾: 高度必须有附近走过的点背书 (理由见 corroborate_radius 的注释)
+    _before_corroborate = int(np.isfinite(elevation).sum())
+    if p.corroborate_radius > 0:
+        rad = max(1, int(round(p.corroborate_radius / res)))
+        endorsed = np.zeros((height, width), bool)
+        step = p.corroborate_tol
+        for lv in np.arange(band_lo, band_hi + step, step):
+            near = np.abs(seed_h_grid - lv) <= p.corroborate_tol
+            if not near.any():
+                continue
+            reach = maximum_filter(near, size=2 * rad + 1)
+            endorsed |= reach & (np.abs(elevation - lv) <= p.corroborate_tol)
+        elevation[~endorsed] = np.nan
+        extra &= endorsed
+        interpolated &= endorsed
+
+    # 只有经受住腐蚀的成片区域才算"这张图真的需要多值表示", 细条是墙面伪影
+    if p.min_overlap_width_cells > 0:
+        extra &= binary_erosion(extra, iterations=p.min_overlap_width_cells)
+    overlaps = [
+        {
+            "row": int(r),
+            "col": int(c),
+            "x": float(x_min + c * res),
+            "y": float(y_max - r * res),
+            "heights": [round(to_z(b), 3) for b in sorted(cells[(r, c)])],
+        }
+        for r, c in zip(*np.nonzero(extra))
+    ]
 
     n_cells = int(np.isfinite(elevation).sum())
     return ElevationResult(
@@ -395,6 +441,7 @@ def build_elevation(
             "width": width,
             "height": height,
             "standable_cells": n_cells,
+            "dropped_uncorroborated": _before_corroborate - n_cells,
             "standable_area_m2": round(n_cells * res * res, 2),
             "grown_cells": n_grown,
             "interpolated_cells": int(interpolated.sum()),
