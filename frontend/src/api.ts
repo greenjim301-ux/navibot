@@ -101,3 +101,19 @@ export async function deleteRoute(id: string): Promise<void> {
   const res = await fetch(`${BACKEND_HTTP}/api/routes/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
 }
+
+/** 批量查地面高程 (可站立高度)。null = 该点附近没有可信高程。
+ *  3D 预览把途经点画在各自实际高度上要用 —— 高程在后端的 elevation.npy 里,
+ *  前端自己算不了。 */
+export async function groundZ(
+  mapName: string,
+  points: { x: number; y: number }[],
+): Promise<(number | null)[]> {
+  const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/ground`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ points }),
+  });
+  const data = await asJson<{ z: (number | null)[] }>(res);
+  return data.z;
+}

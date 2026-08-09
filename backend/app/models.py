@@ -85,6 +85,19 @@ class PlanPathRequest(BaseModel):
     points: List[Waypoint] = Field(min_length=2)
 
 
+class GroundZRequest(BaseModel):
+    points: List[Waypoint] = Field(min_length=1)
+
+
+class GroundZResponse(BaseModel):
+    """每个点的地面高程 (可站立高度), null = 该点附近没有可信高程。
+
+    给 3D 预览用: 途经点标记要画在各自的实际高度上, 否则楼上楼下的点会挤在
+    同一个平面里。前端自己算不了 —— 高程在 elevation.npy 里, 只有后端能查。
+    """
+    z: List[Optional[float]] = []
+
+
 class PathSegment(BaseModel):
     planned: bool  # False = 起终点不连通, 这段是直连(会穿墙), 前端应画成虚线并提示
     points: List[dict]

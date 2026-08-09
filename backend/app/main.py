@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config
 from .map_registry import MapRegistry
 from .models import (
+    GroundZRequest, GroundZResponse,
     MapInfo, NavStatus, PlanPathRequest, PlanPathResponse,
     RouteCreateRequest, RouteInfo, RouteRequest,
 )
@@ -119,6 +120,15 @@ async def resume_route():
 @app.post("/api/estop", response_model=NavStatus)
 async def estop():
     return route_manager.estop()
+
+
+@app.post("/api/maps/{name}/ground", response_model=GroundZResponse)
+async def map_ground(name: str, req: GroundZRequest):
+    """批量查地面高程。3D 预览把途经点画在各自实际高度上要用。"""
+    zs = await asyncio.to_thread(
+        lambda: [path_planner.ground_elevation(name, p.x, p.y) for p in req.points]
+    )
+    return GroundZResponse(z=zs)
 
 
 @app.get("/api/maps", response_model=list[MapInfo])

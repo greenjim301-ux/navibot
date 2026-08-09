@@ -6,6 +6,7 @@ import { Line2 } from "three/examples/jsm/lines/Line2.js";
 import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { mapAssetUrl } from "../api";
+import { useGroundZ } from "../hooks/useGroundZ";
 import type { NavStatus, TopviewMeta, TrailPoint, Waypoint } from "../types";
 
 interface Props {
@@ -45,6 +46,10 @@ export function PointCloudView({
   const pathGroupRef = useRef<THREE.Group | null>(null);
   const pathMarkersRef = useRef<THREE.Group | null>(null);
   const pathMaterialsRef = useRef<LineMaterial | null>(null);
+
+  // 途经点要画在各自的实际地面高度上。楼梯地图里楼上楼下的点差一米多, 都按
+  // meta.floor_z 画会全挤在同一个平面里, 看不出哪个点在楼上。
+  const waypointZ = useGroundZ(mapName, waypoints);
 
   const [following, setFollowing] = useState(enableFollow);
   // 渲染循环里要读这两个值, 用 ref 拿最新值, 避免它们变化就重建整个场景
@@ -221,10 +226,12 @@ export function PointCloudView({
         new THREE.SphereGeometry(0.08, 16, 16),
         new THREE.MeshBasicMaterial({ color }),
       );
-      mesh.position.set(wp.x, wp.y, meta.floor_z + 0.1);
+      // 高程还没查回来 / 该点附近没有可信高程时退回 floor_z 兜底
+      const ground = waypointZ[idx] ?? meta.floor_z;
+      mesh.position.set(wp.x, wp.y, ground + 0.1);
       group.add(mesh);
     });
-  }, [waypoints, status, meta.floor_z]);
+  }, [waypoints, waypointZ, status, meta.floor_z]);
 
   // 机器狗实时位姿标记
   useEffect(() => {
@@ -236,7 +243,9 @@ export function PointCloudView({
       return;
     }
     mesh.visible = true;
-    mesh.position.set(pose.x, pose.y, meta.floor_z + 0.2);
+    // 直接用 odom 的 z: 它就是机体中心在世界系里的高度, 比 floor_z 猜一个准得多,
+    // 上下楼梯时这个标记会跟着升降。
+    mesh.position.set(pose.x, pose.y, pose.z);
     // ConeGeometry 的轴默认沿 +Y, 绕 Z 转 (yaw - 90°) 正好让锥尖指向 yaw 方向
     mesh.rotation.z = pose.yaw - Math.PI / 2;
   }, [status, meta.floor_z]);
