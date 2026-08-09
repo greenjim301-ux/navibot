@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { MapPin, Play, Pause, Square, TriangleAlert } from "lucide-react";
+import { MapPin, Play, Pause, Square, Eraser, TriangleAlert } from "lucide-react";
 import { cancelRoute, getRoute, pauseRoute, resumeRoute, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
@@ -199,6 +199,19 @@ export default function NavigatePage() {
                 </Button>
               )}
 
+              {/* 只在没跑的时候能清: 执行中清掉当前这趟的轨迹, 看到的就是一条从
+                  半路开始的线, 比留着更容易误读。editable 就是"不在 running/
+                  paused", 直接复用。 */}
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={!editable || trail.length === 0}
+                title={editable ? "清除已画出的实际轨迹" : "导航进行中不能清除轨迹"}
+                onClick={() => setTrail([])}
+              >
+                <Eraser />
+                清除轨迹
+              </Button>
             </>
           )
         }
