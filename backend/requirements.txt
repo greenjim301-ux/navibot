@@ -1,0 +1,6 @@
+# 已通过 `mamba run -n ros_host python -m pip install ...` 装进 ros_host 环境,
+# 这个文件只是记录版本, 不需要再单独建 venv。
+fastapi
+uvicorn[standard]
+websockets
+python-multipart

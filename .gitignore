@@ -1,0 +1,22 @@
+# --- 依赖与构建产物 ---
+node_modules/
+frontend/dist/
+.vite/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- 地图数据 ---
+# mapdata/ 是用户放进来的原始 PCD (当前 ~118MB), web_assets/ 是预处理生成的
+# 派生资产 —— 两者都能从源头重新得到, 不进版本库。
+mapdata/
+web_assets/
+
+# --- 运行时状态 ---
+# 用户保存的路线, 由 RouteStore 在运行时创建
+data/
+
+*.log
