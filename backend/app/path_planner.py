@@ -483,6 +483,34 @@ def plan_reference_path(map_name: str, points: List[Tuple[float, float]]) -> Lis
     return segments
 
 
+def resolve_altitude(map_name: str, x: float, y: float, z_offset: float = 0.0) -> Optional[float]:
+    """算一个导航点该用的 z (odom 系机体高度), 不可解返回 None。
+
+    = 该点地面高程 + 实测的 odom 离地高度 (delta_sensor_m) + z_offset。
+
+    delta_sensor_m 是预处理时从建图轨迹量出来的, 不写死 0.35/0.4: odom 的 z 基准
+    取决于 hand-lio 的 lidar_t_body 外参, 那个值一改这里就得跟着改, 从数据里量
+    才能自动对上。
+
+    点击位置常常不在认证的可站立格上, 所以就近找 (LEVEL_PROBE_M 半径内)。找不到
+    就返回 None —— 宁可让上层报错, 也不要瞎给一个 z: planner 的到达判据是 3D 的
+    0.5m, z 错了这个点可能永远到不了, 或者一开始就被当成"已到达"跳过。
+    """
+    try:
+        grid = load_grid(map_name)
+    except FileNotFoundError:
+        # 地图没预处理过 / 名字不存在。这里不抛错, 让上层退回"用机器狗当前 odom
+        # 高度"的兜底路径 —— 单层地图上那恰好是对的, 而且这条路径有日志可查。
+        return None
+    elev_meta = grid.meta.get("elevation")
+    if not elev_meta:
+        return None
+    z = grid.nearest_certified_elevation(x, y)
+    if z is None:
+        return None
+    return z + float(elev_meta["delta_sensor_m"]) + z_offset
+
+
 def find_stair_crossings(segments: List[dict], slope_thresh: float = STAIR_SLOPE,
                           margin_m: float = 0.4,
                           min_rise_m: float = MIN_STAIR_RISE_M) -> List[dict]:

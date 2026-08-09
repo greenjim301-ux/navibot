@@ -10,6 +10,17 @@ class Waypoint(BaseModel):
     y: float
     yaw: float = 0.0  # 弧度, 面向下一个途经点可由前端算好传入, 不传则默认0
 
+    z_offset: float = 0.0
+    """相对该点地面的高度微调 (m)。
+
+    路线里**不存绝对 z**, 下发时才用 "该点地面高程 + 实测的 odom 离地高度 +
+    z_offset" 现算。因为 odom 的 z 基准会随 hand-lio 的 lidar_t_body 外参变化,
+    存了绝对值就会在某天标定之后集体失效, 而且失效得很安静 —— 偏个 0.3m 不报错,
+    只是让 planner 那个 0.5m 的到达判据变得很脆。
+
+    留这个字段是因为 SCAN-Planner 的 README 两处都写了 "If the robot cannot climb
+    stairs, increase the z height of keypoints", 抬 z 是官方认可的调参手段。"""
+
 
 class RouteRequest(BaseModel):
     waypoints: List[Waypoint] = Field(min_length=1)
@@ -30,8 +41,12 @@ class TaskState(str, Enum):
 class Pose(BaseModel):
     x: float
     y: float
+    z: float = 0.0
     yaw: float
     stamp: float
+    cov: float = 0.0
+    """定位质量 (odom 的 covariance[0], 0~0.99)。>=0.99 表示定位失败, 此时所有
+    绝对坐标的导航点都不可信, 前端要显眼地提示。"""
 
 
 class NavStatus(BaseModel):

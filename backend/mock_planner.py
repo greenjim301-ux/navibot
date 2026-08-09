@@ -1,176 +1,126 @@
 #!/usr/bin/env python3
-"""
-Mock scan planner —— 在没有实体机器狗时, 用来联调 backend/前端的假 ROS 节点。
+"""模拟 SCAN-Planner (navi_mode=2), 用于没有实机/没跑真 planner 时验证后端链路。
 
-按 backend/app/config.py 里假设的 topic 契约实现:
-  订阅 /navibot/goal      (geometry_msgs/PoseStamped) 收到新目标点
-  订阅 /navibot/goal_path (nav_msgs/Path)             当前目标的绕障参考路径
-  订阅 /navibot/cancel    (std_msgs/Empty)            取消当前目标 (停在原地)
-  订阅 /navibot/estop     (std_msgs/Empty)            紧急停止 (停在原地 + 上报 aborted)
-  发布 /navibot/pose      (geometry_msgs/PoseStamped) 以 10Hz 匀速插值移动的虚拟位姿
-  发布 /navibot/goal_result (std_msgs/String)         到达目标后发 "reached"
+刻意复刻真 planner 的这几条行为 (对着 scan_replan_fsm.cpp 写的), 因为后端的进度
+推断完全建立在它们之上, 模拟得不像就测不出真问题:
 
-这个节点不做真实避障。收到 goal_path 时就沿着后端算好的折线逐点走(这样在
-3D 预览里看到的轨迹会绕开墙, 跟真实局部规划器的行为接近); 没有配套路径时
-退化成朝目标点直线移动。目的是把"提交路线 -> 逐点下发 -> 到达反馈 -> 实时
-位姿"这条链路跑通。
+  - 订阅 /preset_waypoints (nav_msgs/Path), 队列 1, 不 latch
+  - 一条 Path = 一整轮, 中途再来一条整轮替换
+  - 位姿的 z 原样使用, 不加 body_height
+  - 到达判据是 **3D 距离 < 0.5m**
+  - 新一轮开始时跳过距当前位置 0.5m 以内的点 (planNextWaypoint)
+  - 订阅 /planning/go2_execution_frozen, 冻结时原地不动
+  - 发布 /hand_lio/odom_vehicle (nav_msgs/Odometry), 带 covariance[0]
+  - **不发布任何到达/完成话题** —— 这正是后端必须自己推断进度的原因
+
+它不做避障也不规划轨迹, 直接朝目标点插值移动。
 """
 import argparse
 import math
-import sys
 
 import rospy
-from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
-from std_msgs.msg import Empty, String
+from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import Bool
 import tf.transformations as tft
 
-GOAL_TOPIC = "/navibot/goal"
-GOAL_PATH_TOPIC = "/navibot/goal_path"
-CANCEL_TOPIC = "/navibot/cancel"
-ESTOP_TOPIC = "/navibot/estop"
-POSE_TOPIC = "/navibot/pose"
-RESULT_TOPIC = "/navibot/goal_result"
-
 SPEED_M_S = 0.4
+CLIMB_SPEED_M_S = 0.15   # 爬升慢一些, 让"上楼梯"这段在时间上看得出来
 YAW_RATE_RAD_S = 1.5
-REACH_EPS_M = 0.1
-# 转折点的到达判定。不能设太松: 松了就等于在拐角处"抄近路", 贴墙的急转弯会
-# 切掉墙角(实测 0.15 时会有几个轨迹点压到墙里)。也不能小于单步位移
-# (SPEED_M_S/RATE_HZ = 0.04m), 否则可能永远进不了判定圈。
-WAYPOINT_EPS_M = 0.06
-# 收到的路径末端跟目标点差这么远以内, 就认为这条路径是配套这个目标的
-PATH_MATCH_EPS_M = 0.5
-RATE_HZ = 10.0
-MAP_FRAME = "map"
+REACH_EPS_M = 0.5        # 必须和 scan_replan_fsm.cpp 一致
+RATE_HZ = 20.0
 
 
 class MockPlanner:
-    def __init__(self, start=(0.0, 0.0, 0.0)):
-        self.x, self.y, self.yaw = start
-        self.target = None  # (x, y, yaw) or None
-        self.active = True
-        # 后端最近发来的参考路径 (世界坐标点列表), 以及当前正在走第几段
-        self.pending_path = None
-        self.route = []
-        self.route_idx = 0
+    def __init__(self, start):
+        self.x, self.y, self.z, self.yaw = start
+        self.waypoints = []
+        self.idx = 0
+        self.frozen = False
+        self.odom_pub = rospy.Publisher("/hand_lio/odom_vehicle", Odometry, queue_size=10)
+        rospy.Subscriber("/preset_waypoints", Path, self.on_waypoints, queue_size=1)
+        rospy.Subscriber("/planning/go2_execution_frozen", Bool, self.on_frozen, queue_size=10)
 
-        self.pose_pub = rospy.Publisher(POSE_TOPIC, PoseStamped, queue_size=10)
-        self.result_pub = rospy.Publisher(RESULT_TOPIC, String, queue_size=10)
-        rospy.Subscriber(GOAL_TOPIC, PoseStamped, self.on_goal, queue_size=10)
-        rospy.Subscriber(GOAL_PATH_TOPIC, Path, self.on_goal_path, queue_size=1)
-        rospy.Subscriber(CANCEL_TOPIC, Empty, self.on_cancel, queue_size=10)
-        rospy.Subscriber(ESTOP_TOPIC, Empty, self.on_estop, queue_size=10)
+    def on_frozen(self, msg):
+        if msg.data != self.frozen:
+            rospy.loginfo("[mock] frozen -> %s", msg.data)
+        self.frozen = msg.data
 
-    def on_goal_path(self, msg: Path):
-        """后端总是先发路径再发目标点, 所以这里只是先存下来, 等 goal 到了再启用。"""
-        self.pending_path = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+    def on_waypoints(self, msg):
+        if not msg.poses:
+            rospy.logwarn("[mock] 空的 waypoints, 忽略")
+            return
+        self.waypoints = [(p.pose.position.x, p.pose.position.y, p.pose.position.z) for p in msg.poses]
+        self.idx = 0
+        self.skip_reached()
+        rospy.loginfo("[mock] 收到 %d 个途经点, 从第 %d 个开始", len(self.waypoints), self.idx + 1)
 
-    def on_goal(self, msg: PoseStamped):
-        q = msg.pose.orientation
-        _, _, yaw = tft.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self.target = (msg.pose.position.x, msg.pose.position.y, yaw)
-        self.active = True
+    def skip_reached(self):
+        """跳过已经在 0.5m 以内的点, 对齐 planNextWaypoint 的行为。"""
+        while self.idx < len(self.waypoints) and self.dist(self.waypoints[self.idx]) < REACH_EPS_M:
+            rospy.loginfo("[mock] 途经点 %d 已在 %.2fm 内, 跳过", self.idx + 1, self.dist(self.waypoints[self.idx]))
+            self.idx += 1
 
-        # 只有当路径末端确实落在这个目标附近时才认为是配套的, 否则可能是上一个
-        # 目标残留的路径(goal_path 是 latch 的), 沿着它走会走错地方。
-        path = self.pending_path
-        self.pending_path = None
-        if path and len(path) >= 2 and math.hypot(
-            path[-1][0] - self.target[0], path[-1][1] - self.target[1]
-        ) <= PATH_MATCH_EPS_M:
-            self.route = path
-            self.route_idx = 0
-            rospy.loginfo("mock_planner: new goal (%.2f, %.2f) 沿 %d 点参考路径走",
-                          self.target[0], self.target[1], len(path))
-        else:
-            self.route = []
-            self.route_idx = 0
-            rospy.loginfo("mock_planner: new goal (%.2f, %.2f) 无配套路径, 直线前往",
-                          self.target[0], self.target[1])
+    def dist(self, wp):
+        return math.dist((self.x, self.y, self.z), wp)
 
-    def _stop(self):
-        self.target = None
-        self.route = []
-        self.route_idx = 0
-        self.pending_path = None
+    def step(self, dt):
+        if self.frozen or self.idx >= len(self.waypoints):
+            return
+        tx, ty, tz = self.waypoints[self.idx]
+        if self.dist((tx, ty, tz)) < REACH_EPS_M:
+            rospy.loginfo("[mock] 到达途经点 %d/%d", self.idx + 1, len(self.waypoints))
+            self.idx += 1
+            return
 
-    def on_cancel(self, _msg: Empty):
-        rospy.loginfo("mock_planner: canceled, stop at (%.2f, %.2f)", self.x, self.y)
-        self._stop()
+        target_yaw = math.atan2(ty - self.y, tx - self.x)
+        dyaw = (target_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
+        if abs(dyaw) > 0.15:
+            self.yaw += math.copysign(min(abs(dyaw), YAW_RATE_RAD_S * dt), dyaw)
+            return
 
-    def on_estop(self, _msg: Empty):
-        rospy.logwarn("mock_planner: ESTOP, stop at (%.2f, %.2f)", self.x, self.y)
-        self._stop()
-        self.result_pub.publish(String(data="aborted"))
+        dx, dy, dz = tx - self.x, ty - self.y, tz - self.z
+        planar = math.hypot(dx, dy)
+        if planar > 1e-6:
+            move = min(SPEED_M_S * dt, planar)
+            self.x += dx / planar * move
+            self.y += dy / planar * move
+        if abs(dz) > 1e-6:
+            self.z += math.copysign(min(CLIMB_SPEED_M_S * dt, abs(dz)), dz)
+        self.yaw += math.copysign(min(abs(dyaw), YAW_RATE_RAD_S * dt), dyaw)
 
-    def _current_carrot(self):
-        """当前要朝着走的点: 沿参考路径时是下一个未到达的转折点, 否则就是目标点。
-
-        返回 (x, y, is_final)。
-        """
-        while self.route_idx < len(self.route):
-            wx, wy = self.route[self.route_idx]
-            if math.hypot(wx - self.x, wy - self.y) < WAYPOINT_EPS_M:
-                self.route_idx += 1  # 这个转折点算走到了, 看下一个
-                continue
-            return wx, wy, self.route_idx >= len(self.route) - 1
-        return self.target[0], self.target[1], True
-
-    def step(self, dt: float):
-        if self.target is not None:
-            tx, ty, tyaw = self.target
-            cx, cy, is_final = self._current_carrot()
-            dx, dy = cx - self.x, cy - self.y
-            dist = math.hypot(dx, dy)
-
-            # 只有走到路径最后一段、并且真的贴近目标点了, 才算到达
-            if is_final and math.hypot(tx - self.x, ty - self.y) < REACH_EPS_M:
-                self.x, self.y, self.yaw = tx, ty, tyaw
-                self._stop()
-                rospy.loginfo("mock_planner: reached (%.2f, %.2f)", tx, ty)
-                self.result_pub.publish(String(data="reached"))
-            elif dist > 1e-6:
-                step = min(SPEED_M_S * dt, dist)
-                self.x += dx / dist * step
-                self.y += dy / dist * step
-                desired_yaw = math.atan2(dy, dx)
-                yaw_diff = math.atan2(math.sin(desired_yaw - self.yaw), math.cos(desired_yaw - self.yaw))
-                max_step = YAW_RATE_RAD_S * dt
-                self.yaw += max(-max_step, min(max_step, yaw_diff))
-
-        self.publish_pose()
-
-    def publish_pose(self):
-        msg = PoseStamped()
-        msg.header.frame_id = MAP_FRAME
-        msg.header.stamp = rospy.Time.now()
-        msg.pose.position.x = self.x
-        msg.pose.position.y = self.y
+    def publish(self):
+        odom = Odometry()
+        odom.header.stamp = rospy.Time.now()
+        odom.header.frame_id = "world"
+        odom.child_frame_id = "body"
+        odom.pose.pose.position.x = self.x
+        odom.pose.pose.position.y = self.y
+        odom.pose.pose.position.z = self.z
         qx, qy, qz, qw = tft.quaternion_from_euler(0, 0, self.yaw)
-        msg.pose.orientation.x = qx
-        msg.pose.orientation.y = qy
-        msg.pose.orientation.z = qz
-        msg.pose.orientation.w = qw
-        self.pose_pub.publish(msg)
+        odom.pose.pose.orientation.x = qx
+        odom.pose.pose.orientation.y = qy
+        odom.pose.pose.orientation.z = qz
+        odom.pose.pose.orientation.w = qw
+        odom.pose.covariance[0] = 0.01   # 定位良好
+        self.odom_pub.publish(odom)
 
 
 def main():
-    # 出生点要能改: 默认的原点 (0,0) 在某些地图里恰好落在墙/家具里, 机器狗
-    # 一开始就得从障碍里"走出来", 看起来像穿墙(实测 livingroom 就是这样)。
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", nargs=3, type=float, metavar=("X", "Y", "YAW"),
-                    default=[0.0, 0.0, 0.0], help="虚拟机器狗的初始位姿")
-    args, _ = ap.parse_known_args(rospy.myargv(argv=sys.argv)[1:])
+    ap.add_argument("--start", nargs=4, type=float, default=[0.0, 0.0, 0.0, 0.0],
+                     metavar=("X", "Y", "Z", "YAW"),
+                     help="初始位姿。z 是 odom 系机体高度 (地面高程 + 传感器离地高度), "
+                          "不是离地高度本身。默认 (0,0,0,0) 在多数地图里都在墙里, 记得改")
+    args = ap.parse_args()
 
-    rospy.init_node("mock_scan_planner", anonymous=False)
-    planner = MockPlanner(tuple(args.start))
-    rospy.loginfo("mock_planner start pose: (%.2f, %.2f, %.2f)", *args.start)
+    rospy.init_node("mock_scan_planner", disable_signals=True)
+    mp = MockPlanner(tuple(args.start))
+    rospy.loginfo("[mock] SCAN-Planner (navi_mode=2) 模拟器启动于 (%.2f, %.2f, %.2f)", *args.start[:3])
     rate = rospy.Rate(RATE_HZ)
     dt = 1.0 / RATE_HZ
-    rospy.loginfo("mock_planner started, listening on %s", GOAL_TOPIC)
     while not rospy.is_shutdown():
-        planner.step(dt)
+        mp.step(dt)
+        mp.publish()
         rate.sleep()
 
 

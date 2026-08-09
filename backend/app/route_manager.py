@@ -1,9 +1,10 @@
 import logging
+import math
 import threading
 import time
 from typing import List, Optional
 
-from . import path_planner
+from . import config, path_planner
 from .models import NavStatus, Pose, TaskState, Waypoint
 from .ros_bridge import RosBridge
 from .ws_manager import WebSocketManager
@@ -12,12 +13,26 @@ logger = logging.getLogger("navibot.route_manager")
 
 
 class RouteManager:
-    """途经点队列调度状态机。
+    """路线执行状态机 (对接 SCAN-Planner navi_mode=2)。
 
-    职责: 把前端提交的一条有序途经点列表, 逐个当作"当前目标"下发给 scan
-    planner (通过 RosBridge), 根据 planner 的到达/失败反馈推进到下一个点,
-    并把任务状态和机器狗实时位姿通过 WebSocketManager 广播给前端。
+    和之前"逐点下发目标、等 planner 回结果"的模型不一样, navi_mode=2 是一次收下
+    整条路线自己按顺序推进的, 所以这里的职责收窄成三件事:
+
+      1. 下发: 把途经点的 z 算出来 (地面高程 + 实测 odom 离地高度 + 用户微调),
+         整条 Path 一次发给 planner。
+      2. 跟踪: planner **不发布任何到达/完成话题**, 只能订阅 odom 用和它一样的
+         判据 (3D 距离 < REACH_EPS_M) 自己推进度。判据必须保持一致, 否则前端显示
+         的进度会和实际错位。
+      3. 暂停/继续: 发 /planning/go2_execution_frozen。
+
+    一个刻意的取舍: 这里推的"进度"是**推断**出来的, 不是 planner 告诉我们的。
+    planner 可能因为局部不可达而卡在某个点上, 我们看不出区别 —— 只能看到狗不动
+    了。所以有一个卡住超时兜底, 报 FAILED 而不是一直显示"执行中"。
     """
+
+    # 距离目标点这么久没有明显靠近就认为卡住了 (planner 侧无反馈, 只能靠超时)
+    STUCK_TIMEOUT_S = 60.0
+    STUCK_PROGRESS_EPS_M = 0.15
 
     def __init__(self, ros_bridge: RosBridge, ws_manager: WebSocketManager) -> None:
         self._ros = ros_bridge
@@ -26,11 +41,14 @@ class RouteManager:
 
         self._state = TaskState.IDLE
         self._waypoints: List[Waypoint] = []
+        self._dispatched_z: List[float] = []
         self._current_index: int = -1
         self._label: Optional[str] = None
         self._map_name: Optional[str] = None
         self._message: Optional[str] = None
         self._robot_pose: Optional[Pose] = None
+        self._best_dist: float = math.inf
+        self._best_dist_at: float = 0.0
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -53,117 +71,163 @@ class RouteManager:
         self._ws.broadcast_threadsafe({"type": "nav_status", "data": self._status_locked().model_dump()})
 
     # ---- 指令 ----
-    def _dispatch_goal(self, wp: Waypoint) -> None:
-        """下发一个目标点。
+    def _resolve_altitudes(self, waypoints: List[Waypoint], map_name: Optional[str],
+                            pose: Optional[Pose]) -> List[float]:
+        """给每个途经点算下发用的 z (odom 系机体高度)。
 
-        先把"从当前位置到这个目标"的绕障参考路径发出去, 再发目标点本身 ——
-        顺序不能反, planner 收到目标时才能立刻按路径起步。路径算不出来(地图
-        没预处理/两点不连通)就只发目标点, planner 自己按局部避障走。
+        有高程图就用 "地面高程 + delta_sensor_m + z_offset"。没有(旧版资产/没有
+        建图轨迹)就退回机器狗当前的 odom z —— 单层平面图上这恰好是对的, 因为
+        目标高度就等于它现在所处的高度。两者都没有就报错, 不猜。
         """
-        with self._lock:
-            pose = self._robot_pose
-            map_name = self._map_name
-
-        if pose is not None and map_name:
-            try:
-                segments = path_planner.plan_reference_path(map_name, [(pose.x, pose.y), (wp.x, wp.y)])
-                points = [pt for seg in segments if seg["planned"] for pt in seg["points"]]
-                if points:
-                    self._ros.publish_goal_path(points)
-            except Exception:
-                logger.exception("规划参考路径失败, 只下发目标点 map=%s", map_name)
-
-        self._ros.publish_goal(wp.x, wp.y, wp.yaw)
+        out: List[float] = []
+        for i, wp in enumerate(waypoints, 1):
+            z = path_planner.resolve_altitude(map_name, wp.x, wp.y, wp.z_offset) if map_name else None
+            if z is None:
+                if pose is None:
+                    raise ValueError(
+                        f"第 {i} 个途经点无法确定高度: 地图没有高程数据, 也还没收到机器狗位姿"
+                    )
+                z = pose.z + wp.z_offset
+                logger.info("途经点 %d 没有高程数据, 退回当前 odom 高度 %.3f", i, z)
+            out.append(z)
+        return out
 
     def submit_route(self, waypoints: List[Waypoint], label: Optional[str] = None,
                       map_name: Optional[str] = None) -> NavStatus:
         if not waypoints:
             raise ValueError("waypoints 不能为空")
+
+        with self._lock:
+            pose = self._robot_pose
+        zs = self._resolve_altitudes(waypoints, map_name, pose)
+
+        # 先解冻: 上一轮暂停/取消留下的 frozen=True 会让新路线发下去也不动
+        self._ros.set_frozen(False)
+        self._ros.publish_waypoints([
+            {"x": wp.x, "y": wp.y, "z": z, "yaw": wp.yaw} for wp, z in zip(waypoints, zs)
+        ])
+
         with self._lock:
             self._waypoints = list(waypoints)
-            self._current_index = 0
+            self._dispatched_z = zs
             self._label = label
             self._map_name = map_name
             self._message = None
             self._state = TaskState.RUNNING
-            wp = self._waypoints[0]
-            status = self._status_locked()
-        self._dispatch_goal(wp)
-        logger.info("route submitted: %d waypoints, label=%s", len(waypoints), label)
-        with self._lock:
+            # planner 起步时会跳过距当前位置 0.5m 以内的点 (planNextWaypoint),
+            # 这里用同样的规则对齐, 否则第一个点就会显示成"没到过"
+            self._current_index = 0
+            self._reset_stuck_locked()
+            self._advance_reached_locked()
             self._broadcast_locked()
+            status = self._status_locked()
+        logger.info("route submitted: %d waypoints, label=%s, map=%s", len(waypoints), label, map_name)
         return status
 
     def cancel(self) -> NavStatus:
+        """取消当前路线。
+
+        navi_mode=2 没有 cancel 话题, 能做的只有冻结执行 —— planner 内部仍然认为
+        任务在进行, 只是轨迹时间不再推进。想真正结束这一轮, 用户需要重新下发一条
+        新路线 (新的 Path 会整轮替换)。
+        """
+        self._ros.set_frozen(True)
         with self._lock:
             self._state = TaskState.CANCELED
-            self._message = "用户取消"
+            self._message = "已取消 (执行已冻结; planner 侧任务需由新路线替换)"
             self._broadcast_locked()
-            status = self._status_locked()
-        self._ros.cancel()
-        return status
+            return self._status_locked()
 
     def pause(self) -> NavStatus:
         with self._lock:
             if self._state != TaskState.RUNNING:
                 raise ValueError(f"当前状态 {self._state} 不能暂停")
+        self._ros.set_frozen(True)
+        with self._lock:
             self._state = TaskState.PAUSED
             self._message = "已暂停"
             self._broadcast_locked()
-            status = self._status_locked()
-        self._ros.cancel()
-        return status
+            return self._status_locked()
 
     def resume(self) -> NavStatus:
         with self._lock:
             if self._state != TaskState.PAUSED:
                 raise ValueError(f"当前状态 {self._state} 不能继续")
-            if not (0 <= self._current_index < len(self._waypoints)):
-                raise ValueError("没有可继续的途经点")
+        self._ros.set_frozen(False)
+        with self._lock:
             self._state = TaskState.RUNNING
             self._message = None
-            wp = self._waypoints[self._current_index]
+            self._reset_stuck_locked()
             self._broadcast_locked()
-            status = self._status_locked()
-        self._dispatch_goal(wp)
-        return status
+            return self._status_locked()
 
     def estop(self) -> NavStatus:
+        """紧急停止。
+
+        **这是个已知缺口**: navi_mode=2 没有外部急停接口, 这里能做的只是冻结轨迹
+        执行 —— 它让 planner 不再往前推轨迹时间, 但不等于断电或立即制动。真正的
+        硬急停必须在 unitree_bridge 那一层做。UI 上不要把它说成"急停已生效"。
+        """
+        self._ros.set_frozen(True)
         with self._lock:
             self._state = TaskState.ESTOPPED
-            self._message = "紧急停止"
+            self._message = "已冻结轨迹执行 (非硬急停, 见 config.py)"
             self._broadcast_locked()
-            status = self._status_locked()
-        self._ros.estop()
-        return status
+            return self._status_locked()
+
+    # ---- 进度推断 ----
+    def _reset_stuck_locked(self) -> None:
+        self._best_dist = math.inf
+        self._best_dist_at = time.time()
+
+    def _dist_to_locked(self, idx: int) -> float:
+        """到第 idx 个途经点的 3D 距离, 和 planner 的到达判据用同一个度量。"""
+        p = self._robot_pose
+        if p is None or not (0 <= idx < len(self._waypoints)):
+            return math.inf
+        wp = self._waypoints[idx]
+        z = self._dispatched_z[idx] if idx < len(self._dispatched_z) else p.z
+        return math.dist((p.x, p.y, p.z), (wp.x, wp.y, z))
+
+    def _advance_reached_locked(self) -> bool:
+        """把已经到达的途经点推过去, 返回是否发生了变化。"""
+        moved = False
+        while self._current_index < len(self._waypoints):
+            if self._dist_to_locked(self._current_index) >= config.REACH_EPS_M:
+                break
+            self._current_index += 1
+            moved = True
+            self._reset_stuck_locked()
+        if moved and self._current_index >= len(self._waypoints):
+            self._state = TaskState.SUCCEEDED
+            self._message = "路线执行完成"
+            self._current_index = len(self._waypoints)
+        return moved
 
     # ---- ROS 回调 (跑在 ros 后台线程里) ----
-    def on_pose(self, x: float, y: float, yaw: float, stamp: float) -> None:
+    def on_pose(self, x: float, y: float, z: float, yaw: float, cov: float, stamp: float) -> None:
         with self._lock:
-            self._robot_pose = Pose(x=x, y=y, yaw=yaw, stamp=stamp)
+            self._robot_pose = Pose(x=x, y=y, z=z, yaw=yaw, stamp=stamp, cov=cov)
+            if self._state == TaskState.RUNNING:
+                if not self._advance_reached_locked():
+                    self._check_stuck_locked()
             self._broadcast_locked()
 
-    def on_result(self, result: str) -> None:
-        with self._lock:
-            if self._state != TaskState.RUNNING:
-                logger.info("ignore goal result '%s' in state %s", result, self._state)
-                return
+    def _check_stuck_locked(self) -> None:
+        """planner 不报失败, 只能靠"长时间没靠近目标"来判卡住。
 
-            if result == "reached":
-                self._current_index += 1
-                if self._current_index >= len(self._waypoints):
-                    self._state = TaskState.SUCCEEDED
-                    self._message = "路线执行完成"
-                    self._broadcast_locked()
-                    return
-                wp = self._waypoints[self._current_index]
-                self._broadcast_locked()
-            else:
-                self._state = TaskState.FAILED
-                self._message = f"scan planner 返回: {result}"
-                self._broadcast_locked()
-                return
-
-        # 发布下一个目标点放到锁外面, 避免持锁时做 IO
-        self._dispatch_goal(wp)
-        logger.info("advance to waypoint %d/%d", self._current_index + 1, len(self._waypoints))
+        比较的是历史最近距离而不是上一帧距离: 绕障时会先远离再靠近, 拿上一帧比会
+        误报。
+        """
+        d = self._dist_to_locked(self._current_index)
+        if d + self.STUCK_PROGRESS_EPS_M < self._best_dist:
+            self._best_dist = d
+            self._best_dist_at = time.time()
+            return
+        if time.time() - self._best_dist_at > self.STUCK_TIMEOUT_S:
+            self._state = TaskState.FAILED
+            self._message = (
+                f"{self.STUCK_TIMEOUT_S:.0f}s 内没有靠近第 {self._current_index + 1} 个途经点, "
+                f"当前距离 {d:.2f}m。可能是局部规划失败, 或该点的 z 不对导致到达判据永远不成立"
+            )
+            logger.warning(self._message)

@@ -45,13 +45,10 @@ async def on_startup() -> None:
     # RosBridge 的回调在 route_manager 构造完成前就注册了, 但回调只有等
     # ros_bridge.start() 之后订阅到真实消息才会触发, 那时 route_manager
     # (global) 早已赋值完毕, 所以这里用闭包引用全局变量是安全的。
-    def _on_pose(x, y, yaw, stamp):
-        route_manager.on_pose(x, y, yaw, stamp)
+    def _on_pose(x, y, z, yaw, cov, stamp):
+        route_manager.on_pose(x, y, z, yaw, cov, stamp)
 
-    def _on_result(result):
-        route_manager.on_result(result)
-
-    ros_bridge = RosBridge(on_pose=_on_pose, on_result=_on_result)
+    ros_bridge = RosBridge(on_pose=_on_pose)
     route_manager = RouteManager(ros_bridge, ws_manager)
     ros_bridge.start()
     logger.info("navibot backend started")
@@ -68,6 +65,11 @@ async def submit_route(req: RouteRequest):
         return route_manager.submit_route(req.waypoints, req.label, req.map_name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        # 最典型的是"没有节点订阅 /preset_waypoints"(planner 没在跑)。这条必须原样
+        # 透到前端 —— 只显示 500 的话, 用户看到的是"下发失败"而不知道该去启动
+        # planner, 而 /preset_waypoints 不 latch, 消息是被静默丢掉的。
+        raise HTTPException(503, str(e))
 
 
 @app.post("/api/route/cancel", response_model=NavStatus)
