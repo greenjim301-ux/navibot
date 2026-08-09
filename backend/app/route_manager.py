@@ -2,6 +2,7 @@ import logging
 import math
 import threading
 import time
+from dataclasses import dataclass
 from typing import List, Optional
 
 from . import config, path_planner
@@ -10,6 +11,14 @@ from .ros_bridge import RosBridge
 from .ws_manager import WebSocketManager
 
 logger = logging.getLogger("navibot.route_manager")
+
+
+@dataclass
+class _Altitude:
+    """一个途经点的下发高度, 以及它是怎么算出来的 (给日志用)。"""
+    z: float
+    ground: Optional[float] = None
+    delta: Optional[float] = None
 
 
 class RouteManager:
@@ -91,8 +100,38 @@ class RouteManager:
         ground = path_planner.ground_elevation(map_name, pose.x, pose.y)
         return None if ground is None else pose.z - ground
 
+    def _log_dispatch(self, waypoints: List[Waypoint], alts: List["_Altitude"],
+                       map_name: Optional[str], pose: Optional[Pose]) -> None:
+        """把下发的东西原样打出来。
+
+        坐标出问题时这是唯一的现场: planner 收到 waypoints 之后不会回报任何东西,
+        狗不动的时候只能靠这几行判断是"点算错了"还是"planner 没收到"。所以三样
+        都打全 —— 狗在哪、点在哪、z 是怎么算出来的。
+        """
+        logger.info("=== 下发 preset_waypoints: map=%s, %d 个点 ===", map_name, len(waypoints))
+        if pose is None:
+            logger.info("  机器狗当前: (还没收到 odom)")
+        else:
+            ground = path_planner.ground_elevation(map_name, pose.x, pose.y) if map_name else None
+            logger.info(
+                "  机器狗当前: x=%.3f y=%.3f z=%.3f yaw=%.1f°  脚下地面=%s  定位cov=%.3f%s",
+                pose.x, pose.y, pose.z, math.degrees(pose.yaw),
+                f"{ground:.3f}" if ground is not None else "未知(不在认证可站立区)",
+                pose.cov, "  【定位失败!】" if pose.cov >= config.POSE_COV_BAD else "",
+            )
+        for i, (wp, a) in enumerate(zip(waypoints, alts), 1):
+            if a.ground is not None and a.delta is not None:
+                how = f"地面{a.ground:+.3f} + Δ{a.delta:+.3f}" + (f" + 微调{wp.z_offset:+.3f}" if wp.z_offset else "")
+            else:
+                how = "无高程数据, 退回当前 odom 高度"
+            dist = (math.dist((pose.x, pose.y, pose.z), (wp.x, wp.y, a.z)) if pose else float("nan"))
+            # planner 起步时会跳过距当前位置 0.5m 以内的点 (planNextWaypoint), 标出来
+            skip = "  ← planner 会跳过(<%.1fm)" % config.REACH_EPS_M if dist < config.REACH_EPS_M else ""
+            logger.info("  #%d  x=%.3f y=%.3f z=%.3f  (%s)  距狗 %.2fm%s",
+                        i, wp.x, wp.y, a.z, how, dist, skip)
+
     def _resolve_altitudes(self, waypoints: List[Waypoint], map_name: Optional[str],
-                            pose: Optional[Pose]) -> List[float]:
+                            pose: Optional[Pose]) -> List["_Altitude"]:
         """给每个途经点算下发用的 z (odom 系机体高度)。
 
         z = 该点地面高程 + Δ + z_offset。Δ 优先用运行时实测值(见 _odom_delta),
@@ -115,19 +154,17 @@ class RouteManager:
                 delta, mapped, delta - mapped,
             )
 
-        out: List[float] = []
+        out: List[_Altitude] = []
         for i, wp in enumerate(waypoints, 1):
             ground = path_planner.ground_elevation(map_name, wp.x, wp.y) if map_name else None
             if ground is not None and delta is not None:
-                out.append(ground + delta + wp.z_offset)
+                out.append(_Altitude(z=ground + delta + wp.z_offset, ground=ground, delta=delta))
                 continue
             if pose is None:
                 raise ValueError(
                     f"第 {i} 个途经点无法确定高度: 地图没有高程数据, 也还没收到机器狗位姿"
                 )
-            z = pose.z + wp.z_offset
-            logger.info("途经点 %d 没有高程数据, 退回当前 odom 高度 %.3f", i, z)
-            out.append(z)
+            out.append(_Altitude(z=pose.z + wp.z_offset))
         return out
 
     def submit_route(self, waypoints: List[Waypoint], label: Optional[str] = None,
@@ -137,17 +174,18 @@ class RouteManager:
 
         with self._lock:
             pose = self._robot_pose
-        zs = self._resolve_altitudes(waypoints, map_name, pose)
+        alts = self._resolve_altitudes(waypoints, map_name, pose)
+        self._log_dispatch(waypoints, alts, map_name, pose)
 
         # 先解冻: 上一轮暂停/取消留下的 frozen=True 会让新路线发下去也不动
         self._ros.set_frozen(False)
         self._ros.publish_waypoints([
-            {"x": wp.x, "y": wp.y, "z": z, "yaw": wp.yaw} for wp, z in zip(waypoints, zs)
+            {"x": wp.x, "y": wp.y, "z": a.z, "yaw": wp.yaw} for wp, a in zip(waypoints, alts)
         ])
 
         with self._lock:
             self._waypoints = list(waypoints)
-            self._dispatched_z = zs
+            self._dispatched_z = [a.z for a in alts]
             self._label = label
             self._map_name = map_name
             self._message = None
@@ -159,7 +197,7 @@ class RouteManager:
             self._advance_reached_locked()
             self._broadcast_locked()
             status = self._status_locked()
-        logger.info("route submitted: %d waypoints, label=%s, map=%s", len(waypoints), label, map_name)
+        logger.info("route submitted: label=%s, 当前目标 #%d", label, self._current_index + 1)
         return status
 
     def cancel(self) -> NavStatus:

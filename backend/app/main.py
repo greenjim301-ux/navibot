@@ -18,7 +18,18 @@ from .ros_bridge import RosBridge
 from .route_manager import RouteManager
 from .ws_manager import WebSocketManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# 不能用 logging.basicConfig: uvicorn 在导入本模块之前就调过 logging.config.dictConfig,
+# 那个调用内部会 _clearExistingHandlers() 把 root 的 handler 清空, 结果就是后端自己的
+# 日志(下发的导航点坐标、Δ 告警等)一条都看不到, 而 uvicorn 的访问日志照常输出 ——
+# 排查时很容易误判成"代码没走到"。这里直接给 navibot 这棵 logger 树挂 handler。
+_navibot_logger = logging.getLogger("navibot")
+if not _navibot_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _navibot_logger.addHandler(_handler)
+    _navibot_logger.setLevel(logging.INFO)
+    _navibot_logger.propagate = False
+
 logger = logging.getLogger("navibot.main")
 
 app = FastAPI(title="navibot backend")
