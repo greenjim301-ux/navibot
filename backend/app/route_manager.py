@@ -71,24 +71,62 @@ class RouteManager:
         self._ws.broadcast_threadsafe({"type": "nav_status", "data": self._status_locked().model_dump()})
 
     # ---- 指令 ----
+    # 运行时实测 Δ 和建图时那个差超过这么多就告警 —— 多半是外参改了
+    DELTA_MISMATCH_WARN_M = 0.10
+
+    def _odom_delta(self, map_name: Optional[str], pose: Optional[Pose]) -> Optional[float]:
+        """实测"odom 离地高度" = 机器狗当前 odom z - 它脚下的地面高程。
+
+        为什么不能直接用预处理存下来的 delta_sensor_m: 那个是从**建图轨迹**
+        (HandBot-S1 自己的位姿)量出来的, 而运行时的 odom 是
+        /hand_lio/odom_vehicle = world_T_imu · imu_T_lidar · lidar_T_body,
+        中间还隔着两次外参变换。给 lidar_t_body 填上实测的 -0.24m 之后, 运行时
+        odom 的 z 基准整体降了约 0.196m, 建图轨迹却纹丝不动 —— 继续用建图那个值
+        会让下发的 z 系统性偏高约 0.2m, 而 planner 的到达判据只有 0.5m。
+
+        现场量就没这个问题: 无论外参怎么改、以后换什么硬件, 这个差值都自动对上。
+        """
+        if not map_name or pose is None:
+            return None
+        ground = path_planner.ground_elevation(map_name, pose.x, pose.y)
+        return None if ground is None else pose.z - ground
+
     def _resolve_altitudes(self, waypoints: List[Waypoint], map_name: Optional[str],
                             pose: Optional[Pose]) -> List[float]:
         """给每个途经点算下发用的 z (odom 系机体高度)。
 
-        有高程图就用 "地面高程 + delta_sensor_m + z_offset"。没有(旧版资产/没有
-        建图轨迹)就退回机器狗当前的 odom z —— 单层平面图上这恰好是对的, 因为
-        目标高度就等于它现在所处的高度。两者都没有就报错, 不猜。
+        z = 该点地面高程 + Δ + z_offset。Δ 优先用运行时实测值(见 _odom_delta),
+        机器狗不在认证可站立区上时才退回建图时量的 delta_sensor_m。
+
+        地图完全没有高程数据(旧版资产/没有建图轨迹)时, 退回机器狗当前的 odom z
+        —— 单层平面图上这恰好是对的, 因为目标高度就等于它现在所处的高度。两者
+        都没有就报错, 不猜。
         """
+        delta = self._odom_delta(map_name, pose)
+        mapped = path_planner.mapping_delta(map_name) if map_name else None
+        if delta is None:
+            delta = mapped
+            if delta is not None:
+                logger.warning("机器狗不在认证可站立区上, Δ 退回建图值 %.3f (可能偏)", delta)
+        elif mapped is not None and abs(delta - mapped) > self.DELTA_MISMATCH_WARN_M:
+            logger.warning(
+                "实测 Δ=%.3f 与建图 Δ=%.3f 差 %.3fm。建图设备位姿和运行时 odom 不是"
+                "同一个基准(hand-lio 的 lidar_t_body/imu_t_lidar 外参), 已按实测值下发",
+                delta, mapped, delta - mapped,
+            )
+
         out: List[float] = []
         for i, wp in enumerate(waypoints, 1):
-            z = path_planner.resolve_altitude(map_name, wp.x, wp.y, wp.z_offset) if map_name else None
-            if z is None:
-                if pose is None:
-                    raise ValueError(
-                        f"第 {i} 个途经点无法确定高度: 地图没有高程数据, 也还没收到机器狗位姿"
-                    )
-                z = pose.z + wp.z_offset
-                logger.info("途经点 %d 没有高程数据, 退回当前 odom 高度 %.3f", i, z)
+            ground = path_planner.ground_elevation(map_name, wp.x, wp.y) if map_name else None
+            if ground is not None and delta is not None:
+                out.append(ground + delta + wp.z_offset)
+                continue
+            if pose is None:
+                raise ValueError(
+                    f"第 {i} 个途经点无法确定高度: 地图没有高程数据, 也还没收到机器狗位姿"
+                )
+            z = pose.z + wp.z_offset
+            logger.info("途经点 %d 没有高程数据, 退回当前 odom 高度 %.3f", i, z)
             out.append(z)
         return out
 
