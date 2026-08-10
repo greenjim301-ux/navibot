@@ -16,7 +16,7 @@ class Waypoint(BaseModel):
     路线里**不存绝对 z**, 下发时才用 "该点地面高程 + 实测的 odom 离地高度 +
     z_offset" 现算。因为 odom 的 z 基准会随 hand-lio 的 lidar_t_body 外参变化,
     存了绝对值就会在某天标定之后集体失效, 而且失效得很安静 —— 偏个 0.3m 不报错,
-    只是让 planner 那个 0.5m 的到达判据变得很脆。
+    只是让 planner 途中点提前切换用的那个 0.3m 半径变得很脆。
 
     留这个字段是因为 SCAN-Planner 的 README 两处都写了 "If the robot cannot climb
     stairs, increase the z height of keypoints", 抬 z 是官方认可的调参手段。"""
@@ -34,8 +34,6 @@ class TaskState(str, Enum):
     PAUSED = "paused"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
-    CANCELED = "canceled"
-    ESTOPPED = "estopped"
 
 
 class Pose(BaseModel):
@@ -81,10 +79,6 @@ class MapStatus(str, Enum):
     ERROR = "error"
 
 
-class PlanPathRequest(BaseModel):
-    points: List[Waypoint] = Field(min_length=2)
-
-
 class GroundZRequest(BaseModel):
     points: List[Waypoint] = Field(min_length=1)
 
@@ -96,15 +90,6 @@ class GroundZResponse(BaseModel):
     同一个平面里。前端自己算不了 —— 高程在 elevation.npy 里, 只有后端能查。
     """
     z: List[Optional[float]] = []
-
-
-class PathSegment(BaseModel):
-    planned: bool  # False = 起终点不连通, 这段是直连(会穿墙), 前端应画成虚线并提示
-    points: List[dict]
-
-
-class PlanPathResponse(BaseModel):
-    segments: List[PathSegment] = []
 
 
 class MapInfo(BaseModel):

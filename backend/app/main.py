@@ -9,7 +9,7 @@ from . import config
 from .map_registry import MapRegistry
 from .models import (
     GroundZRequest, GroundZResponse,
-    MapInfo, NavStatus, PlanPathRequest, PlanPathResponse,
+    MapInfo, NavStatus,
     RouteCreateRequest, RouteInfo, RouteRequest,
 )
 from .route_store import RouteStore
@@ -83,7 +83,10 @@ async def on_startup() -> None:
     def _on_pose(x, y, z, yaw, cov, stamp):
         route_manager.on_pose(x, y, z, yaw, cov, stamp)
 
-    ros_bridge = RosBridge(on_pose=_on_pose)
+    def _on_optimal_traj(points):
+        route_manager.on_optimal_traj(points)
+
+    ros_bridge = RosBridge(on_pose=_on_pose, on_optimal_traj=_on_optimal_traj)
     route_manager = RouteManager(ros_bridge, ws_manager)
     ros_bridge.start()
     logger.info("navibot backend started")
@@ -107,11 +110,6 @@ async def submit_route(req: RouteRequest):
         raise HTTPException(503, str(e))
 
 
-@app.post("/api/route/cancel", response_model=NavStatus)
-async def cancel_route():
-    return route_manager.cancel()
-
-
 @app.post("/api/route/pause", response_model=NavStatus)
 async def pause_route():
     try:
@@ -126,11 +124,6 @@ async def resume_route():
         return route_manager.resume()
     except ValueError as e:
         raise HTTPException(400, str(e))
-
-
-@app.post("/api/estop", response_model=NavStatus)
-async def estop():
-    return route_manager.estop()
 
 
 @app.post("/api/maps/{name}/ground", response_model=GroundZResponse)
@@ -161,17 +154,6 @@ async def preprocess_map(name: str):
         return await asyncio.to_thread(map_registry.start_preprocess, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
-
-
-@app.post("/api/maps/{name}/plan_path", response_model=PlanPathResponse)
-async def plan_path(name: str, req: PlanPathRequest):
-    """算一条"大概"绕开障碍的参考路线, 只给前端 3D 预览展示用, 不参与导航执行。"""
-    pts = [(w.x, w.y) for w in req.points]
-    try:
-        segments = await asyncio.to_thread(path_planner.plan_reference_path, name, pts)
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
-    return PlanPathResponse(segments=segments)
 
 
 @app.delete("/api/maps/{name}", status_code=204)
@@ -221,6 +203,9 @@ async def ws_nav(ws: WebSocket):
     try:
         status = route_manager.get_status()
         await ws.send_json({"type": "nav_status", "data": status.model_dump()})
+        optimal_traj = route_manager.get_optimal_traj()
+        if optimal_traj:
+            await ws.send_json({"type": "optimal_traj", "data": {"points": optimal_traj}})
         while True:
             # 前端目前不需要往这条连接发消息, 只是保持连接存活/感知断开
             await ws.receive_text()

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { MapPin, Play, Pause, Square, Eraser, TriangleAlert } from "lucide-react";
-import { cancelRoute, getRoute, pauseRoute, resumeRoute, submitRoute } from "../api";
+import { MapPin, Play, Pause, Eraser, TriangleAlert } from "lucide-react";
+import { getRoute, pauseRoute, resumeRoute, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
@@ -24,8 +24,6 @@ const STATE_LABEL: Record<string, string> = {
   paused: "已暂停",
   succeeded: "已完成",
   failed: "失败",
-  canceled: "已取消",
-  estopped: "紧急停止",
 };
 
 const STATE_VARIANT: Record<string, "secondary" | "default" | "outline" | "destructive"> = {
@@ -34,8 +32,6 @@ const STATE_VARIANT: Record<string, "secondary" | "default" | "outline" | "destr
   paused: "outline",
   succeeded: "default",
   failed: "destructive",
-  canceled: "secondary",
-  estopped: "destructive",
 };
 
 // 轨迹采样阈值: odom 是 200Hz 的, 每帧都记会瞬间堆出几万个点且肉眼看不出区别。
@@ -70,7 +66,7 @@ export default function NavigatePage() {
   const [draftShowSafety, setDraftShowSafety] = useState(false);
   const [draftShowStandable, setDraftShowStandable] = useState(true);
 
-  const { status, connected } = useNavStatus();
+  const { status, optimalTraj, connected } = useNavStatus();
 
   const state = status?.state ?? "idle";
   const editable = state !== "running" && state !== "paused";
@@ -192,13 +188,6 @@ export default function NavigatePage() {
                 </Button>
               )}
 
-              {(state === "running" || state === "paused") && (
-                <Button size="sm" variant="outline" disabled={busy} onClick={() => run(cancelRoute)}>
-                  <Square />
-                  取消
-                </Button>
-              )}
-
               {/* 只在没跑的时候能清: 执行中清掉当前这趟的轨迹, 看到的就是一条从
                   半路开始的线, 比留着更容易误读。editable 就是"不在 running/
                   paused", 直接复用。 */}
@@ -240,6 +229,7 @@ export default function NavigatePage() {
             waypoints={waypoints}
             status={status}
             trail={trail}
+            optimalTraj={optimalTraj}
             enableFollow
           />
         </div>

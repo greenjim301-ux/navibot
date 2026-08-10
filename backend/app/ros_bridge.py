@@ -13,6 +13,7 @@ import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool
+from visualization_msgs.msg import Marker
 import tf.transformations as tft
 
 from . import config
@@ -21,11 +22,14 @@ logger = logging.getLogger("navibot.ros_bridge")
 
 # (x, y, z, yaw, cov0, stamp)
 PoseCallback = Callable[[float, float, float, float, float, float], None]
+# 一条局部轨迹的采样点: [{"x":.., "y":.., "z":.., "r":.., "g":.., "b":..}, ...]
+OptimalTrajCallback = Callable[[List[dict]], None]
 
 
 class RosBridge:
-    def __init__(self, on_pose: PoseCallback) -> None:
+    def __init__(self, on_pose: PoseCallback, on_optimal_traj: Optional[OptimalTrajCallback] = None) -> None:
         self._on_pose = on_pose
+        self._on_optimal_traj = on_optimal_traj
         self._wp_pub: Optional[rospy.Publisher] = None
         self._frozen_pub: Optional[rospy.Publisher] = None
         self._started = False
@@ -41,10 +45,12 @@ class RosBridge:
             self._wp_pub = rospy.Publisher(config.PRESET_WAYPOINTS_TOPIC, Path, queue_size=1)
             self._frozen_pub = rospy.Publisher(config.FROZEN_TOPIC, Bool, queue_size=10, latch=True)
             rospy.Subscriber(config.ODOM_TOPIC, Odometry, self._handle_odom, queue_size=50)
+            if self._on_optimal_traj is not None:
+                rospy.Subscriber(config.OPTIMAL_TRAJ_TOPIC, Marker, self._handle_optimal_traj, queue_size=5)
             logger.info(
-                "ROS bridge started: waypoints=%s frozen=%s odom=%s frame=%s",
+                "ROS bridge started: waypoints=%s frozen=%s odom=%s optimal_traj=%s frame=%s",
                 config.PRESET_WAYPOINTS_TOPIC, config.FROZEN_TOPIC,
-                config.ODOM_TOPIC, config.MAP_FRAME,
+                config.ODOM_TOPIC, config.OPTIMAL_TRAJ_TOPIC, config.MAP_FRAME,
             )
             rospy.spin()
 
@@ -61,6 +67,28 @@ class RosBridge:
         _, _, yaw = tft.euler_from_quaternion([q.x, q.y, q.z, q.w])
         p = msg.pose.pose.position
         self._on_pose(p.x, p.y, p.z, yaw, float(msg.pose.covariance[0]), time.time())
+
+    def _handle_optimal_traj(self, msg: Marker) -> None:
+        """/scan_planner_node/optimal_list 一次发两个 Marker (SPHERE_LIST id=0,
+        LINE_STRIP id=1000), 点和颜色是同一份数据, 只转发 LINE_STRIP 那条就够画线了。
+
+        原样转发给前端, 不在这里做任何"这是不是当前路线"之类的判断 —— 跟 rviz
+        一样, 纯展示 planner 当前正在跑的局部轨迹, planner 每次重规划都会重发。
+        """
+        if msg.type != Marker.LINE_STRIP:
+            return
+        has_colors = len(msg.colors) == len(msg.points)
+        points = [
+            {
+                "x": p.x, "y": p.y, "z": p.z,
+                "r": msg.colors[i].r if has_colors else 1.0,
+                "g": msg.colors[i].g if has_colors else 0.0,
+                "b": msg.colors[i].b if has_colors else 0.0,
+            }
+            for i, p in enumerate(msg.points)
+        ]
+        assert self._on_optimal_traj is not None
+        self._on_optimal_traj(points)
 
     def publish_waypoints(self, waypoints: List[dict]) -> None:
         """下发一整轮路线。waypoints 里的 z 必须已经是 odom 系机体高度。

@@ -7,8 +7,13 @@
   - 订阅 /preset_waypoints (nav_msgs/Path), 队列 1, 不 latch
   - 一条 Path = 一整轮, 中途再来一条整轮替换
   - 位姿的 z 原样使用, 不加 body_height
-  - 到达判据是 **3D 距离 < 0.5m**
-  - 新一轮开始时跳过距当前位置 0.5m 以内的点 (planNextWaypoint)
+  - 到达判据是 **3D 距离 < waypoint_arrival_radius(0.3m)**, 但这只对"途中点"
+    提前生效(真机在 EXEC_TRAJ 里检查); 最后一个点没有这条提前退出, 是等轨迹
+    执行完/reboundReplan 判 TOO_CLOSE_TO_GOAL 才算数, 落点比 0.3m 精确得多——
+    这里简化处理, 最后一个点走到接近重合才算到达, 不提前截断
+  - 新一轮开始时只跳过和当前位置**几乎重合**(< kDegenerateDist=0.05m)的点
+    (planNextWaypoint) —— 这不是"差不多到了就跳过", 正常间距的途经点不会被
+    跳, scan planner 在执行层面仍然会尽量开到每一个点
   - 订阅 /planning/go2_execution_frozen, 冻结时原地不动
   - 发布 /hand_lio/odom_vehicle (nav_msgs/Odometry), 带 covariance[0]
   - **不发布任何到达/完成话题** —— 这正是后端必须自己推断进度的原因
@@ -19,14 +24,18 @@ import argparse
 import math
 
 import rospy
+from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, ColorRGBA
+from visualization_msgs.msg import Marker
 import tf.transformations as tft
 
 SPEED_M_S = 0.4
 CLIMB_SPEED_M_S = 0.15   # 爬升慢一些, 让"上楼梯"这段在时间上看得出来
 YAW_RATE_RAD_S = 1.5
-REACH_EPS_M = 0.5        # 必须和 scan_replan_fsm.cpp 一致
+WAYPOINT_ARRIVAL_RADIUS_M = 0.3   # 对齐 fsm/waypoint_arrival_radius, 只用于途中点提前切换
+DEGENERATE_DIST_M = 0.05         # 对齐 kDegenerateDist, 只用于跳过和当前位置重合的点
+LAST_WAYPOINT_EPS_M = 0.02       # 最后一个点没有提前退出, 模拟成走到接近重合才算到达
 RATE_HZ = 20.0
 
 
@@ -37,6 +46,9 @@ class MockPlanner:
         self.idx = 0
         self.frozen = False
         self.odom_pub = rospy.Publisher("/hand_lio/odom_vehicle", Odometry, queue_size=10)
+        # 假装是 displayOptimalTraj: 只为了验证后端 -> 前端这条转发链路通不通,
+        # 不追求形状对 —— 真 planner 发的是样条轨迹, 这里就发当前位置到目标点的直线
+        self.optimal_pub = rospy.Publisher("/scan_planner_node/optimal_list", Marker, queue_size=2)
         rospy.Subscriber("/preset_waypoints", Path, self.on_waypoints, queue_size=1)
         rospy.Subscriber("/planning/go2_execution_frozen", Bool, self.on_frozen, queue_size=10)
 
@@ -55,9 +67,9 @@ class MockPlanner:
         rospy.loginfo("[mock] 收到 %d 个途经点, 从第 %d 个开始", len(self.waypoints), self.idx + 1)
 
     def skip_reached(self):
-        """跳过已经在 0.5m 以内的点, 对齐 planNextWaypoint 的行为。"""
-        while self.idx < len(self.waypoints) and self.dist(self.waypoints[self.idx]) < REACH_EPS_M:
-            rospy.loginfo("[mock] 途经点 %d 已在 %.2fm 内, 跳过", self.idx + 1, self.dist(self.waypoints[self.idx]))
+        """跳过和当前位置几乎重合的点, 对齐 planNextWaypoint 的 kDegenerateDist 判据。"""
+        while self.idx < len(self.waypoints) and self.dist(self.waypoints[self.idx]) < DEGENERATE_DIST_M:
+            rospy.loginfo("[mock] 途经点 %d 与当前位置重合(%.3fm), 跳过", self.idx + 1, self.dist(self.waypoints[self.idx]))
             self.idx += 1
 
     def dist(self, wp):
@@ -67,7 +79,9 @@ class MockPlanner:
         if self.frozen or self.idx >= len(self.waypoints):
             return
         tx, ty, tz = self.waypoints[self.idx]
-        if self.dist((tx, ty, tz)) < REACH_EPS_M:
+        is_last = self.idx == len(self.waypoints) - 1
+        eps = LAST_WAYPOINT_EPS_M if is_last else WAYPOINT_ARRIVAL_RADIUS_M
+        if self.dist((tx, ty, tz)) < eps:
             rospy.loginfo("[mock] 到达途经点 %d/%d", self.idx + 1, len(self.waypoints))
             self.idx += 1
             return
@@ -103,6 +117,24 @@ class MockPlanner:
         odom.pose.pose.orientation.w = qw
         odom.pose.covariance[0] = 0.01   # 定位良好
         self.odom_pub.publish(odom)
+        self.publish_optimal_traj()
+
+    def publish_optimal_traj(self):
+        if self.idx >= len(self.waypoints):
+            return
+        line = Marker()
+        line.header.frame_id = "world"
+        line.header.stamp = rospy.Time.now()
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.id = 1000
+        line.pose.orientation.w = 1.0
+        line.scale.x = 0.08
+        tx, ty, tz = self.waypoints[self.idx]
+        for x, y, z in ((self.x, self.y, self.z), (tx, ty, tz)):
+            line.points.append(Point(x=x, y=y, z=z))
+            line.colors.append(ColorRGBA(r=1.0, g=0.4, b=0.0, a=1.0))
+        self.optimal_pub.publish(line)
 
 
 def main():

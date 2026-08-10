@@ -7,7 +7,7 @@ import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { mapAssetUrl } from "../api";
 import { useGroundZ } from "../hooks/useGroundZ";
-import type { NavStatus, TopviewMeta, TrailPoint, Waypoint } from "../types";
+import type { NavStatus, OptimalTrajPoint, TopviewMeta, TrailPoint, Waypoint } from "../types";
 
 interface Props {
   mapName: string;
@@ -17,6 +17,9 @@ interface Props {
   /** 机器狗实际走过的轨迹 (世界坐标, 含 z)。由页面按位姿累积后传进来 —— 这里
    *  只负责画, 不持有状态, 页面才知道什么时候该清空(比如开始新一轮导航)。 */
   trail?: TrailPoint[] | null;
+  /** planner 当前正在跑的局部轨迹 (/scan_planner_node/optimal_list 原样转发),
+   *  跟 rviz 里看到的是同一份数据, 纯展示, 不参与任何判断。 */
+  optimalTraj?: OptimalTrajPoint[] | null;
   /** 是否提供"镜头跟随机器狗"开关 (预览页没有实时位姿, 不需要) */
   enableFollow?: boolean;
 }
@@ -38,7 +41,7 @@ function parsePCW1(buf: ArrayBuffer) {
 }
 
 export function PointCloudView({
-  mapName, meta, waypoints = [], status = null, trail = null, enableFollow = false,
+  mapName, meta, waypoints = [], status = null, trail = null, optimalTraj = null, enableFollow = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const markersGroupRef = useRef<THREE.Group | null>(null);
@@ -46,6 +49,8 @@ export function PointCloudView({
   const pathGroupRef = useRef<THREE.Group | null>(null);
   const pathMarkersRef = useRef<THREE.Group | null>(null);
   const pathMaterialsRef = useRef<LineMaterial | null>(null);
+  const optimalGroupRef = useRef<THREE.Group | null>(null);
+  const optimalMaterialRef = useRef<LineMaterial | null>(null);
 
   // 途经点要画在各自的实际地面高度上。楼梯地图里楼上楼下的点差一米多, 都按
   // meta.floor_z 画会全挤在同一个平面里, 看不出哪个点在楼上。
@@ -146,6 +151,18 @@ export function PointCloudView({
     scene.add(pathMarkers);
     pathMarkersRef.current = pathMarkers;
 
+    // planner 局部轨迹: 逐点着色 (对齐 rviz 里那条红黄速度渐变线), 跟轨迹的
+    // 纯色 trailMaterial 不能共用一个 material。
+    const optimalMaterial = new LineMaterial({
+      linewidth: 2.5, vertexColors: true, transparent: true, opacity: 0.95, depthTest: false,
+    });
+    optimalMaterial.resolution.set(width, height);
+    optimalMaterialRef.current = optimalMaterial;
+
+    const optimalGroup = new THREE.Group();
+    scene.add(optimalGroup);
+    optimalGroupRef.current = optimalGroup;
+
     let disposed = false;
     let points: THREE.Points | null = null;
 
@@ -195,6 +212,7 @@ export function PointCloudView({
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
       trailMaterial.resolution.set(w, h);
+      optimalMaterial.resolution.set(w, h);
     }
     window.addEventListener("resize", handleResize);
 
@@ -207,6 +225,8 @@ export function PointCloudView({
       (points?.material as THREE.Material | undefined)?.dispose();
       pathGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       trailMaterial.dispose();
+      optimalGroup.children.forEach((c) => (c as Line2).geometry.dispose());
+      optimalMaterial.dispose();
       renderer.dispose();
       container.removeChild(renderer.domElement);
     };
@@ -280,6 +300,33 @@ export function PointCloudView({
     line.renderOrder = 10;
     group.add(line);
   }, [trail]);
+
+  // planner 局部轨迹 (/scan_planner_node/optimal_list): 每次重规划整条替换,
+  // 跟 rviz 一样不做任何插值/平滑, 后端给什么就画什么。
+  useEffect(() => {
+    const group = optimalGroupRef.current;
+    const material = optimalMaterialRef.current;
+    if (!group || !material) return;
+
+    group.children.forEach((c) => (c as Line2).geometry.dispose());
+    group.clear();
+
+    if (!optimalTraj || optimalTraj.length < 2) return;
+
+    const positions: number[] = [];
+    const colors: number[] = [];
+    optimalTraj.forEach((p) => {
+      positions.push(p.x, p.y, p.z);
+      colors.push(p.r, p.g, p.b);
+    });
+    const geometry = new LineGeometry();
+    geometry.setPositions(positions);
+    geometry.setColors(colors);
+    const line = new Line2(geometry, material);
+    line.computeLineDistances();
+    line.renderOrder = 11;
+    group.add(line);
+  }, [optimalTraj]);
 
   const hasPose = Boolean(status?.robot_pose);
 

@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { BACKEND_WS } from "./api";
-import type { NavStatus } from "./types";
+import type { NavStatus, OptimalTrajPoint } from "./types";
 
-/** 连接后端 /ws/nav, 断线自动重连, 暴露最新的 NavStatus 与连接状态。 */
+/** 连接后端 /ws/nav, 断线自动重连, 暴露最新的 NavStatus、局部轨迹与连接状态。 */
 export function useNavStatus() {
   const [status, setStatus] = useState<NavStatus | null>(null);
+  const [optimalTraj, setOptimalTraj] = useState<OptimalTrajPoint[] | null>(null);
   const [connected, setConnected] = useState(false);
   const retryRef = useRef(0);
 
@@ -24,6 +25,8 @@ export function useNavStatus() {
           const msg = JSON.parse(evt.data);
           if (msg.type === "nav_status") {
             setStatus(msg.data as NavStatus);
+          } else if (msg.type === "optimal_traj") {
+            setOptimalTraj((msg.data as { points: OptimalTrajPoint[] }).points);
           }
         } catch {
           // ignore malformed message
@@ -49,5 +52,5 @@ export function useNavStatus() {
     };
   }, []);
 
-  return { status, connected };
+  return { status, optimalTraj, connected };
 }

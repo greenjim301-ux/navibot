@@ -29,9 +29,10 @@ class RouteManager:
 
       1. 下发: 把途经点的 z 算出来 (地面高程 + 实测 odom 离地高度 + 用户微调),
          整条 Path 一次发给 planner。
-      2. 跟踪: planner **不发布任何到达/完成话题**, 只能订阅 odom 用和它一样的
-         判据 (3D 距离 < REACH_EPS_M) 自己推进度。判据必须保持一致, 否则前端显示
-         的进度会和实际错位。
+      2. 跟踪: planner **不发布任何到达/完成话题**, 只能订阅 odom 自己推进度。
+         途中点用和 planner 一样的判据 (3D 距离 < REACH_EPS_M, 对齐
+         fsm/waypoint_arrival_radius); 最后一个点 planner 没有这条提前退出,
+         只能拿同一个半径近似, 时机跟真机不完全一致。见 config.py 里的详细说明。
       3. 暂停/继续: 发 /planning/go2_execution_frozen。
 
     一个刻意的取舍: 这里推的"进度"是**推断**出来的, 不是 planner 告诉我们的。
@@ -58,6 +59,7 @@ class RouteManager:
         self._robot_pose: Optional[Pose] = None
         self._best_dist: float = math.inf
         self._best_dist_at: float = 0.0
+        self._optimal_traj: List[dict] = []
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -79,6 +81,11 @@ class RouteManager:
     def _broadcast_locked(self) -> None:
         self._ws.broadcast_threadsafe({"type": "nav_status", "data": self._status_locked().model_dump()})
 
+    def get_optimal_traj(self) -> List[dict]:
+        """planner 当前正在跑的局部轨迹采样点, 给新连上的 ws 客户端补发用。"""
+        with self._lock:
+            return list(self._optimal_traj)
+
     # ---- 指令 ----
     # 运行时实测 Δ 和建图时那个差超过这么多就告警 —— 多半是外参改了
     DELTA_MISMATCH_WARN_M = 0.10
@@ -91,7 +98,7 @@ class RouteManager:
         /hand_lio/odom_vehicle = world_T_imu · imu_T_lidar · lidar_T_body,
         中间还隔着两次外参变换。给 lidar_t_body 填上实测的 -0.24m 之后, 运行时
         odom 的 z 基准整体降了约 0.196m, 建图轨迹却纹丝不动 —— 继续用建图那个值
-        会让下发的 z 系统性偏高约 0.2m, 而 planner 的到达判据只有 0.5m。
+        会让下发的 z 系统性偏高约 0.2m, 而 planner 途中点提前切换的半径只有 0.3m。
 
         现场量就没这个问题: 无论外参怎么改、以后换什么硬件, 这个差值都自动对上。
         """
@@ -125,8 +132,9 @@ class RouteManager:
             else:
                 how = "无高程数据, 退回当前 odom 高度"
             dist = (math.dist((pose.x, pose.y, pose.z), (wp.x, wp.y, a.z)) if pose else float("nan"))
-            # planner 起步时会跳过距当前位置 0.5m 以内的点 (planNextWaypoint), 标出来
-            skip = "  ← planner 会跳过(<%.1fm)" % config.REACH_EPS_M if dist < config.REACH_EPS_M else ""
+            # planNextWaypoint() 的重合点判据(不是到达判据): 只有跟机器狗当前位置
+            # 几乎重合(<5cm)才会被跳过, 标出来
+            skip = "  ← planner 会跳过(重合 <%.2fm)" % config.DEGENERATE_DIST_M if dist < config.DEGENERATE_DIST_M else ""
             logger.info("  #%d  x=%.3f y=%.3f z=%.3f  (%s)  距狗 %.2fm%s",
                         i, wp.x, wp.y, a.z, how, dist, skip)
 
@@ -190,29 +198,13 @@ class RouteManager:
             self._map_name = map_name
             self._message = None
             self._state = TaskState.RUNNING
-            # planner 起步时会跳过距当前位置 0.5m 以内的点 (planNextWaypoint),
-            # 这里用同样的规则对齐, 否则第一个点就会显示成"没到过"
             self._current_index = 0
             self._reset_stuck_locked()
-            self._advance_reached_locked()
+            self._skip_degenerate_locked()
             self._broadcast_locked()
             status = self._status_locked()
         logger.info("route submitted: label=%s, 当前目标 #%d", label, self._current_index + 1)
         return status
-
-    def cancel(self) -> NavStatus:
-        """取消当前路线。
-
-        navi_mode=2 没有 cancel 话题, 能做的只有冻结执行 —— planner 内部仍然认为
-        任务在进行, 只是轨迹时间不再推进。想真正结束这一轮, 用户需要重新下发一条
-        新路线 (新的 Path 会整轮替换)。
-        """
-        self._ros.set_frozen(True)
-        with self._lock:
-            self._state = TaskState.CANCELED
-            self._message = "已取消 (执行已冻结; planner 侧任务需由新路线替换)"
-            self._broadcast_locked()
-            return self._status_locked()
 
     def pause(self) -> NavStatus:
         with self._lock:
@@ -237,20 +229,6 @@ class RouteManager:
             self._broadcast_locked()
             return self._status_locked()
 
-    def estop(self) -> NavStatus:
-        """紧急停止。
-
-        **这是个已知缺口**: navi_mode=2 没有外部急停接口, 这里能做的只是冻结轨迹
-        执行 —— 它让 planner 不再往前推轨迹时间, 但不等于断电或立即制动。真正的
-        硬急停必须在 unitree_bridge 那一层做。UI 上不要把它说成"急停已生效"。
-        """
-        self._ros.set_frozen(True)
-        with self._lock:
-            self._state = TaskState.ESTOPPED
-            self._message = "已冻结轨迹执行 (非硬急停, 见 config.py)"
-            self._broadcast_locked()
-            return self._status_locked()
-
     # ---- 进度推断 ----
     def _reset_stuck_locked(self) -> None:
         self._best_dist = math.inf
@@ -266,7 +244,8 @@ class RouteManager:
         return math.dist((p.x, p.y, p.z), (wp.x, wp.y, z))
 
     def _advance_reached_locked(self) -> bool:
-        """把已经到达的途经点推过去, 返回是否发生了变化。"""
+        """把已经进入 REACH_EPS_M(waypoint_arrival_radius) 的途经点推过去, 返回是否
+        发生了变化。这是途中点的判据; 对最后一个点只是近似, 见 config.py。"""
         moved = False
         while self._current_index < len(self._waypoints):
             if self._dist_to_locked(self._current_index) >= config.REACH_EPS_M:
@@ -280,6 +259,21 @@ class RouteManager:
             self._current_index = len(self._waypoints)
         return moved
 
+    def _skip_degenerate_locked(self) -> None:
+        """下发新一轮时, 跳过和机器狗当前位置几乎重合的途经点, 对齐
+        planNextWaypoint() 里的 kDegenerateDist(0.05m) 判据。
+
+        这跟到达判据(_advance_reached_locked)是两回事: 正常间距的途经点(通常
+        远大于 5cm)基本不会触发这条, 没被跳过不代表 planner 不会去——它仍然会
+        尽量开过去。
+        """
+        while (self._current_index < len(self._waypoints)
+               and self._dist_to_locked(self._current_index) < config.DEGENERATE_DIST_M):
+            self._current_index += 1
+        if self._current_index >= len(self._waypoints):
+            self._state = TaskState.SUCCEEDED
+            self._message = "路线执行完成"
+
     # ---- ROS 回调 (跑在 ros 后台线程里) ----
     def on_pose(self, x: float, y: float, z: float, yaw: float, cov: float, stamp: float) -> None:
         with self._lock:
@@ -288,6 +282,13 @@ class RouteManager:
                 if not self._advance_reached_locked():
                     self._check_stuck_locked()
             self._broadcast_locked()
+
+    def on_optimal_traj(self, points: List[dict]) -> None:
+        """转发 /scan_planner_node/optimal_list, 纯展示用途, 不参与任何进度/状态
+        判断 —— 3D 预览里画出来的就是 rviz 里那条红黄渐变的局部轨迹线。"""
+        with self._lock:
+            self._optimal_traj = points
+        self._ws.broadcast_threadsafe({"type": "optimal_traj", "data": {"points": points}})
 
     def _check_stuck_locked(self) -> None:
         """planner 不报失败, 只能靠"长时间没靠近目标"来判卡住。

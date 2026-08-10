@@ -44,7 +44,7 @@ from PIL import Image, ImageFilter
 
 from elevation import ElevationParams, build_elevation, load_trajectory
 
-# occupancy.npy 的取值语义 (后端寻路读这个文件, 跟 backend/app/path_planner.py 保持一致)
+# occupancy.npy 的取值语义
 OCC_UNKNOWN = 0
 OCC_FREE = 1
 OCC_OCCUPIED = 2

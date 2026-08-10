@@ -1,4 +1,4 @@
-import type { MapInfo, NavStatus, PathSegment, SavedRoute, Waypoint } from "./types";
+import type { MapInfo, NavStatus, SavedRoute, Waypoint } from "./types";
 
 export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "http://localhost:8000";
 export const BACKEND_WS = import.meta.env.VITE_BACKEND_WS ?? "ws://localhost:8000";
@@ -29,20 +29,12 @@ export async function submitRoute(waypoints: Waypoint[], mapName: string, label?
   );
 }
 
-export async function cancelRoute(): Promise<NavStatus> {
-  return asJson(await fetch(`${BACKEND_HTTP}/api/route/cancel`, { method: "POST" }));
-}
-
 export async function pauseRoute(): Promise<NavStatus> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/route/pause`, { method: "POST" }));
 }
 
 export async function resumeRoute(): Promise<NavStatus> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/route/resume`, { method: "POST" }));
-}
-
-export async function estop(): Promise<NavStatus> {
-  return asJson(await fetch(`${BACKEND_HTTP}/api/estop`, { method: "POST" }));
 }
 
 export async function listMaps(): Promise<MapInfo[]> {
@@ -55,17 +47,6 @@ export async function getMap(name: string): Promise<MapInfo> {
 
 export async function preprocessMap(name: string): Promise<MapInfo> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(name)}/preprocess`, { method: "POST" }));
-}
-
-/** 让后端在占据栅格上算一条"大概"绕开障碍的参考路线 (仅供 3D 预览展示) */
-export async function planPath(mapName: string, points: Waypoint[]): Promise<PathSegment[]> {
-  const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/plan_path`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ points }),
-  });
-  const data = await asJson<{ segments: PathSegment[] }>(res);
-  return data.segments;
 }
 
 export async function deleteMap(name: string): Promise<void> {

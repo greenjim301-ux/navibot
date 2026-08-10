@@ -13,9 +13,7 @@ export type TaskState =
   | "running"
   | "paused"
   | "succeeded"
-  | "failed"
-  | "canceled"
-  | "estopped";
+  | "failed";
 
 export interface RobotPose {
   x: number;
@@ -47,17 +45,15 @@ export interface TrailPoint {
   z: number;
 }
 
-export interface PathPoint {
+/** /scan_planner_node/optimal_list 的一个采样点: planner 当前正在跑的局部轨迹,
+ *  rgb 是 rviz 里那条速度渐变色线的原始颜色 (0~1), 后端原样转发, 不是我们算的。 */
+export interface OptimalTrajPoint {
   x: number;
   y: number;
-  /** 该点的地面高度 (不是机体高度)。画线时自己抬一点; null = 该点不在认证可站立区。 */
-  z: number | null;
-}
-
-export interface PathSegment {
-  /** false = 起终点在占据栅格上不连通, 这段是直连(会穿墙), 要画成虚线并提示用户 */
-  planned: boolean;
-  points: PathPoint[];
+  z: number;
+  r: number;
+  g: number;
+  b: number;
 }
 
 export interface SavedRoute {
