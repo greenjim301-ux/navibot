@@ -6,16 +6,25 @@
 # 环境不用装, 见 backend/requirements.txt。
 numpy>=1.24
 scipy>=1.10
-open3d>=0.19
+open3d>=0.14
 pillow>=10.4
 
 # ---- Python 3.8 兼容性 ----
 # 代码本身兼容 3.8 (map_pipeline/*.py 都带 `from __future__ import annotations`,
-# 用 tools/check_py38.py 校验过), 但上面这些版本下限是按 mamba ros_host (3.12)
-# 里实测装到的版本写的, 不代表它们本身支持 3.8。如果哪天要在机器 (lubancat)
-# 的系统 Python 3.8 上直接跑预处理 (不走 mamba), 用这组经 PyPI 实测确认的
-# "3.8 能装到的最新版" 上限, 否则 pip 会直接解析失败或装出装不上的轮子:
-#   numpy<2.0      (2.0 起要求 Python >=3.9)
-#   scipy<1.11      (1.11 起要求 Python >=3.9)
-#   pillow<11.0     (11.0 起要求 Python >=3.9)
-#   open3d          不受影响, 0.19 仍提供 cp38 轮子
+# 用 tools/check_py38.py 校验过)。版本下限按功能需要给的, 不是照搬某个环境里
+# 装到的版本 —— 用到的 open3d API (read_point_cloud/.points/select_by_index/
+# voxel_down_sample/remove_statistical_outlier) 从很早的版本起就稳定, 没有理由
+# 卡在某个特定版本。
+#
+# open3d 的版本上限**因机器的 CPU 架构和 glibc 版本而不同**, 之前这里写过
+# "0.19 仍提供 cp38 轮子", 是只在 x86_64 上核实过就写的, 在 aarch64 的板子
+# (比如跑这套预处理的 lubancat) 上是错的, 实测:
+#   x86_64                              : 0.19.0 的 cp38 轮子仍在 (manylinux_2_31)
+#   aarch64 + glibc>=2.27               : 最高到 0.18.0/0.17.0 (manylinux_2_27)
+#   aarch64 + glibc<2.27 (比如 lubancat) : 最高只能到 0.16.0 (manylinux2014, 老 tag)
+# pip 装的时候会自动按机器实际情况解析到能装的那个版本, 不用手动改这个文件;
+# 上面这条 open3d>=0.14 只是保证不会解析到功能不全的古董版本。
+#
+# numpy/scipy/pillow 同样受 Python 3.8 本身限制 (而不是架构): 2.0/1.11/11.0 这三个
+# 版本起都要求 Python>=3.9, 在 3.8 上 pip 会自动落回它们各自的最后一个 3.8 版本
+# (numpy 1.24.4 / scipy 1.10.1 / pillow 10.4.0), 同样不用手动改。
