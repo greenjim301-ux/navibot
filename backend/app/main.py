@@ -110,22 +110,6 @@ async def submit_route(req: RouteRequest):
         raise HTTPException(503, str(e))
 
 
-@app.post("/api/route/pause", response_model=NavStatus)
-async def pause_route():
-    try:
-        return route_manager.pause()
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-@app.post("/api/route/resume", response_model=NavStatus)
-async def resume_route():
-    try:
-        return route_manager.resume()
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
 @app.post("/api/estop", response_model=NavStatus)
 async def estop():
     try:

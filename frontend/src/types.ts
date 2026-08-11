@@ -11,7 +11,6 @@ export interface Waypoint {
 export type TaskState =
   | "idle"
   | "running"
-  | "paused"
   | "succeeded"
   | "failed"
   | "stopped";

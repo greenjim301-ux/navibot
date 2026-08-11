@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { MapPin, Play, Pause, Eraser, TriangleAlert, OctagonX } from "lucide-react";
-import { estop, getRoute, pauseRoute, resumeRoute, submitRoute } from "../api";
+import { MapPin, Play, Eraser, TriangleAlert, OctagonX } from "lucide-react";
+import { estop, getRoute, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
@@ -21,7 +21,6 @@ import {
 const STATE_LABEL: Record<string, string> = {
   idle: "空闲",
   running: "执行中",
-  paused: "已暂停",
   succeeded: "已完成",
   failed: "失败",
   stopped: "已停止",
@@ -30,7 +29,6 @@ const STATE_LABEL: Record<string, string> = {
 const STATE_VARIANT: Record<string, "secondary" | "default" | "outline" | "destructive"> = {
   idle: "secondary",
   running: "default",
-  paused: "outline",
   succeeded: "default",
   failed: "destructive",
   stopped: "destructive",
@@ -71,7 +69,7 @@ export default function NavigatePage() {
   const { status, optimalTraj, connected } = useNavStatus();
 
   const state = status?.state ?? "idle";
-  const editable = state !== "running" && state !== "paused";
+  const editable = state !== "running";
   const ready = info?.status === "ready" && Boolean(info.topview_meta);
 
   // 从路线管理点"导航"进来时, 把那条已保存的路线加载进来
@@ -174,14 +172,9 @@ export default function NavigatePage() {
               </Button>
 
               {state === "running" ? (
-                <Button size="sm" variant="outline" disabled={busy} onClick={() => run(pauseRoute)}>
-                  <Pause />
-                  暂停
-                </Button>
-              ) : state === "paused" ? (
-                <Button size="sm" disabled={busy} onClick={() => run(resumeRoute)}>
-                  <Play />
-                  继续
+                <Button size="sm" variant="destructive" disabled={busy} onClick={() => run(estop)}>
+                  <OctagonX />
+                  停止导航
                 </Button>
               ) : (
                 <Button size="sm" disabled={busy || waypoints.length === 0} onClick={handleStart}>
@@ -190,16 +183,9 @@ export default function NavigatePage() {
                 </Button>
               )}
 
-              {(state === "running" || state === "paused") && (
-                <Button size="sm" variant="destructive" disabled={busy} onClick={() => run(estop)}>
-                  <OctagonX />
-                  停止导航
-                </Button>
-              )}
-
               {/* 只在没跑的时候能清: 执行中清掉当前这趟的轨迹, 看到的就是一条从
-                  半路开始的线, 比留着更容易误读。editable 就是"不在 running/
-                  paused", 直接复用。 */}
+                  半路开始的线, 比留着更容易误读。editable 就是"不在 running",
+                  直接复用。 */}
               <Button
                 size="sm"
                 variant="ghost"

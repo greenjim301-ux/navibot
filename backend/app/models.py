@@ -31,7 +31,6 @@ class RouteRequest(BaseModel):
 class TaskState(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
-    PAUSED = "paused"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     STOPPED = "stopped"

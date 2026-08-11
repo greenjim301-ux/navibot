@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool, Empty
+from std_msgs.msg import Empty
 from visualization_msgs.msg import Marker
 import tf.transformations as tft
 
@@ -31,7 +31,6 @@ class RosBridge:
         self._on_pose = on_pose
         self._on_optimal_traj = on_optimal_traj
         self._wp_pub: Optional[rospy.Publisher] = None
-        self._frozen_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
         self._started = False
 
@@ -44,14 +43,13 @@ class RosBridge:
             # queue_size=1 + 不 latch: 对齐 planner 侧的订阅方式。latch 在这里是有害的 ——
             # planner 重启后会立刻收到上一轮的路线并自己跑起来, 用户没下任何指令。
             self._wp_pub = rospy.Publisher(config.PRESET_WAYPOINTS_TOPIC, Path, queue_size=1)
-            self._frozen_pub = rospy.Publisher(config.FROZEN_TOPIC, Bool, queue_size=10, latch=True)
             self._estop_pub = rospy.Publisher(config.EMERGENCY_STOP_TOPIC, Empty, queue_size=5)
             rospy.Subscriber(config.ODOM_TOPIC, Odometry, self._handle_odom, queue_size=50)
             if self._on_optimal_traj is not None:
                 rospy.Subscriber(config.OPTIMAL_TRAJ_TOPIC, Marker, self._handle_optimal_traj, queue_size=5)
             logger.info(
-                "ROS bridge started: waypoints=%s frozen=%s odom=%s optimal_traj=%s frame=%s",
-                config.PRESET_WAYPOINTS_TOPIC, config.FROZEN_TOPIC,
+                "ROS bridge started: waypoints=%s estop=%s odom=%s optimal_traj=%s frame=%s",
+                config.PRESET_WAYPOINTS_TOPIC, config.EMERGENCY_STOP_TOPIC,
                 config.ODOM_TOPIC, config.OPTIMAL_TRAJ_TOPIC, config.MAP_FRAME,
             )
             rospy.spin()
@@ -130,16 +128,9 @@ class RosBridge:
         logger.info("preset_waypoints published: %d points, z=%s",
                     len(msg.poses), [round(w["z"], 2) for w in waypoints])
 
-    def set_frozen(self, frozen: bool) -> None:
-        """冻结/解冻轨迹执行。navi_mode=2 下唯一的外部"停一下"手段, 见 config.py。"""
-        if self._frozen_pub is None:
-            raise RuntimeError("ROS bridge 尚未启动")
-        self._frozen_pub.publish(Bool(data=frozen))
-        logger.info("execution frozen -> %s", frozen)
-
     def emergency_stop(self) -> None:
-        """真正的急停: 让 planner 悬停并作废当前任务 (userEmergencyStopCallback),
-        恢复必须靠重新下发一整轮 preset_waypoints, 不是 set_frozen(False) 能解开的。
+        """急停: 让 planner 悬停并作废当前任务 (userEmergencyStopCallback), 恢复
+        必须靠重新下发一整轮 preset_waypoints。
 
         话题不 latch, 没订阅者说明 planner 根本没在跑, 这种情况下"已停止"是假的
         成功, 必须原样报错让上层如实告诉用户, 不能默默吞掉。

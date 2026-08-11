@@ -25,7 +25,7 @@ class RouteManager:
     """路线执行状态机 (对接 SCAN-Planner navi_mode=2)。
 
     和之前"逐点下发目标、等 planner 回结果"的模型不一样, navi_mode=2 是一次收下
-    整条路线自己按顺序推进的, 所以这里的职责收窄成三件事:
+    整条路线自己按顺序推进的, 所以这里的职责收窄成两件事:
 
       1. 下发: 把途经点的 z 算出来 (地面高程 + 实测 odom 离地高度 + 用户微调),
          整条 Path 一次发给 planner。
@@ -33,7 +33,9 @@ class RouteManager:
          途中点用和 planner 一样的判据 (3D 距离 < REACH_EPS_M, 对齐
          fsm/waypoint_arrival_radius); 最后一个点 planner 没有这条提前退出,
          只能拿同一个半径近似, 时机跟真机不完全一致。见 config.py 里的详细说明。
-      3. 暂停/继续: 发 /planning/go2_execution_frozen。
+
+    停止靠 /planning/emergency_stop (见 estop()), 不做暂停/继续 —— 用不上,
+    也没有必要维护"冻结轨迹时间"这条额外状态。
 
     一个刻意的取舍: 这里推的"进度"是**推断**出来的, 不是 planner 告诉我们的。
     planner 可能因为局部不可达而卡在某个点上, 我们看不出区别 —— 只能看到狗不动
@@ -185,8 +187,6 @@ class RouteManager:
         alts = self._resolve_altitudes(waypoints, map_name, pose)
         self._log_dispatch(waypoints, alts, map_name, pose)
 
-        # 先解冻: 上一轮暂停/取消留下的 frozen=True 会让新路线发下去也不动
-        self._ros.set_frozen(False)
         self._ros.publish_waypoints([
             {"x": wp.x, "y": wp.y, "z": a.z, "yaw": wp.yaw} for wp, a in zip(waypoints, alts)
         ])
@@ -206,44 +206,18 @@ class RouteManager:
         logger.info("route submitted: label=%s, 当前目标 #%d", label, self._current_index + 1)
         return status
 
-    def pause(self) -> NavStatus:
-        with self._lock:
-            if self._state != TaskState.RUNNING:
-                raise ValueError(f"当前状态 {self._state} 不能暂停")
-        self._ros.set_frozen(True)
-        with self._lock:
-            self._state = TaskState.PAUSED
-            self._message = "已暂停"
-            self._broadcast_locked()
-            return self._status_locked()
-
     def estop(self) -> NavStatus:
-        """真正的急停 (/planning/emergency_stop), 不是 pause 的别名。
-
-        跟 pause 不一样: pause 只是冻结轨迹时间, resume 接着原轨迹走; 这个会让
-        planner 悬停并作废当前任务 (userEmergencyStopCallback), 恢复必须重新
-        设置并提交一整轮路线, 所以停下来之后状态直接进 STOPPED, 不留在
-        RUNNING/PAUSED —— 界面上"暂停/继续"按钮不该再出现。
+        """急停 (/planning/emergency_stop)。会让 planner 悬停并作废当前任务
+        (userEmergencyStopCallback), 恢复必须重新设置并提交一整轮路线, 所以
+        停下来之后状态直接进 STOPPED。
         """
         with self._lock:
-            if self._state not in (TaskState.RUNNING, TaskState.PAUSED):
+            if self._state != TaskState.RUNNING:
                 raise ValueError(f"当前状态 {self._state} 不能停止")
         self._ros.emergency_stop()
         with self._lock:
             self._state = TaskState.STOPPED
             self._message = "已停止, 需要重新设置并提交路线"
-            self._broadcast_locked()
-            return self._status_locked()
-
-    def resume(self) -> NavStatus:
-        with self._lock:
-            if self._state != TaskState.PAUSED:
-                raise ValueError(f"当前状态 {self._state} 不能继续")
-        self._ros.set_frozen(False)
-        with self._lock:
-            self._state = TaskState.RUNNING
-            self._message = None
-            self._reset_stuck_locked()
             self._broadcast_locked()
             return self._status_locked()
 

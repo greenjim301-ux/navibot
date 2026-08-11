@@ -12,12 +12,11 @@ src/planner/plan_manage/src/scan_replan_fsm.cpp 核对过:
       必须等订阅者连上 (见 RosBridge.publish_waypoints)。
       planner 处于 EMERGENCY_STOP 时会忽略这条消息。
 
-  FROZEN_TOPIC (std_msgs/Bool, backend -> planner)
-      冻结/解冻轨迹执行时间 (updateLocalTrajTimeFreeze)。这是 navi_mode=2 下
-      唯一的外部"停一下"手段 —— planner 没有 cancel 话题, 也没有外部急停接口,
-      内部的 EMERGENCY_STOP 只由它自己的碰撞检测触发。
-      **这是个已知缺口**: 真正的硬急停必须在 unitree_bridge 那一层做, 冻结只是
-      让它不再往前推轨迹时间, 不等于断电或立即制动。
+  EMERGENCY_STOP_TOPIC (std_msgs/Empty, backend -> planner)
+      对应 userEmergencyStopCallback: 让 planner 悬停并进入 EMERGENCY_STOP,
+      作废当前任务, 需要重新下发一整轮 preset_waypoints 才能恢复。navi_mode=2
+      下唯一用到的外部"停下来"手段 —— 不做暂停/继续, 用不上也没必要维护
+      "冻结轨迹时间"那条额外状态。
 
   ODOM_TOPIC (nav_msgs/Odometry, planner 侧 -> backend)
       /hand_lio/odom_vehicle, world 系机体位姿, 200Hz。planner 用的是同一个话题
@@ -46,11 +45,6 @@ import os
 MAP_FRAME = os.environ.get("NAVIBOT_MAP_FRAME", "world")
 
 PRESET_WAYPOINTS_TOPIC = os.environ.get("NAVIBOT_WAYPOINTS_TOPIC", "/preset_waypoints")
-FROZEN_TOPIC = os.environ.get("NAVIBOT_FROZEN_TOPIC", "/planning/go2_execution_frozen")
-# backend -> planner, std_msgs/Empty, 对应 scan_replan_fsm.cpp 的
-# userEmergencyStopCallback: 让 planner 悬停并进入 EMERGENCY_STOP, 需要一个
-# 全新的目标点才会恢复 —— 跟 FROZEN_TOPIC 不是一回事, 后者只是暂停轨迹时间,
-# 松开就从原轨迹接着走, 这个是真正让机器停下来并作废当前任务
 EMERGENCY_STOP_TOPIC = os.environ.get("NAVIBOT_EMERGENCY_STOP_TOPIC", "/planning/emergency_stop")
 ODOM_TOPIC = os.environ.get("NAVIBOT_ODOM_TOPIC", "/hand_lio/odom_vehicle")
 # planner 侧 -> backend, visualization_msgs/Marker, 纯展示用途 (跟

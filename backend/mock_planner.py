@@ -14,7 +14,6 @@
   - 新一轮开始时只跳过和当前位置**几乎重合**(< kDegenerateDist=0.05m)的点
     (planNextWaypoint) —— 这不是"差不多到了就跳过", 正常间距的途经点不会被
     跳, scan planner 在执行层面仍然会尽量开到每一个点
-  - 订阅 /planning/go2_execution_frozen, 冻结时原地不动
   - 发布 /hand_lio/odom_vehicle (nav_msgs/Odometry), 带 covariance[0]
   - **不发布任何到达/完成话题** —— 这正是后端必须自己推断进度的原因
 
@@ -26,7 +25,7 @@ import math
 import rospy
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool, ColorRGBA
+from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
 import tf.transformations as tft
 
@@ -44,18 +43,11 @@ class MockPlanner:
         self.x, self.y, self.z, self.yaw = start
         self.waypoints = []
         self.idx = 0
-        self.frozen = False
         self.odom_pub = rospy.Publisher("/hand_lio/odom_vehicle", Odometry, queue_size=10)
         # 假装是 displayOptimalTraj: 只为了验证后端 -> 前端这条转发链路通不通,
         # 不追求形状对 —— 真 planner 发的是样条轨迹, 这里就发当前位置到目标点的直线
         self.optimal_pub = rospy.Publisher("/scan_planner_node/optimal_list", Marker, queue_size=2)
         rospy.Subscriber("/preset_waypoints", Path, self.on_waypoints, queue_size=1)
-        rospy.Subscriber("/planning/go2_execution_frozen", Bool, self.on_frozen, queue_size=10)
-
-    def on_frozen(self, msg):
-        if msg.data != self.frozen:
-            rospy.loginfo("[mock] frozen -> %s", msg.data)
-        self.frozen = msg.data
 
     def on_waypoints(self, msg):
         if not msg.poses:
@@ -76,7 +68,7 @@ class MockPlanner:
         return math.dist((self.x, self.y, self.z), wp)
 
     def step(self, dt):
-        if self.frozen or self.idx >= len(self.waypoints):
+        if self.idx >= len(self.waypoints):
             return
         tx, ty, tz = self.waypoints[self.idx]
         is_last = self.idx == len(self.waypoints) - 1
