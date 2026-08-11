@@ -8,7 +8,7 @@ topview.png 的像素亮度反推高度, 那是给人看的渲染图, 配色阈�
 import json
 import math
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -64,7 +64,7 @@ class MapGrid:
         return float(patch[rr[np.argmin(d)], cc[np.argmin(d)]])
 
 
-_grid_cache: dict[str, Tuple[float, MapGrid]] = {}
+_grid_cache: Dict[str, Tuple[float, MapGrid]] = {}
 
 
 def load_grid(map_name: str) -> MapGrid:

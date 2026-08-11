@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set
 
 from fastapi import WebSocket
 
@@ -17,7 +17,7 @@ class WebSocketManager:
 
     def __init__(self) -> None:
         self._connections: Set[WebSocket] = set()
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop

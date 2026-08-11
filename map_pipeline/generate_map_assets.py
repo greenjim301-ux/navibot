@@ -30,6 +30,10 @@
      全部信息
   4. 光影(hillshade)默认关闭, 实测浮雕效果反而影响清晰度
 """
+# Python 3.8 (机器上 ROS Noetic 自带的版本) 没有 PEP 585/604, 这行让所有注解
+# 变成惰性字符串, tuple[...] / float | None 这类写法就不会在导入时求值。
+from __future__ import annotations
+
 import argparse
 import json
 import struct

@@ -1,9 +1,13 @@
 import asyncio
 import logging
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+# 不用 asyncio.to_thread: 那是 Python 3.9+ 的, 而机器上跑的是 ROS Noetic 自带的
+# 3.8。run_in_threadpool 来自 starlette (FastAPI 的依赖), 调用方式一模一样。
+from starlette.concurrency import run_in_threadpool
 
 from . import config
 from .map_registry import MapRegistry
@@ -65,8 +69,8 @@ async def add_vary_origin(request, call_next):
     return response
 
 ws_manager = WebSocketManager()
-route_manager: RouteManager | None = None
-ros_bridge: RosBridge | None = None
+route_manager: Optional[RouteManager] = None
+ros_bridge: Optional[RosBridge] = None
 map_registry = MapRegistry()
 route_store = RouteStore()
 
@@ -124,20 +128,20 @@ async def estop():
 @app.post("/api/maps/{name}/ground", response_model=GroundZResponse)
 async def map_ground(name: str, req: GroundZRequest):
     """批量查地面高程。3D 预览把途经点画在各自实际高度上要用。"""
-    zs = await asyncio.to_thread(
+    zs = await run_in_threadpool(
         lambda: [path_planner.ground_elevation(name, p.x, p.y) for p in req.points]
     )
     return GroundZResponse(z=zs)
 
 
-@app.get("/api/maps", response_model=list[MapInfo])
+@app.get("/api/maps", response_model=List[MapInfo])
 async def list_maps():
-    return await asyncio.to_thread(map_registry.list_maps)
+    return await run_in_threadpool(map_registry.list_maps)
 
 
 @app.get("/api/maps/{name}", response_model=MapInfo)
 async def get_map(name: str):
-    info = await asyncio.to_thread(map_registry.get_map_info, name)
+    info = await run_in_threadpool(map_registry.get_map_info, name)
     if info is None:
         raise HTTPException(404, f"地图 '{name}' 不存在")
     return info
@@ -146,7 +150,7 @@ async def get_map(name: str):
 @app.post("/api/maps/{name}/preprocess", response_model=MapInfo)
 async def preprocess_map(name: str):
     try:
-        return await asyncio.to_thread(map_registry.start_preprocess, name)
+        return await run_in_threadpool(map_registry.start_preprocess, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -154,21 +158,21 @@ async def preprocess_map(name: str):
 @app.delete("/api/maps/{name}", status_code=204)
 async def delete_map(name: str):
     try:
-        await asyncio.to_thread(map_registry.delete_map, name)
+        await run_in_threadpool(map_registry.delete_map, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
     # 地图没了, 挂在它下面的路线也就没意义了(途经点坐标只在那张地图里有效)
-    await asyncio.to_thread(route_store.delete_routes_for_map, name)
+    await run_in_threadpool(route_store.delete_routes_for_map, name)
 
 
-@app.get("/api/routes", response_model=list[RouteInfo])
-async def list_routes(map_name: str | None = None):
-    return await asyncio.to_thread(route_store.list_routes, map_name)
+@app.get("/api/routes", response_model=List[RouteInfo])
+async def list_routes(map_name: Optional[str] = None):
+    return await run_in_threadpool(route_store.list_routes, map_name)
 
 
 @app.get("/api/routes/{route_id}", response_model=RouteInfo)
 async def get_route(route_id: str):
-    route = await asyncio.to_thread(route_store.get_route, route_id)
+    route = await run_in_threadpool(route_store.get_route, route_id)
     if route is None:
         raise HTTPException(404, f"路线 '{route_id}' 不存在")
     return route
@@ -176,10 +180,10 @@ async def get_route(route_id: str):
 
 @app.post("/api/routes", response_model=RouteInfo)
 async def create_route(req: RouteCreateRequest):
-    if await asyncio.to_thread(map_registry.get_map_info, req.map_name) is None:
+    if await run_in_threadpool(map_registry.get_map_info, req.map_name) is None:
         raise HTTPException(400, f"地图 '{req.map_name}' 不存在")
     try:
-        return await asyncio.to_thread(
+        return await run_in_threadpool(
             route_store.create_route, req.name, req.map_name, req.waypoints
         )
     except ValueError as e:
@@ -188,7 +192,7 @@ async def create_route(req: RouteCreateRequest):
 
 @app.delete("/api/routes/{route_id}", status_code=204)
 async def delete_route(route_id: str):
-    if not await asyncio.to_thread(route_store.delete_route, route_id):
+    if not await run_in_threadpool(route_store.delete_route, route_id):
         raise HTTPException(404, f"路线 '{route_id}' 不存在")
 
 
