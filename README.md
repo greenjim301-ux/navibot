@@ -53,7 +53,16 @@ web_assets/map/<name>/
 
 ## 跑起来
 
-前置：`roscore`、mamba 环境 `ros_host`（ROS Noetic + Python 3.12）、`open3d` / `scipy` / `fastapi` / `uvicorn`。
+前置：`roscore`；后端需要 `fastapi` / `uvicorn` / `numpy`；离线预处理另需 `open3d` / `scipy` / `pillow`。
+
+> **Python 版本**：后端必须兼容 **Python 3.8** —— 机器（lubancat）上跑的是 ROS Noetic
+> 自带的 3.8，`rospy` 也是为它编译的。开发机用的是 mamba `ros_host` 里的 3.12，
+> `dict[str, int]`、`X | None`、`asyncio.to_thread` 这些写法在本地一路绿灯，推到机器上
+> 才在 import 阶段炸掉，本地永远测不出来。提交前跑一次：
+>
+> ```bash
+> python3 tools/check_py38.py
+> ```
 
 ```bash
 # 1. 放一份地图数据
