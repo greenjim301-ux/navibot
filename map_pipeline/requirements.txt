@@ -1,0 +1,21 @@
+# 离线地图预处理 (map_pipeline/) 的依赖。已装进 mamba 环境 ros_host, 这个文件只是
+# 记录版本, 不需要单独建 venv:
+#   mamba run -n ros_host python -m pip install -r map_pipeline/requirements.txt
+#
+# 只跑离线预处理才需要这些包 —— 后端 (backend/) 不依赖它们, 机器上的运行时
+# 环境不用装, 见 backend/requirements.txt。
+numpy>=1.24
+scipy>=1.10
+open3d>=0.19
+pillow>=10.4
+
+# ---- Python 3.8 兼容性 ----
+# 代码本身兼容 3.8 (map_pipeline/*.py 都带 `from __future__ import annotations`,
+# 用 tools/check_py38.py 校验过), 但上面这些版本下限是按 mamba ros_host (3.12)
+# 里实测装到的版本写的, 不代表它们本身支持 3.8。如果哪天要在机器 (lubancat)
+# 的系统 Python 3.8 上直接跑预处理 (不走 mamba), 用这组经 PyPI 实测确认的
+# "3.8 能装到的最新版" 上限, 否则 pip 会直接解析失败或装出装不上的轮子:
+#   numpy<2.0      (2.0 起要求 Python >=3.9)
+#   scipy<1.11      (1.11 起要求 Python >=3.9)
+#   pillow<11.0     (11.0 起要求 Python >=3.9)
+#   open3d          不受影响, 0.19 仍提供 cp38 轮子
