@@ -67,6 +67,13 @@ export default function NavigatePage() {
   const [draftShowStandable, setDraftShowStandable] = useState(true);
 
   const { status, optimalTraj, connected } = useNavStatus();
+  // "清除轨迹" 也要把 planner 局部轨迹线擦掉, 但那条线是 ws 推来的、页面并不
+  // 持有它的数据, 只能记一个"擦掉了"标记, 下一条新轨迹(重规划)推过来时自动
+  // 恢复显示 —— 跟机器狗实际走过的轨迹不一样, 这条不是"一直累积"的。
+  const [optimalTrajHidden, setOptimalTrajHidden] = useState(false);
+  useEffect(() => {
+    setOptimalTrajHidden(false);
+  }, [optimalTraj]);
 
   const state = status?.state ?? "idle";
   const editable = state !== "running";
@@ -189,9 +196,12 @@ export default function NavigatePage() {
               <Button
                 size="sm"
                 variant="ghost"
-                disabled={!editable || trail.length === 0}
+                disabled={!editable || (trail.length === 0 && !optimalTraj)}
                 title={editable ? "清除已画出的实际轨迹" : "导航进行中不能清除轨迹"}
-                onClick={() => setTrail([])}
+                onClick={() => {
+                  setTrail([]);
+                  setOptimalTrajHidden(true);
+                }}
               >
                 <Eraser />
                 清除轨迹
@@ -224,7 +234,7 @@ export default function NavigatePage() {
             waypoints={waypoints}
             status={status}
             trail={trail}
-            optimalTraj={optimalTraj}
+            optimalTraj={optimalTrajHidden ? null : optimalTraj}
             enableFollow
           />
         </div>
