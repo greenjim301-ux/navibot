@@ -48,6 +48,44 @@ from PIL import Image, ImageFilter
 
 from elevation import ElevationParams, build_elevation, load_trajectory
 
+
+class _BooleanOptionalAction(argparse.Action):
+    """argparse.BooleanOptionalAction 的 3.8 兼容实现 (原版是 3.9 才有的)。
+
+    机器上跑的是 ROS Noetic 自带的 Python 3.8, 没有这个类 —— 之前直接用了
+    argparse.BooleanOptionalAction, 本地在 3.12 下测着好好的, 部署到机器上才在
+    参数解析阶段炸: AttributeError: module 'argparse' has no attribute
+    'BooleanOptionalAction'。tools/check_py38.py 当时没把它录进已知清单, 没能
+    在提交前拦下来 (清单已经补上, 见该文件)。
+
+    直接照抄 CPython 3.12 里 argparse.py 的实现 (逻辑不复杂, 没有依赖 3.9+ 的
+    其它特性), 保留同样的 --flag / --no-flag 行为和帮助文本里的 "(default: ...)"
+    后缀, 换掉之后命令行界面完全不变。
+    """
+
+    def __init__(self, option_strings, dest, default=None, type=None,
+                 choices=None, required=False, help=None, metavar=None):
+        _option_strings = []
+        for option_string in option_strings:
+            _option_strings.append(option_string)
+            if option_string.startswith("--"):
+                _option_strings.append("--no-" + option_string[2:])
+
+        if help is not None and default is not None and default is not argparse.SUPPRESS:
+            help += " (default: %(default)s)"
+
+        super().__init__(
+            option_strings=_option_strings, dest=dest, nargs=0, default=default,
+            type=type, choices=choices, required=required, help=help, metavar=metavar,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if option_string in self.option_strings:
+            setattr(namespace, self.dest, not option_string.startswith("--no-"))
+
+    def format_usage(self):
+        return " | ".join(self.option_strings)
+
 # occupancy.npy 的取值语义
 OCC_UNKNOWN = 0
 OCC_FREE = 1
@@ -379,7 +417,7 @@ def main():
     ap.add_argument("--safety-margin", type=float, default=0.25, help="安全边距可视化半径 (m)")
     ap.add_argument("--voxel-size", type=float, default=0.03, help="3D 预览降采样体素大小 (m)")
     ap.add_argument("--max-preview-points", type=int, default=400000)
-    ap.add_argument("--preview-hide-ceiling", action=argparse.BooleanOptionalAction, default=True,
+    ap.add_argument("--preview-hide-ceiling", action=_BooleanOptionalAction, default=True,
                      help="3D 预览是否裁掉天花板附近的点 (默认裁掉)")
     ap.add_argument("--preview-ceiling-margin", type=float, default=0.35,
                      help="裁剪天花板时往下留的余量 (m), 越大裁得越多。"
@@ -396,14 +434,14 @@ def main():
                      help="占据栅格判定阈值: 障碍高度带内落进同一个栅格的点数达到这个值就"
                           "判定为障碍。用绝对点数而不是渲染用的归一化密度, 保证改配色不会"
                           "影响寻路")
-    ap.add_argument("--denoise", action=argparse.BooleanOptionalAction, default=True,
+    ap.add_argument("--denoise", action=_BooleanOptionalAction, default=True,
                      help="是否在最开始做统计离群点剔除去噪 (默认做)")
     ap.add_argument("--denoise-neighbors", type=int, default=20,
                      help="去噪时每个点看多少个邻居算平均距离")
     ap.add_argument("--denoise-std-ratio", type=float, default=2.0,
                      help="去噪阈值: 平均邻居距离超出全局均值多少个标准差就判定为离群点, "
                           "越小去得越狠")
-    ap.add_argument("--elevation", action=argparse.BooleanOptionalAction, default=True,
+    ap.add_argument("--elevation", action=_BooleanOptionalAction, default=True,
                      help="是否提取逐格可站立高程面 (需要同目录下的建图轨迹)。关掉就退回"
                           "整图一个 floor_z 的单层假设, 带楼梯的地图会算错")
     ap.add_argument("--elev-resolution", type=float, default=0.10,

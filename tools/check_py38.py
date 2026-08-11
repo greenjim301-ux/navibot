@@ -24,6 +24,7 @@ BUILTIN_GENERICS = {"dict", "list", "tuple", "set", "frozenset", "type"}
 # 名字也算进来 (这个文件自己的规则表就是最好的例子)。
 # "模块.属性" 形式
 NEW_ATTRS = {
+    "argparse.BooleanOptionalAction": "3.9",
     "asyncio.to_thread": "3.9",
     "functools.cache": "3.9",
     "itertools.pairwise": "3.10",
