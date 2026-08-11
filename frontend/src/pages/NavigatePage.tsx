@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { MapPin, Play, Pause, Eraser, TriangleAlert } from "lucide-react";
-import { getRoute, pauseRoute, resumeRoute, submitRoute } from "../api";
+import { MapPin, Play, Pause, Eraser, TriangleAlert, OctagonX } from "lucide-react";
+import { estop, getRoute, pauseRoute, resumeRoute, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
@@ -24,6 +24,7 @@ const STATE_LABEL: Record<string, string> = {
   paused: "已暂停",
   succeeded: "已完成",
   failed: "失败",
+  stopped: "已停止",
 };
 
 const STATE_VARIANT: Record<string, "secondary" | "default" | "outline" | "destructive"> = {
@@ -32,6 +33,7 @@ const STATE_VARIANT: Record<string, "secondary" | "default" | "outline" | "destr
   paused: "outline",
   succeeded: "default",
   failed: "destructive",
+  stopped: "destructive",
 };
 
 // 轨迹采样阈值: odom 是 200Hz 的, 每帧都记会瞬间堆出几万个点且肉眼看不出区别。
@@ -185,6 +187,13 @@ export default function NavigatePage() {
                 <Button size="sm" disabled={busy || waypoints.length === 0} onClick={handleStart}>
                   <Play />
                   开始导航
+                </Button>
+              )}
+
+              {(state === "running" || state === "paused") && (
+                <Button size="sm" variant="destructive" disabled={busy} onClick={() => run(estop)}>
+                  <OctagonX />
+                  停止导航
                 </Button>
               )}
 

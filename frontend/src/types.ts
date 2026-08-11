@@ -13,7 +13,8 @@ export type TaskState =
   | "running"
   | "paused"
   | "succeeded"
-  | "failed";
+  | "failed"
+  | "stopped";
 
 export interface RobotPose {
   x: number;

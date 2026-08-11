@@ -34,6 +34,7 @@ class TaskState(str, Enum):
     PAUSED = "paused"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    STOPPED = "stopped"
 
 
 class Pose(BaseModel):

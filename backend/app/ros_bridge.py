@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Empty
 from visualization_msgs.msg import Marker
 import tf.transformations as tft
 
@@ -32,6 +32,7 @@ class RosBridge:
         self._on_optimal_traj = on_optimal_traj
         self._wp_pub: Optional[rospy.Publisher] = None
         self._frozen_pub: Optional[rospy.Publisher] = None
+        self._estop_pub: Optional[rospy.Publisher] = None
         self._started = False
 
     def start(self) -> None:
@@ -44,6 +45,7 @@ class RosBridge:
             # planner 重启后会立刻收到上一轮的路线并自己跑起来, 用户没下任何指令。
             self._wp_pub = rospy.Publisher(config.PRESET_WAYPOINTS_TOPIC, Path, queue_size=1)
             self._frozen_pub = rospy.Publisher(config.FROZEN_TOPIC, Bool, queue_size=10, latch=True)
+            self._estop_pub = rospy.Publisher(config.EMERGENCY_STOP_TOPIC, Empty, queue_size=5)
             rospy.Subscriber(config.ODOM_TOPIC, Odometry, self._handle_odom, queue_size=50)
             if self._on_optimal_traj is not None:
                 rospy.Subscriber(config.OPTIMAL_TRAJ_TOPIC, Marker, self._handle_optimal_traj, queue_size=5)
@@ -134,3 +136,19 @@ class RosBridge:
             raise RuntimeError("ROS bridge 尚未启动")
         self._frozen_pub.publish(Bool(data=frozen))
         logger.info("execution frozen -> %s", frozen)
+
+    def emergency_stop(self) -> None:
+        """真正的急停: 让 planner 悬停并作废当前任务 (userEmergencyStopCallback),
+        恢复必须靠重新下发一整轮 preset_waypoints, 不是 set_frozen(False) 能解开的。
+
+        话题不 latch, 没订阅者说明 planner 根本没在跑, 这种情况下"已停止"是假的
+        成功, 必须原样报错让上层如实告诉用户, 不能默默吞掉。
+        """
+        if self._estop_pub is None:
+            raise RuntimeError("ROS bridge 尚未启动")
+        if self._estop_pub.get_num_connections() == 0:
+            raise RuntimeError(
+                f"没有节点订阅 {config.EMERGENCY_STOP_TOPIC}, SCAN-Planner (navi_mode=2) 在跑吗?"
+            )
+        self._estop_pub.publish(Empty())
+        logger.warning("emergency stop published")

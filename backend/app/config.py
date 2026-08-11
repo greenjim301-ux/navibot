@@ -47,6 +47,11 @@ MAP_FRAME = os.environ.get("NAVIBOT_MAP_FRAME", "world")
 
 PRESET_WAYPOINTS_TOPIC = os.environ.get("NAVIBOT_WAYPOINTS_TOPIC", "/preset_waypoints")
 FROZEN_TOPIC = os.environ.get("NAVIBOT_FROZEN_TOPIC", "/planning/go2_execution_frozen")
+# backend -> planner, std_msgs/Empty, 对应 scan_replan_fsm.cpp 的
+# userEmergencyStopCallback: 让 planner 悬停并进入 EMERGENCY_STOP, 需要一个
+# 全新的目标点才会恢复 —— 跟 FROZEN_TOPIC 不是一回事, 后者只是暂停轨迹时间,
+# 松开就从原轨迹接着走, 这个是真正让机器停下来并作废当前任务
+EMERGENCY_STOP_TOPIC = os.environ.get("NAVIBOT_EMERGENCY_STOP_TOPIC", "/planning/emergency_stop")
 ODOM_TOPIC = os.environ.get("NAVIBOT_ODOM_TOPIC", "/hand_lio/odom_vehicle")
 # planner 侧 -> backend, visualization_msgs/Marker, 纯展示用途 (跟
 # default.rviz 里 "optimal_traj" 那个 Marker 显示项是同一个话题)。每次重规划

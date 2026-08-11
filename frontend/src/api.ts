@@ -37,6 +37,12 @@ export async function resumeRoute(): Promise<NavStatus> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/route/resume`, { method: "POST" }));
 }
 
+/** 真正的急停 (/planning/emergency_stop), 不是 pause 的别名。停下来之后需要
+ *  重新设置并提交路线才能继续, 不能靠"继续"按钮恢复。 */
+export async function estop(): Promise<NavStatus> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/estop`, { method: "POST" }));
+}
+
 export async function listMaps(): Promise<MapInfo[]> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/maps`));
 }

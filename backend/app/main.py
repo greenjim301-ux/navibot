@@ -126,6 +126,17 @@ async def resume_route():
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/estop", response_model=NavStatus)
+async def estop():
+    try:
+        return route_manager.estop()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        # planner 没在跑, 没有订阅者接住这条 stop 消息, 必须原样告诉用户
+        raise HTTPException(503, str(e))
+
+
 @app.post("/api/maps/{name}/ground", response_model=GroundZResponse)
 async def map_ground(name: str, req: GroundZRequest):
     """批量查地面高程。3D 预览把途经点画在各自实际高度上要用。"""

@@ -217,6 +217,24 @@ class RouteManager:
             self._broadcast_locked()
             return self._status_locked()
 
+    def estop(self) -> NavStatus:
+        """真正的急停 (/planning/emergency_stop), 不是 pause 的别名。
+
+        跟 pause 不一样: pause 只是冻结轨迹时间, resume 接着原轨迹走; 这个会让
+        planner 悬停并作废当前任务 (userEmergencyStopCallback), 恢复必须重新
+        设置并提交一整轮路线, 所以停下来之后状态直接进 STOPPED, 不留在
+        RUNNING/PAUSED —— 界面上"暂停/继续"按钮不该再出现。
+        """
+        with self._lock:
+            if self._state not in (TaskState.RUNNING, TaskState.PAUSED):
+                raise ValueError(f"当前状态 {self._state} 不能停止")
+        self._ros.emergency_stop()
+        with self._lock:
+            self._state = TaskState.STOPPED
+            self._message = "已停止, 需要重新设置并提交路线"
+            self._broadcast_locked()
+            return self._status_locked()
+
     def resume(self) -> NavStatus:
         with self._lock:
             if self._state != TaskState.PAUSED:
