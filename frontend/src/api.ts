@@ -35,8 +35,45 @@ export async function estop(): Promise<NavStatus> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/estop`, { method: "POST" }));
 }
 
+/** 勾选框开关 self_inflation 展示: 开就让后端订阅这个 200Hz 的话题并转发,
+ *  关就取消订阅——是个全局开关(所有连着的标签页共用), 实际状态和数据都通过
+ *  ws 的 "self_inflation" 消息推送, 这里的返回值只是提交动作的确认。 */
+export async function setSelfInflation(enabled: boolean): Promise<{ enabled: boolean }> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/self_inflation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
+/** 勾选框开关膨胀地图展示 (/grid_map/occupancy_inflate), 逻辑跟 setSelfInflation
+ *  一样: 全局开关, 实际状态和数据都通过 ws 的 "inflation_map" 消息推送。 */
+export async function setInflationMap(enabled: boolean): Promise<{ enabled: boolean }> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/inflation_map`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
 export async function listMaps(): Promise<MapInfo[]> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/maps`));
+}
+
+/** 导入地图: 只是往地图表里记一笔"名字 -> 存储路径", 不拷贝文件, 也不会自动
+ *  触发预处理。storagePath 下应有 3d_map/dense_cloud_map.pcd。 */
+export async function importMap(name: string, storagePath: string): Promise<MapInfo> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/maps`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, storage_path: storagePath }),
+    }),
+  );
 }
 
 export async function getMap(name: string): Promise<MapInfo> {

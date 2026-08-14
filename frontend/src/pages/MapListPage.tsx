@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Trash2, Map as MapIcon, CircleCheck, CircleDashed, Loader2, RefreshCw } from "lucide-react";
-import { deleteMap, listMaps, mapAssetUrl, preprocessMap } from "../api";
+import { Trash2, Map as MapIcon, CircleCheck, CircleDashed, Loader2, RefreshCw, FolderInput } from "lucide-react";
+import { deleteMap, importMap, listMaps, mapAssetUrl, preprocessMap } from "../api";
 import type { MapInfo } from "../types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter,
 } from "@/components/ui/card";
@@ -14,6 +16,9 @@ import {
   AlertDialog, AlertDialogTrigger, AlertDialogContent, AlertDialogHeader,
   AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction,
 } from "@/components/ui/alert-dialog";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+} from "@/components/ui/dialog";
 
 const STATUS_LABEL: Record<MapInfo["status"], string> = {
   not_processed: "未预处理",
@@ -34,6 +39,12 @@ export default function MapListPage() {
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
 
+  const [importOpen, setImportOpen] = useState(false);
+  const [importName, setImportName] = useState("");
+  const [importPath, setImportPath] = useState("");
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+
   const refresh = useCallback(async () => {
     try {
       const list = await listMaps();
@@ -49,6 +60,27 @@ export default function MapListPage() {
     const timer = window.setInterval(refresh, 3000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  function openImportDialog() {
+    setImportName("");
+    setImportPath("");
+    setImportError(null);
+    setImportOpen(true);
+  }
+
+  async function handleImport() {
+    setImportBusy(true);
+    setImportError(null);
+    try {
+      await importMap(importName.trim(), importPath.trim());
+      setImportOpen(false);
+      await refresh();
+    } catch (e) {
+      setImportError(String(e));
+    } finally {
+      setImportBusy(false);
+    }
+  }
 
   async function handlePreprocess(name: string) {
     setPendingAction(name);
@@ -82,7 +114,13 @@ export default function MapListPage() {
     <div className="mx-auto max-w-6xl px-8 py-9">
       <PageHeader
         title="地图管理"
-        description="地图来自 mapdata/ 下的每个子文件夹，需先预处理才能预览或用于导航。"
+        description="地图列表来自地图表，导入后需先预处理才能预览或用于导航。"
+        actions={
+          <Button size="sm" onClick={openImportDialog}>
+            <FolderInput />
+            导入地图
+          </Button>
+        }
       />
 
       {maps !== null && maps.length > 0 && (
@@ -113,7 +151,7 @@ export default function MapListPage() {
         </div>
       ) : maps.length === 0 ? (
         <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
-          mapdata/ 下还没有任何地图 (需要 <code>mapdata/&lt;name&gt;/dense_cloud_map.pcd</code>)
+          地图表里还没有任何地图，点右上角"导入地图"添加一个
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -128,6 +166,55 @@ export default function MapListPage() {
           ))}
         </div>
       )}
+
+      <Dialog open={importOpen} onOpenChange={setImportOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>导入地图</DialogTitle>
+            <DialogDescription>
+              只是往地图表里记一笔名字和存储路径，不会拷贝文件；导入后还需要手动点一次预处理。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label htmlFor="import-name">地图名称</Label>
+              <Input
+                id="import-name"
+                value={importName}
+                onChange={(e) => setImportName(e.target.value)}
+                placeholder="例如 living-room"
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="import-path">存储路径</Label>
+              <Input
+                id="import-path"
+                value={importPath}
+                onChange={(e) => setImportPath(e.target.value)}
+                placeholder="例如 /home/cat/map-1"
+                className="font-mono"
+              />
+              <p className="text-xs text-muted-foreground">
+                该路径下需要有 <code>3d_map/dense_cloud_map.pcd</code>，例如实际文件是{" "}
+                <code>/home/cat/map-1/3d_map/dense_cloud_map.pcd</code>，这里就填{" "}
+                <code>/home/cat/map-1</code>。
+              </p>
+            </div>
+            {importError && (
+              <p className="text-sm text-destructive">{importError}</p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setImportOpen(false)}>取消</Button>
+            <Button
+              disabled={importBusy || !importName.trim() || !importPath.trim()}
+              onClick={handleImport}
+            >
+              {importBusy ? "导入中…" : "导入"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -185,6 +272,9 @@ function MapCard({
 
       <CardHeader className="pt-4">
         <CardTitle className="truncate text-base">{map.name}</CardTitle>
+        <CardDescription className="truncate font-mono text-[11px]" title={map.storage_path}>
+          {map.storage_path}
+        </CardDescription>
         {ready && map.topview_meta && (
           <CardDescription className="font-mono text-[11px]">
             {map.topview_meta.width}×{map.topview_meta.height}px ·{" "}
@@ -240,7 +330,8 @@ function MapCard({
             <AlertDialogHeader>
               <AlertDialogTitle>删除地图 "{map.name}"？</AlertDialogTitle>
               <AlertDialogDescription>
-                这会永久删除 mapdata/{map.name}/ 下的原始点云数据，以及已生成的俯视图 / 3D 预览产物，无法恢复。
+                这会删除地图表里的这条记录，以及已生成的俯视图 / 3D 预览产物，无法恢复；
+                存储路径 {map.storage_path} 下的原始点云数据不会被删除。
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>

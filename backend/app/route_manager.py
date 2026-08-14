@@ -62,6 +62,14 @@ class RouteManager:
         self._best_dist: float = math.inf
         self._best_dist_at: float = 0.0
         self._optimal_traj: List[dict] = []
+        self._last_pose_broadcast_at: float = 0.0
+        self._last_optimal_traj_broadcast_at: float = 0.0
+        self._self_inflation_enabled: bool = False
+        self._self_inflation: dict = {}  # marker id -> 最新的那个圆柱
+        self._last_self_inflation_broadcast_at: float = 0.0
+        self._inflation_map_enabled: bool = False
+        self._inflation_map: List[float] = []  # 拍平的 [x0,y0,z0, x1,y1,z1, ...]
+        self._last_inflation_map_broadcast_at: float = 0.0
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -87,6 +95,17 @@ class RouteManager:
         """planner 当前正在跑的局部轨迹采样点, 给新连上的 ws 客户端补发用。"""
         with self._lock:
             return list(self._optimal_traj)
+
+    def get_self_inflation_state(self) -> dict:
+        """当前是否订阅了 self_inflation + 最新一份圆柱数据, 给新连上的 ws 客户端
+        补发用 (包括多开一个标签页时, 勾选框状态要跟已有的保持一致)。"""
+        with self._lock:
+            return self._self_inflation_payload_locked()
+
+    def get_inflation_map_state(self) -> dict:
+        """当前是否订阅了膨胀地图 + 最新一片点云, 给新连上的 ws 客户端补发用。"""
+        with self._lock:
+            return self._inflation_map_payload_locked()
 
     # ---- 指令 ----
     # 运行时实测 Δ 和建图时那个差超过这么多就告警 —— 多半是外参改了
@@ -270,17 +289,95 @@ class RouteManager:
     def on_pose(self, x: float, y: float, z: float, yaw: float, cov: float, stamp: float) -> None:
         with self._lock:
             self._robot_pose = Pose(x=x, y=y, z=z, yaw=yaw, stamp=stamp, cov=cov)
+            state_before = self._state
+            index_before = self._current_index
             if self._state == TaskState.RUNNING:
                 if not self._advance_reached_locked():
                     self._check_stuck_locked()
-            self._broadcast_locked()
+            # 状态机变化(到达途经点、成功、卡住失败)不受限流影响, 立刻推送;
+            # 单纯的位姿刷新按 POSE_BROADCAST_HZ 限流, odom 200Hz 转发太浪费
+            notable = self._state != state_before or self._current_index != index_before
+            now = time.time()
+            if notable or now - self._last_pose_broadcast_at >= 1.0 / config.POSE_BROADCAST_HZ:
+                self._last_pose_broadcast_at = now
+                self._broadcast_locked()
 
     def on_optimal_traj(self, points: List[dict]) -> None:
         """转发 /scan_planner_node/optimal_list, 纯展示用途, 不参与任何进度/状态
-        判断 —— 3D 预览里画出来的就是 rviz 里那条红黄渐变的局部轨迹线。"""
+        判断 —— 3D 预览里画出来的就是 rviz 里那条红黄渐变的局部轨迹线。
+
+        每次重规划都会重发一整条, 频率跟规划频率挂钩而不是 200Hz 的 odom, 但同样
+        没必要原样转发给前端, 按 OPTIMAL_TRAJ_BROADCAST_HZ 限流一下。self._optimal_traj
+        本身不受限流影响, 随时是最新的一条, 只是"广播"这个动作被限流。
+        """
         with self._lock:
             self._optimal_traj = points
+            now = time.time()
+            if now - self._last_optimal_traj_broadcast_at < 1.0 / config.OPTIMAL_TRAJ_BROADCAST_HZ:
+                return
+            self._last_optimal_traj_broadcast_at = now
         self._ws.broadcast_threadsafe({"type": "optimal_traj", "data": {"points": points}})
+
+    def _self_inflation_payload_locked(self) -> dict:
+        return {"enabled": self._self_inflation_enabled, "markers": list(self._self_inflation.values())}
+
+    def on_self_inflation(self, marker: dict) -> None:
+        """转发 /scan_planner_node/self_inflation 的一个圆柱 (id=0 前/id=1 后)。
+        200Hz, 只在勾选框打开时才会被订阅(见 ros_bridge.set_self_inflation_enabled),
+        这里再按 SELF_INFLATION_BROADCAST_HZ 限流一次广播动作。"""
+        with self._lock:
+            if not self._self_inflation_enabled:
+                return
+            self._self_inflation[marker["id"]] = marker
+            now = time.time()
+            if now - self._last_self_inflation_broadcast_at < 1.0 / config.SELF_INFLATION_BROADCAST_HZ:
+                return
+            self._last_self_inflation_broadcast_at = now
+            payload = self._self_inflation_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "self_inflation", "data": payload})
+
+    def set_self_inflation_enabled(self, enabled: bool) -> dict:
+        """开关 self_inflation 展示。这个状态变化立刻广播给所有 ws 客户端(不受
+        限流影响), 好让多开的标签页里勾选框保持一致。"""
+        self._ros.set_self_inflation_enabled(enabled)
+        with self._lock:
+            self._self_inflation_enabled = enabled
+            if not enabled:
+                self._self_inflation = {}
+            payload = self._self_inflation_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "self_inflation", "data": payload})
+        return payload
+
+    def _inflation_map_payload_locked(self) -> dict:
+        return {"enabled": self._inflation_map_enabled, "points": list(self._inflation_map)}
+
+    def on_inflation_map(self, points: List[float]) -> None:
+        """转发 /grid_map/occupancy_inflate 的一整片点云 (拍平的 [x,y,z, ...]),
+        每次整片替换(不是增量)。200Hz 上限的话题, 只在勾选框打开时才会被订阅
+        (见 ros_bridge.set_inflation_map_enabled), 这里再按
+        INFLATION_MAP_BROADCAST_HZ 限流一次广播动作。"""
+        with self._lock:
+            if not self._inflation_map_enabled:
+                return
+            self._inflation_map = points
+            now = time.time()
+            if now - self._last_inflation_map_broadcast_at < 1.0 / config.INFLATION_MAP_BROADCAST_HZ:
+                return
+            self._last_inflation_map_broadcast_at = now
+            payload = self._inflation_map_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
+
+    def set_inflation_map_enabled(self, enabled: bool) -> dict:
+        """开关膨胀地图展示。状态变化立刻广播给所有 ws 客户端(不受限流影响),
+        好让多开的标签页里勾选框保持一致。"""
+        self._ros.set_inflation_map_enabled(enabled)
+        with self._lock:
+            self._inflation_map_enabled = enabled
+            if not enabled:
+                self._inflation_map = []
+            payload = self._inflation_map_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
+        return payload
 
     def _check_stuck_locked(self) -> None:
         """planner 不报失败, 只能靠"长时间没靠近目标"来判卡住。

@@ -12,6 +12,8 @@ from typing import Callable, List, Optional
 import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Empty
 from visualization_msgs.msg import Marker
 import tf.transformations as tft
@@ -24,14 +26,28 @@ logger = logging.getLogger("navibot.ros_bridge")
 PoseCallback = Callable[[float, float, float, float, float, float], None]
 # 一条局部轨迹的采样点: [{"x":.., "y":.., "z":.., "r":.., "g":.., "b":..}, ...]
 OptimalTrajCallback = Callable[[List[dict]], None]
+# 一个 self_inflation 圆柱: {"id":.., "x":.., "y":.., "z":.., "radius":.., "height":.., "r":.., "g":.., "b":.., "a":..}
+SelfInflationCallback = Callable[[dict], None]
+# 膨胀地图整片点云, 拍平成 [x0,y0,z0, x1,y1,z1, ...] (每次整片替换, 不是增量)
+InflationMapCallback = Callable[[List[float]], None]
 
 
 class RosBridge:
-    def __init__(self, on_pose: PoseCallback, on_optimal_traj: Optional[OptimalTrajCallback] = None) -> None:
+    def __init__(
+        self,
+        on_pose: PoseCallback,
+        on_optimal_traj: Optional[OptimalTrajCallback] = None,
+        on_self_inflation: Optional[SelfInflationCallback] = None,
+        on_inflation_map: Optional[InflationMapCallback] = None,
+    ) -> None:
         self._on_pose = on_pose
         self._on_optimal_traj = on_optimal_traj
+        self._on_self_inflation = on_self_inflation
+        self._on_inflation_map = on_inflation_map
         self._wp_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
+        self._self_inflation_sub: Optional[rospy.Subscriber] = None
+        self._inflation_map_sub: Optional[rospy.Subscriber] = None
         self._started = False
 
     def start(self) -> None:
@@ -89,6 +105,61 @@ class RosBridge:
         ]
         assert self._on_optimal_traj is not None
         self._on_optimal_traj(points)
+
+    def _handle_self_inflation(self, msg: Marker) -> None:
+        """/scan_planner_node/self_inflation 一次回调发两个 CYLINDER (id=0 前,
+        id=1 后, "双圆柱"自身膨胀包络), 跟 optimal_traj 一样原样转发, 不做判断。"""
+        assert self._on_self_inflation is not None
+        self._on_self_inflation({
+            "id": msg.id,
+            "x": msg.pose.position.x, "y": msg.pose.position.y, "z": msg.pose.position.z,
+            "radius": msg.scale.x / 2.0,
+            "height": msg.scale.z,
+            "r": msg.color.r, "g": msg.color.g, "b": msg.color.b, "a": msg.color.a,
+        })
+
+    def set_self_inflation_enabled(self, enabled: bool) -> None:
+        """self_inflation 是 200Hz, 默认不订阅——前端勾选框打开才订阅这个话题、
+        往 ws 转发, 关掉就取消订阅, 不白白转发没人看的数据。"""
+        if not self._started:
+            raise RuntimeError("ROS bridge 尚未启动")
+        if enabled:
+            if self._self_inflation_sub is None:
+                self._self_inflation_sub = rospy.Subscriber(
+                    config.SELF_INFLATION_TOPIC, Marker, self._handle_self_inflation, queue_size=10,
+                )
+        else:
+            if self._self_inflation_sub is not None:
+                self._self_inflation_sub.unregister()
+                self._self_inflation_sub = None
+
+    def _handle_inflation_map(self, msg: PointCloud2) -> None:
+        """/grid_map/occupancy_inflate 是 grid_map.cpp 的膨胀后占据栅格, 每次
+        整片重发(不是增量), 只有 x/y/z 三个字段。原样转发, 不做下采样——是否
+        订阅这个话题本身就已经是"要不要看"的开关了。"""
+        assert self._on_inflation_map is not None
+        flat: List[float] = []
+        for x, y, z in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            flat.append(float(x))
+            flat.append(float(y))
+            flat.append(float(z))
+        self._on_inflation_map(flat)
+
+    def set_inflation_map_enabled(self, enabled: bool) -> None:
+        """grid_map.cpp 侧 publishMapInflate() 本身就是"没有订阅者就不发布"
+        (getNumSubscribers() <= 0 直接 return), 跟 self_inflation 一样默认不
+        订阅, 前端勾选框打开才订阅, 关掉就取消订阅。"""
+        if not self._started:
+            raise RuntimeError("ROS bridge 尚未启动")
+        if enabled:
+            if self._inflation_map_sub is None:
+                self._inflation_map_sub = rospy.Subscriber(
+                    config.INFLATION_MAP_TOPIC, PointCloud2, self._handle_inflation_map, queue_size=2,
+                )
+        else:
+            if self._inflation_map_sub is not None:
+                self._inflation_map_sub.unregister()
+                self._inflation_map_sub = None
 
     def publish_waypoints(self, waypoints: List[dict]) -> None:
         """下发一整轮路线。waypoints 里的 z 必须已经是 odom 系机体高度。

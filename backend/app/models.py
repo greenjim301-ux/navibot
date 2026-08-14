@@ -79,6 +79,18 @@ class MapStatus(str, Enum):
     ERROR = "error"
 
 
+class SelfInflationRequest(BaseModel):
+    enabled: bool
+    """是否订阅 /scan_planner_node/self_inflation 并转发给前端。这个话题是
+    200Hz, 默认不订阅, 只有前端页面上的勾选框打开时才让后端订阅它。"""
+
+
+class InflationMapRequest(BaseModel):
+    enabled: bool
+    """是否订阅 /grid_map/occupancy_inflate 并转发给前端。默认不订阅, 只有
+    前端页面上的勾选框打开时才让后端订阅它。"""
+
+
 class GroundZRequest(BaseModel):
     points: List[Waypoint] = Field(min_length=1)
 
@@ -92,9 +104,19 @@ class GroundZResponse(BaseModel):
     z: List[Optional[float]] = []
 
 
+class MapImportRequest(BaseModel):
+    name: str
+    """地图名, 会拼进 web_assets/map/<name>/ 这样的路径, 不能有 '/' 等字符。"""
+    storage_path: str
+    """存储路径, 其下应有 3d_map/dense_cloud_map.pcd + 3d_map/keyframe_info_3d.txt。
+    例如实际文件在 /home/cat/map-1/3d_map/dense_cloud_map.pcd, 这里填
+    /home/cat/map-1。"""
+
+
 class MapInfo(BaseModel):
     name: str
     status: MapStatus
+    storage_path: str
     error_message: Optional[str] = None
     topview_meta: Optional[dict] = None
     pointcloud_meta: Optional[dict] = None

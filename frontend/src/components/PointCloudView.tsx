@@ -7,7 +7,9 @@ import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { mapAssetUrl } from "../api";
 import { useGroundZ } from "../hooks/useGroundZ";
-import type { NavStatus, OptimalTrajPoint, TopviewMeta, TrailPoint, Waypoint } from "../types";
+import type {
+  NavStatus, OptimalTrajPoint, SelfInflationMarker, TopviewMeta, TrailPoint, Waypoint,
+} from "../types";
 
 interface Props {
   mapName: string;
@@ -20,6 +22,12 @@ interface Props {
   /** planner 当前正在跑的局部轨迹 (/scan_planner_node/optimal_list 原样转发),
    *  跟 rviz 里看到的是同一份数据, 纯展示, 不参与任何判断。 */
   optimalTraj?: OptimalTrajPoint[] | null;
+  /** /scan_planner_node/self_inflation 原样转发, "双圆柱"自身膨胀包络
+   *  (前/后各一个), 只在页面上的勾选框打开时后端才会有数据。 */
+  selfInflation?: SelfInflationMarker[] | null;
+  /** /grid_map/occupancy_inflate 原样转发, 拍平的 [x0,y0,z0, x1,y1,z1, ...],
+   *  只在页面上的勾选框打开时后端才会有数据。 */
+  inflationMap?: number[] | null;
   /** 是否提供"镜头跟随机器狗"开关 (预览页没有实时位姿, 不需要) */
   enableFollow?: boolean;
 }
@@ -41,7 +49,8 @@ function parsePCW1(buf: ArrayBuffer) {
 }
 
 export function PointCloudView({
-  mapName, meta, waypoints = [], status = null, trail = null, optimalTraj = null, enableFollow = false,
+  mapName, meta, waypoints = [], status = null, trail = null, optimalTraj = null,
+  selfInflation = null, inflationMap = null, enableFollow = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const markersGroupRef = useRef<THREE.Group | null>(null);
@@ -51,6 +60,8 @@ export function PointCloudView({
   const pathMaterialsRef = useRef<LineMaterial | null>(null);
   const optimalGroupRef = useRef<THREE.Group | null>(null);
   const optimalMaterialRef = useRef<LineMaterial | null>(null);
+  const selfInflationGroupRef = useRef<THREE.Group | null>(null);
+  const inflationMapGroupRef = useRef<THREE.Group | null>(null);
 
   // 途经点要画在各自的实际地面高度上。楼梯地图里楼上楼下的点差一米多, 都按
   // meta.floor_z 画会全挤在同一个平面里, 看不出哪个点在楼上。
@@ -163,6 +174,14 @@ export function PointCloudView({
     scene.add(optimalGroup);
     optimalGroupRef.current = optimalGroup;
 
+    const selfInflationGroup = new THREE.Group();
+    scene.add(selfInflationGroup);
+    selfInflationGroupRef.current = selfInflationGroup;
+
+    const inflationMapGroup = new THREE.Group();
+    scene.add(inflationMapGroup);
+    inflationMapGroupRef.current = inflationMapGroup;
+
     let disposed = false;
     let points: THREE.Points | null = null;
 
@@ -227,6 +246,16 @@ export function PointCloudView({
       trailMaterial.dispose();
       optimalGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       optimalMaterial.dispose();
+      selfInflationGroup.children.forEach((c) => {
+        const m = c as THREE.Mesh;
+        m.geometry.dispose();
+        (m.material as THREE.Material).dispose();
+      });
+      inflationMapGroup.children.forEach((c) => {
+        const p = c as THREE.Points;
+        p.geometry.dispose();
+        (p.material as THREE.Material).dispose();
+      });
       renderer.dispose();
       container.removeChild(renderer.domElement);
     };
@@ -327,6 +356,62 @@ export function PointCloudView({
     line.renderOrder = 11;
     group.add(line);
   }, [optimalTraj]);
+
+  // self_inflation (/scan_planner_node/self_inflation): 前/后两个半透明圆柱,
+  // 跟 rviz 一样直接画后端给的圆心/半径/高度, 不做任何插值。
+  useEffect(() => {
+    const group = selfInflationGroupRef.current;
+    if (!group) return;
+
+    group.children.forEach((c) => {
+      const m = c as THREE.Mesh;
+      m.geometry.dispose();
+      (m.material as THREE.Material).dispose();
+    });
+    group.clear();
+
+    (selfInflation ?? []).forEach((marker) => {
+      // CylinderGeometry 默认轴沿 +Y, marker.height 是沿世界 +Z 的高度, 转 90°让它立起来
+      const mesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(marker.radius, marker.radius, marker.height, 24),
+        new THREE.MeshBasicMaterial({
+          color: new THREE.Color(marker.r, marker.g, marker.b),
+          transparent: true,
+          opacity: marker.a,
+          depthWrite: false,
+        }),
+      );
+      mesh.rotation.x = Math.PI / 2;
+      mesh.position.set(marker.x, marker.y, marker.z);
+      mesh.renderOrder = 12;
+      group.add(mesh);
+    });
+  }, [selfInflation]);
+
+  // 膨胀地图 (/grid_map/occupancy_inflate): 每次整片替换, points 是拍平的
+  // [x0,y0,z0, x1,y1,z1, ...], 跟 rviz 一样直接画点, 不做插值/下采样。
+  useEffect(() => {
+    const group = inflationMapGroupRef.current;
+    if (!group) return;
+
+    group.children.forEach((c) => {
+      const p = c as THREE.Points;
+      p.geometry.dispose();
+      (p.material as THREE.Material).dispose();
+    });
+    group.clear();
+
+    if (!inflationMap || inflationMap.length < 3) return;
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(inflationMap), 3));
+    const material = new THREE.PointsMaterial({
+      color: 0xff8a3d, size: 0.045, transparent: true, opacity: 0.85, depthWrite: false,
+    });
+    const points = new THREE.Points(geometry, material);
+    points.renderOrder = 9;
+    group.add(points);
+  }, [inflationMap]);
 
   const hasPose = Boolean(status?.robot_pose);
 

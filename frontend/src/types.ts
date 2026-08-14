@@ -56,6 +56,21 @@ export interface OptimalTrajPoint {
   b: number;
 }
 
+/** /scan_planner_node/self_inflation 的一个圆柱 (id=0 前, id=1 后), "双圆柱"
+ *  自身膨胀包络, rgba 是 rviz 里那个半透明蓝色圆柱的原始颜色, 后端原样转发。 */
+export interface SelfInflationMarker {
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  height: number;
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
 export interface SavedRoute {
   id: string;
   name: string;
@@ -69,6 +84,8 @@ export type MapStatus = "not_processed" | "processing" | "ready" | "error";
 export interface MapInfo {
   name: string;
   status: MapStatus;
+  /** 地图表里记的存储路径, 其下应有 3d_map/dense_cloud_map.pcd */
+  storage_path: string;
   error_message: string | null;
   topview_meta: TopviewMeta | null;
   pointcloud_meta: PointcloudMeta | null;

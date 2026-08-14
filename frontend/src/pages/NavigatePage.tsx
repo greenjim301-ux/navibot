@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { MapPin, Play, Eraser, TriangleAlert, OctagonX } from "lucide-react";
-import { estop, getRoute, submitRoute } from "../api";
+import { estop, getRoute, setInflationMap, setSelfInflation, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
@@ -66,7 +66,35 @@ export default function NavigatePage() {
   const [draftShowSafety, setDraftShowSafety] = useState(false);
   const [draftShowStandable, setDraftShowStandable] = useState(true);
 
-  const { status, optimalTraj, connected } = useNavStatus();
+  const {
+    status, optimalTraj, selfInflationEnabled, selfInflation,
+    inflationMapEnabled, inflationMap, connected,
+  } = useNavStatus();
+  // self_inflation / 膨胀地图都是后端的全局订阅开关(默认不订阅, 话题本身很吵),
+  // 勾选框直接提交开关状态, 真正的 enabled/数据都是从 ws 推回来的 —— 这样多开
+  // 标签页时状态互相同步, 不会各自本地维护一份不一致的"勾没勾"。
+  const [selfInflationBusy, setSelfInflationBusy] = useState(false);
+  async function handleToggleSelfInflation(checked: boolean) {
+    setSelfInflationBusy(true);
+    try {
+      await setSelfInflation(checked);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setSelfInflationBusy(false);
+    }
+  }
+  const [inflationMapBusy, setInflationMapBusy] = useState(false);
+  async function handleToggleInflationMap(checked: boolean) {
+    setInflationMapBusy(true);
+    try {
+      await setInflationMap(checked);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setInflationMapBusy(false);
+    }
+  }
   // "清除轨迹" 也要把 planner 局部轨迹线擦掉, 但那条线是 ws 推来的、页面并不
   // 持有它的数据, 只能记一个"擦掉了"标记, 下一条新轨迹(重规划)推过来时自动
   // 恢复显示 —— 跟机器狗实际走过的轨迹不一样, 这条不是"一直累积"的。
@@ -167,6 +195,28 @@ export default function NavigatePage() {
         actions={
           ready && (
             <>
+              {/* self_inflation 是 200Hz 的话题, 默认不订阅, 勾上才让后端订阅并
+                  转发——跟"执行中不能编辑"无关, 导航过程中正好用来看避障包络。 */}
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                self_inflation
+                <Switch
+                  checked={selfInflationEnabled}
+                  disabled={selfInflationBusy}
+                  onCheckedChange={handleToggleSelfInflation}
+                />
+              </label>
+
+              {/* 膨胀地图 (/grid_map/occupancy_inflate) 同理: 默认不订阅, 勾上
+                  才让后端订阅并转发。 */}
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                膨胀地图
+                <Switch
+                  checked={inflationMapEnabled}
+                  disabled={inflationMapBusy}
+                  onCheckedChange={handleToggleInflationMap}
+                />
+              </label>
+
               <Button
                 size="sm"
                 variant="outline"
@@ -235,6 +285,8 @@ export default function NavigatePage() {
             status={status}
             trail={trail}
             optimalTraj={optimalTrajHidden ? null : optimalTraj}
+            selfInflation={selfInflation}
+            inflationMap={inflationMap}
             enableFollow
           />
         </div>

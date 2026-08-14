@@ -13,8 +13,10 @@ from . import config
 from .map_registry import MapRegistry
 from .models import (
     GroundZRequest, GroundZResponse,
-    MapInfo, NavStatus,
+    MapImportRequest, MapInfo, NavStatus,
+    InflationMapRequest,
     RouteCreateRequest, RouteInfo, RouteRequest,
+    SelfInflationRequest,
 )
 from .route_store import RouteStore
 from . import path_planner
@@ -90,7 +92,16 @@ async def on_startup() -> None:
     def _on_optimal_traj(points):
         route_manager.on_optimal_traj(points)
 
-    ros_bridge = RosBridge(on_pose=_on_pose, on_optimal_traj=_on_optimal_traj)
+    def _on_self_inflation(marker):
+        route_manager.on_self_inflation(marker)
+
+    def _on_inflation_map(points):
+        route_manager.on_inflation_map(points)
+
+    ros_bridge = RosBridge(
+        on_pose=_on_pose, on_optimal_traj=_on_optimal_traj, on_self_inflation=_on_self_inflation,
+        on_inflation_map=_on_inflation_map,
+    )
     route_manager = RouteManager(ros_bridge, ws_manager)
     ros_bridge.start()
     logger.info("navibot backend started")
@@ -125,6 +136,27 @@ async def estop():
         raise HTTPException(503, str(e))
 
 
+@app.post("/api/self_inflation")
+async def set_self_inflation(req: SelfInflationRequest):
+    """勾选框打开/关闭 self_inflation 展示: 开就让后端订阅 200Hz 的
+    /scan_planner_node/self_inflation 并转发, 关就取消订阅——默认不订阅,
+    没人看的时候不必转发这份数据。"""
+    try:
+        return await run_in_threadpool(route_manager.set_self_inflation_enabled, req.enabled)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+@app.post("/api/inflation_map")
+async def set_inflation_map(req: InflationMapRequest):
+    """勾选框打开/关闭膨胀地图展示: 开就让后端订阅 /grid_map/occupancy_inflate
+    并转发, 关就取消订阅。"""
+    try:
+        return await run_in_threadpool(route_manager.set_inflation_map_enabled, req.enabled)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
 @app.post("/api/maps/{name}/ground", response_model=GroundZResponse)
 async def map_ground(name: str, req: GroundZRequest):
     """批量查地面高程。3D 预览把途经点画在各自实际高度上要用。"""
@@ -137,6 +169,14 @@ async def map_ground(name: str, req: GroundZRequest):
 @app.get("/api/maps", response_model=List[MapInfo])
 async def list_maps():
     return await run_in_threadpool(map_registry.list_maps)
+
+
+@app.post("/api/maps", response_model=MapInfo)
+async def import_map(req: MapImportRequest):
+    try:
+        return await run_in_threadpool(map_registry.import_map, req.name, req.storage_path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/maps/{name}", response_model=MapInfo)
@@ -205,6 +245,8 @@ async def ws_nav(ws: WebSocket):
         optimal_traj = route_manager.get_optimal_traj()
         if optimal_traj:
             await ws.send_json({"type": "optimal_traj", "data": {"points": optimal_traj}})
+        await ws.send_json({"type": "self_inflation", "data": route_manager.get_self_inflation_state()})
+        await ws.send_json({"type": "inflation_map", "data": route_manager.get_inflation_map_state()})
         while True:
             # 前端目前不需要往这条连接发消息, 只是保持连接存活/感知断开
             await ws.receive_text()

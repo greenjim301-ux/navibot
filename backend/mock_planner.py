@@ -16,6 +16,11 @@
     跳, scan planner 在执行层面仍然会尽量开到每一个点
   - 发布 /hand_lio/odom_vehicle (nav_msgs/Odometry), 带 covariance[0]
   - **不发布任何到达/完成话题** —— 这正是后端必须自己推断进度的原因
+  - 跟着 odom 一起发布 /scan_planner_node/self_inflation (前/后两个 CYLINDER Marker),
+    对齐 publishSelfInflationMarker()
+  - 发布 /grid_map/occupancy_inflate (sensor_msgs/PointCloud2), 对齐
+    grid_map.cpp 的 publishMapInflate() —— 只是为了验证转发链路, 发的是固定的
+    一圈合成点, 不是真的膨胀栅格
 
 它不做避障也不规划轨迹, 直接朝目标点插值移动。
 """
@@ -25,7 +30,9 @@ import math
 import rospy
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import ColorRGBA
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import ColorRGBA, Header
 from visualization_msgs.msg import Marker
 import tf.transformations as tft
 
@@ -37,6 +44,18 @@ DEGENERATE_DIST_M = 0.05         # 对齐 kDegenerateDist, 只用于跳过和当
 LAST_WAYPOINT_EPS_M = 0.02       # 最后一个点没有提前退出, 模拟成走到接近重合才算到达
 RATE_HZ = 20.0
 
+# self_inflation "双圆柱"包络: 真机上这几个数是 grid_map/obstacles_inflation_z_up
+# 等参数算出来的, 这里就近似取几个能看出前后两个柱子的数, 只为验证转发链路
+SELF_INFLATION_RADIUS_M = 0.35
+SELF_INFLATION_OFFSET_M = 0.3    # 前/后圆柱沿朝向偏移的距离
+SELF_INFLATION_Z_UP_M = 0.3
+SELF_INFLATION_Z_DOWN_M = 0.1
+
+# 膨胀地图只是为了验证转发链路, 合成一圈固定的"墙"点 (以起点为中心的正方形边框),
+# 不是真的栅格膨胀数据
+INFLATION_WALL_HALF_SIZE_M = 2.5
+INFLATION_WALL_STEP_M = 0.15
+
 
 class MockPlanner:
     def __init__(self, start):
@@ -47,7 +66,27 @@ class MockPlanner:
         # 假装是 displayOptimalTraj: 只为了验证后端 -> 前端这条转发链路通不通,
         # 不追求形状对 —— 真 planner 发的是样条轨迹, 这里就发当前位置到目标点的直线
         self.optimal_pub = rospy.Publisher("/scan_planner_node/optimal_list", Marker, queue_size=2)
+        # 假装是 publishSelfInflationMarker: 跟真机一样跟着 odom 走, 每次发两个
+        # CYLINDER (前/后)。navibot 默认不订阅这个话题, 只在前端勾选框打开时才订阅——
+        # mock 这边不用管订阅方是谁, 一直发就行, 跟真机行为一致。
+        self.self_inflation_pub = rospy.Publisher("/scan_planner_node/self_inflation", Marker, queue_size=10)
+        # 假装是 publishMapInflate: 真机是"没订阅者就不发布", mock 这边偷懒直接
+        # 一直发, 反正后端那边本来就是按需订阅, 没人订阅时这些消息根本不会被拉取。
+        self.inflation_map_pub = rospy.Publisher("/grid_map/occupancy_inflate", PointCloud2, queue_size=2)
+        self._inflation_wall_points = self._build_inflation_wall(start[0], start[1], start[2])
         rospy.Subscriber("/preset_waypoints", Path, self.on_waypoints, queue_size=1)
+
+    @staticmethod
+    def _build_inflation_wall(cx, cy, cz):
+        """以起点为中心的正方形边框, 固定不变——只是给转发链路一个能看的形状。"""
+        pts = []
+        n = int(2 * INFLATION_WALL_HALF_SIZE_M / INFLATION_WALL_STEP_M)
+        for i in range(n + 1):
+            t = -INFLATION_WALL_HALF_SIZE_M + i * INFLATION_WALL_STEP_M
+            for x, y in ((t, -INFLATION_WALL_HALF_SIZE_M), (t, INFLATION_WALL_HALF_SIZE_M),
+                         (-INFLATION_WALL_HALF_SIZE_M, t), (INFLATION_WALL_HALF_SIZE_M, t)):
+                pts.append((cx + x, cy + y, cz))
+        return pts
 
     def on_waypoints(self, msg):
         if not msg.poses:
@@ -110,6 +149,8 @@ class MockPlanner:
         odom.pose.covariance[0] = 0.01   # 定位良好
         self.odom_pub.publish(odom)
         self.publish_optimal_traj()
+        self.publish_self_inflation()
+        self.publish_inflation_map()
 
     def publish_optimal_traj(self):
         if self.idx >= len(self.waypoints):
@@ -127,6 +168,31 @@ class MockPlanner:
             line.points.append(Point(x=x, y=y, z=z))
             line.colors.append(ColorRGBA(r=1.0, g=0.4, b=0.0, a=1.0))
         self.optimal_pub.publish(line)
+
+    def publish_self_inflation(self):
+        heading = (math.cos(self.yaw), math.sin(self.yaw))
+        z = self.z + 0.5 * (SELF_INFLATION_Z_UP_M - SELF_INFLATION_Z_DOWN_M)
+        for marker_id, sign in ((0, 1.0), (1, -1.0)):
+            marker = Marker()
+            marker.header.frame_id = "world"
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = "self_inflation"
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+            marker.id = marker_id
+            marker.pose.orientation.w = 1.0
+            marker.pose.position.x = self.x + sign * SELF_INFLATION_OFFSET_M * heading[0]
+            marker.pose.position.y = self.y + sign * SELF_INFLATION_OFFSET_M * heading[1]
+            marker.pose.position.z = z
+            marker.scale.x = 2.0 * SELF_INFLATION_RADIUS_M
+            marker.scale.y = 2.0 * SELF_INFLATION_RADIUS_M
+            marker.scale.z = SELF_INFLATION_Z_UP_M + SELF_INFLATION_Z_DOWN_M
+            marker.color = ColorRGBA(r=0.1, g=0.6, b=1.0, a=0.4)
+            self.self_inflation_pub.publish(marker)
+
+    def publish_inflation_map(self):
+        header = Header(frame_id="world", stamp=rospy.Time.now())
+        self.inflation_map_pub.publish(point_cloud2.create_cloud_xyz32(header, self._inflation_wall_points))
 
 
 def main():

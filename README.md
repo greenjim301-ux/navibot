@@ -33,8 +33,11 @@ frontend/         React + Vite + Three.js + Konva: 地图管理、俯视图选�
 ### 数据流
 
 ```
-mapdata/<name>/dense_cloud_map.pcd   HandBot-S1 建的稠密点云
-mapdata/<name>/keyframe_info_3d.txt  建图轨迹 —— 高程提取的种子, 缺了它带楼梯的图就没法处理
+data/maps.db (SQLite)                地图表: 名称 -> 存储路径, 网页"导入地图"按钮写入
+        │
+        ▼
+<存储路径>/3d_map/dense_cloud_map.pcd    HandBot-S1 建的稠密点云
+<存储路径>/3d_map/keyframe_info_3d.txt   建图轨迹 —— 高程提取的种子, 缺了它带楼梯的图就没法处理
         │
         │  map_pipeline/generate_map_assets.py
         ▼
@@ -48,6 +51,8 @@ web_assets/map/<name>/
     pointcloud.bin         降采样点云 (自定义 PCW1 格式), 供前端 3D 预览
     topview_meta.json      坐标元数据 + 高程统计
 ```
+
+地图的原始数据（`dense_cloud_map.pcd` / `keyframe_info_3d.txt`）不归 navibot 管，留在用户自己的存储路径下；"导入地图"只是往 `data/maps.db` 里记一笔名字和路径，不拷贝文件。删除地图只删数据库这一行和 `web_assets/map/<name>/` 下自己生成的预处理产物，不会碰存储路径下的原始文件。
 
 ---
 
@@ -65,14 +70,15 @@ web_assets/map/<name>/
 > ```
 
 ```bash
-# 1. 放一份地图数据
-mkdir -p mapdata/myroom
-cp /path/to/dense_cloud_map.pcd  mapdata/myroom/
-cp /path/to/keyframe_info_3d.txt mapdata/myroom/     # 带楼梯的图必须有
+# 1. 准备一份地图数据, 目录里要有 3d_map/ 子目录 (带楼梯的图 keyframe_info_3d.txt 必须有)
+#   /path/to/myroom/3d_map/dense_cloud_map.pcd
+#   /path/to/myroom/3d_map/keyframe_info_3d.txt
+# 然后在网页"地图管理"里点"导入地图", 名称填 myroom, 存储路径填 /path/to/myroom
+# (只是往 data/maps.db 记一笔账, 不拷贝文件)
 
 # 2. 预处理 (也可以在网页的"地图管理"里点按钮触发)
 mamba run -n ros_host python map_pipeline/generate_map_assets.py \
-    --input mapdata/myroom/dense_cloud_map.pcd \
+    --input /path/to/myroom/3d_map/dense_cloud_map.pcd \
     --outdir web_assets/map/myroom
 
 # 3. 后端 (需要 roscore 已在跑)
