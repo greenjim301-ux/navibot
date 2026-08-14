@@ -44,7 +44,7 @@ export default function RouteListPage() {
   }
 
   return (
-    <div className="mx-auto max-w-6xl px-8 py-9">
+    <div className="px-8 py-6">
       <PageHeader
         title="路线管理"
         description="保存常用的途经点序列，之后可直接预览或用于导航。"

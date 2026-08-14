@@ -2,6 +2,7 @@
 node_modules/
 frontend/dist/
 .vite/
+.playwright-mcp/
 
 # --- Python ---
 __pycache__/

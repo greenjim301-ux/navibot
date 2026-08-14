@@ -32,6 +32,24 @@ interface Props {
   enableFollow?: boolean;
 }
 
+// rviz PointCloud2 的 "rainbow" 色表 (ogre_helpers::getRainbowColor 同款算法):
+// value=0 -> 蓝, 经青/绿/黄, value=1 -> 红。膨胀地图勾选框要求"渲染要像 rviz
+// 那样", 这里按 z 高度自动算 min/max (对齐 rviz 的 Autocompute Value Bounds)
+// 再映射到这条色表, 不是套一个固定颜色。
+function rvizRainbowColor(value: number, out: THREE.Color) {
+  const v = Math.min(1, Math.max(0, value));
+  const h = v * 5 + 1;
+  const i = Math.floor(h);
+  let f = h - i;
+  if ((i & 1) === 0) f = 1 - f;
+  const n = 1 - f;
+  if (i <= 1) out.setRGB(n, 0, 1);
+  else if (i === 2) out.setRGB(0, n, 1);
+  else if (i === 3) out.setRGB(0, 1, n);
+  else if (i === 4) out.setRGB(n, 1, 0);
+  else out.setRGB(1, n, 0);
+}
+
 // 解析 map_pipeline/generate_map_assets.py 导出的 PCW1 自定义二进制格式:
 // magic(4) + uint32 count + float32[count*3] xyz + uint8[count*3] rgb
 function parsePCW1(buf: ArrayBuffer) {
@@ -389,7 +407,9 @@ export function PointCloudView({
   }, [selfInflation]);
 
   // 膨胀地图 (/grid_map/occupancy_inflate): 每次整片替换, points 是拍平的
-  // [x0,y0,z0, x1,y1,z1, ...], 跟 rviz 一样直接画点, 不做插值/下采样。
+  // [x0,y0,z0, x1,y1,z1, ...], 跟 rviz 的 inflate_map 显示项对齐: Axis=Z +
+  // Use rainbow + Autocompute Value Bounds (按当前这批点的 z 范围实时取
+  // min/max, 不是固定阈值), Size (m)=0.1, Alpha=1, 不做插值/下采样。
   useEffect(() => {
     const group = inflationMapGroupRef.current;
     if (!group) return;
@@ -403,11 +423,30 @@ export function PointCloudView({
 
     if (!inflationMap || inflationMap.length < 3) return;
 
+    const positions = new Float32Array(inflationMap);
+    const count = positions.length / 3;
+    let zMin = Infinity;
+    let zMax = -Infinity;
+    for (let i = 0; i < count; i++) {
+      const z = positions[i * 3 + 2];
+      if (z < zMin) zMin = z;
+      if (z > zMax) zMax = z;
+    }
+    const zRange = zMax - zMin;
+    const colors = new Float32Array(count * 3);
+    const rainbow = new THREE.Color();
+    for (let i = 0; i < count; i++) {
+      const z = positions[i * 3 + 2];
+      rvizRainbowColor(zRange > 1e-6 ? (z - zMin) / zRange : 0, rainbow);
+      colors[i * 3] = rainbow.r;
+      colors[i * 3 + 1] = rainbow.g;
+      colors[i * 3 + 2] = rainbow.b;
+    }
+
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(inflationMap), 3));
-    const material = new THREE.PointsMaterial({
-      color: 0xff8a3d, size: 0.045, transparent: true, opacity: 0.85, depthWrite: false,
-    });
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    const material = new THREE.PointsMaterial({ size: 0.1, vertexColors: true });
     const points = new THREE.Points(geometry, material);
     points.renderOrder = 9;
     group.add(points);

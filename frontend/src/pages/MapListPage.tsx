@@ -111,7 +111,7 @@ export default function MapListPage() {
   const notProcessedCount = maps?.filter((m) => m.status === "not_processed" || m.status === "error").length ?? 0;
 
   return (
-    <div className="mx-auto max-w-6xl px-8 py-9">
+    <div className="px-8 py-6">
       <PageHeader
         title="地图管理"
         description="地图列表来自地图表，导入后需先预处理才能预览或用于导航。"

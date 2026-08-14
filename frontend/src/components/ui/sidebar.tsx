@@ -304,7 +304,13 @@ function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
     <main
       data-slot="sidebar-inset"
       className={cn(
-        "relative flex w-full flex-1 flex-col bg-background md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:shadow-sm md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
+        // min-w-0 是必须的: SidebarInset 是 SidebarProvider 那个横向 flex 容器
+        // 里的 flex-1 子项, 默认 min-width:auto 只会收缩到"内容想要的最小宽度"
+        // 为止——平时页面内容都是普通文字/图片感觉不出来, 但像 3D/俯视图预览
+        // 这种内部用 Konva canvas(display:inline-block, 宽度由 JS 撑开的元素)
+        // 的页面, 内容想要的宽度可能比侧边栏让出来的空间还宽, 于是把 <main>
+        // 顶宽, 页面出现横向滚动条(现象是这类预览框比正常应有宽度大一截)。
+        "relative flex w-full min-w-0 flex-1 flex-col bg-background md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:shadow-sm md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
         className
       )}
       {...props}

@@ -197,8 +197,8 @@ export default function NavigatePage() {
             <>
               {/* self_inflation 是 200Hz 的话题, 默认不订阅, 勾上才让后端订阅并
                   转发——跟"执行中不能编辑"无关, 导航过程中正好用来看避障包络。 */}
-              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                self_inflation
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
+                自身膨胀
                 <Switch
                   checked={selfInflationEnabled}
                   disabled={selfInflationBusy}
@@ -208,7 +208,7 @@ export default function NavigatePage() {
 
               {/* 膨胀地图 (/grid_map/occupancy_inflate) 同理: 默认不订阅, 勾上
                   才让后端订阅并转发。 */}
-              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <label className="flex items-center gap-1.5 text-xs text-foreground">
                 膨胀地图
                 <Switch
                   checked={inflationMapEnabled}
