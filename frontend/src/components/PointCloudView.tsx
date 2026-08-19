@@ -819,7 +819,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
       geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
-      const material = new THREE.PointsMaterial({ size: 0.1, vertexColors: true });
+      const material = new THREE.PointsMaterial({
+        size: 0.1, vertexColors: true, clippingPlanes: [heightPlaneRef.current],
+      });
       points = new THREE.Points(geometry, material);
       points.renderOrder = 9;
       group.add(points);
@@ -896,7 +898,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       const capacity = Math.ceil(count * 1.5);
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
-      const material = new THREE.PointsMaterial({ size: 0.05, color: 0x38bdf8 });
+      const material = new THREE.PointsMaterial({
+        size: 0.05, color: 0x38bdf8, clippingPlanes: [heightPlaneRef.current],
+      });
       points = new THREE.Points(geometry, material);
       points.renderOrder = 8;
       group.add(points);
