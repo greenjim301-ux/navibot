@@ -58,24 +58,6 @@ export interface PointCloudViewHandle {
   resetView(): void;
 }
 
-// rviz PointCloud2 的 "rainbow" 色表 (ogre_helpers::getRainbowColor 同款算法):
-// value=0 -> 蓝, 经青/绿/黄, value=1 -> 红。膨胀地图勾选框要求"渲染要像 rviz
-// 那样", 这里按 z 高度自动算 min/max (对齐 rviz 的 Autocompute Value Bounds)
-// 再映射到这条色表, 不是套一个固定颜色。
-function rvizRainbowColor(value: number, out: THREE.Color) {
-  const v = Math.min(1, Math.max(0, value));
-  const h = v * 5 + 1;
-  const i = Math.floor(h);
-  let f = h - i;
-  if ((i & 1) === 0) f = 1 - f;
-  const n = 1 - f;
-  if (i <= 1) out.setRGB(n, 0, 1);
-  else if (i === 2) out.setRGB(0, n, 1);
-  else if (i === 3) out.setRGB(0, 1, n);
-  else if (i === 4) out.setRGB(n, 1, 0);
-  else out.setRGB(1, n, 0);
-}
-
 // 解析 map_pipeline/generate_map_assets.py 导出的 PCW1 自定义二进制格式:
 // magic(4) + uint32 count + float32[count*3] xyz + uint8[count*3] rgb
 function parsePCW1(buf: ArrayBuffer) {
@@ -155,6 +137,10 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   const optimalMaterialRef = useRef<LineMaterial | null>(null);
   const selfInflationGroupRef = useRef<THREE.Group | null>(null);
   const inflationMapGroupRef = useRef<THREE.Group | null>(null);
+  // 膨胀地图的 Points/几何体在多次更新之间复用(见下面那个 effect), 不是每次都
+  // 整个丢掉重建; capacity 记录当前顶点/颜色缓冲区能容纳的点数上限。
+  const inflationPointsRef = useRef<THREE.Points | null>(null);
+  const inflationCapacityRef = useRef(0);
   // 按需渲染: 场景大多数时候是静止的(尤其点云可能有几百万个点), 不值得每帧都
   // 真跑一次 renderer.render()。这个 flag 由所有会改变画面的地方(相机交互/跟随
   // 动画/props 驱动的场景更新/resize)置位, animate() 里渲染完就清掉, 空闲时
@@ -364,6 +350,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     const inflationMapGroup = new THREE.Group();
     scene.add(inflationMapGroup);
     inflationMapGroupRef.current = inflationMapGroup;
+    inflationPointsRef.current = null;
+    inflationCapacityRef.current = 0;
 
     let disposed = false;
     let points: THREE.Points | null = null;
@@ -779,51 +767,88 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     });
   }, [selfInflation]);
 
-  // 膨胀地图 (/grid_map/occupancy_inflate): 每次整片替换, points 是拍平的
+  // 膨胀地图 (/grid_map/occupancy_inflate): points 是拍平的
   // [x0,y0,z0, x1,y1,z1, ...], 跟 rviz 的 inflate_map 显示项对齐: Axis=Z +
   // Use rainbow + Autocompute Value Bounds (按当前这批点的 z 范围实时取
   // min/max, 不是固定阈值), Size (m)=0.1, Alpha=1, 不做插值/下采样。
+  // 更新时原地复用 GPU 缓冲区(见下面 inflationPointsRef/inflationCapacityRef),
+  // 只有点数超出当前容量才重新分配, 不是每帧都整个 dispose 重建。
   useEffect(() => {
     const group = inflationMapGroupRef.current;
     if (!group) return;
     needsRenderRef.current = true;
 
-    group.children.forEach((c) => {
-      const p = c as THREE.Points;
-      p.geometry.dispose();
-      (p.material as THREE.Material).dispose();
-    });
-    group.clear();
+    if (!inflationMap || inflationMap.length < 3) {
+      // 没数据就隐藏, 不销毁——缓冲区留着, 下次数据回来直接复用, 不用重新分配。
+      if (inflationPointsRef.current) inflationPointsRef.current.visible = false;
+      return;
+    }
 
-    if (!inflationMap || inflationMap.length < 3) return;
+    const count = Math.floor(inflationMap.length / 3);
+    let points = inflationPointsRef.current;
 
-    const positions = new Float32Array(inflationMap);
-    const count = positions.length / 3;
+    // 只有第一次、或者这一帧的点数超过了当前缓冲区容量时才重新分配 GPU 缓冲区;
+    // 容量足够的正常情况下(帧与帧之间点数一般变化不大)全部走下面的原地写入,
+    // 不再 dispose/新建 geometry/material, 避免逐帧的显存重新上传。
+    if (!points || count > inflationCapacityRef.current) {
+      if (points) {
+        points.geometry.dispose();
+        (points.material as THREE.Material).dispose();
+        group.remove(points);
+      }
+      const capacity = Math.ceil(count * 1.5); // 留 50% 余量, 减少反复扩容重建
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
+      const material = new THREE.PointsMaterial({ size: 0.1, vertexColors: true });
+      points = new THREE.Points(geometry, material);
+      points.renderOrder = 9;
+      group.add(points);
+      inflationPointsRef.current = points;
+      inflationCapacityRef.current = capacity;
+    }
+    points.visible = true;
+
+    const geometry = points.geometry;
+    const posAttr = geometry.getAttribute("position") as THREE.BufferAttribute;
+    const colorAttr = geometry.getAttribute("color") as THREE.BufferAttribute;
+    const positions = posAttr.array as Float32Array;
+    const colors = colorAttr.array as Float32Array;
+
+    positions.set(inflationMap); // 定长数组间的原生批量拷贝, 比逐元素手写循环快
+
     let zMin = Infinity;
     let zMax = -Infinity;
     for (let i = 0; i < count; i++) {
-      const z = positions[i * 3 + 2];
+      const z = inflationMap[i * 3 + 2];
       if (z < zMin) zMin = z;
       if (z > zMax) zMax = z;
     }
     const zRange = zMax - zMin;
-    const colors = new Float32Array(count * 3);
-    const rainbow = new THREE.Color();
+    const invRange = zRange > 1e-6 ? 1 / zRange : 0;
+
+    // rvizRainbowColor 内联展开: 避免每个点一次函数调用 + THREE.Color 对象读写的
+    // 开销, 这个循环每帧要跑几千到几万次, 内联后就是纯数值运算。
     for (let i = 0; i < count; i++) {
-      const z = positions[i * 3 + 2];
-      rvizRainbowColor(zRange > 1e-6 ? (z - zMin) / zRange : 0, rainbow);
-      colors[i * 3] = rainbow.r;
-      colors[i * 3 + 1] = rainbow.g;
-      colors[i * 3 + 2] = rainbow.b;
+      const si = i * 3;
+      const z = inflationMap[si + 2];
+      const v = invRange > 0 ? Math.min(1, Math.max(0, (z - zMin) * invRange)) : 0;
+      const h = v * 5 + 1;
+      const ii = Math.floor(h);
+      let f = h - ii;
+      if ((ii & 1) === 0) f = 1 - f;
+      const n = 1 - f;
+      if (ii <= 1) { colors[si] = n; colors[si + 1] = 0; colors[si + 2] = 1; }
+      else if (ii === 2) { colors[si] = 0; colors[si + 1] = n; colors[si + 2] = 1; }
+      else if (ii === 3) { colors[si] = 0; colors[si + 1] = 1; colors[si + 2] = n; }
+      else if (ii === 4) { colors[si] = n; colors[si + 1] = 1; colors[si + 2] = 0; }
+      else { colors[si] = 1; colors[si + 1] = n; colors[si + 2] = 0; }
     }
 
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-    const material = new THREE.PointsMaterial({ size: 0.1, vertexColors: true });
-    const points = new THREE.Points(geometry, material);
-    points.renderOrder = 9;
-    group.add(points);
+    posAttr.needsUpdate = true;
+    colorAttr.needsUpdate = true;
+    geometry.setDrawRange(0, count);
+    geometry.computeBoundingSphere();
   }, [inflationMap]);
 
   const hasPose = Boolean(status?.robot_pose);
