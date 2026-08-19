@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Trash2, Map as MapIcon, CircleCheck, CircleDashed, Loader2, RefreshCw, FolderInput } from "lucide-react";
-import { deleteMap, importMap, listMaps, mapAssetUrl, preprocessMap } from "../api";
+import { deleteMap, importMap, listMaps, preprocessMap } from "../api";
 import type { MapInfo } from "../types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -250,21 +250,7 @@ function MapCard({
   return (
     <Card className="gap-0 overflow-hidden py-0">
       <div className="relative flex h-32 items-center justify-center overflow-hidden bg-muted">
-        {ready ? (
-          // crossOrigin 必须加, 而且必须和 TopView 里 useImage(url, "anonymous") 一致。
-          // 这张缩略图和俯视图用的是同一个 URL: 这里不带 crossOrigin 的话, 浏览器会
-          // 把一份"没有 CORS 头"的响应放进缓存, 之后 Konva 以 CORS 模式请求同一个
-          // URL 时命中这份缓存, 就报 "No 'Access-Control-Allow-Origin' header is
-          // present" —— 服务端明明发了头也没用, 因为压根没再发请求。
-          <img
-            src={mapAssetUrl(map.name, "topview.png")}
-            alt={`${map.name} 俯视图`}
-            crossOrigin="anonymous"
-            className="h-full w-full object-contain"
-          />
-        ) : (
-          <MapIcon className="size-8 text-muted-foreground/40" />
-        )}
+        <MapIcon className="size-8 text-muted-foreground/40" />
         <Badge variant={STATUS_VARIANT[map.status]} className="absolute top-2 right-2">
           {processing ? STATUS_LABEL.processing : STATUS_LABEL[map.status]}
         </Badge>
@@ -275,10 +261,9 @@ function MapCard({
         <CardDescription className="truncate font-mono text-[11px]" title={map.storage_path}>
           {map.storage_path}
         </CardDescription>
-        {ready && map.topview_meta && (
+        {ready && map.pointcloud_meta && (
           <CardDescription className="font-mono text-[11px]">
-            {map.topview_meta.width}×{map.topview_meta.height}px ·{" "}
-            {map.pointcloud_meta?.num_points.toLocaleString()} 点
+            {map.pointcloud_meta.num_points.toLocaleString()} 点
           </CardDescription>
         )}
       </CardHeader>
@@ -288,7 +273,7 @@ function MapCard({
           <p className="line-clamp-3 text-xs text-destructive">{map.error_message}</p>
         )}
         {map.status === "not_processed" && (
-          <p className="text-xs text-muted-foreground">还没有生成俯视图 / 3D 预览资产</p>
+          <p className="text-xs text-muted-foreground">还没有生成 3D 预览资产</p>
         )}
         {processing && (
           <p className="text-xs text-muted-foreground">正在跑点云处理流水线，通常需要几秒到几十秒…</p>
@@ -330,7 +315,7 @@ function MapCard({
             <AlertDialogHeader>
               <AlertDialogTitle>删除地图 "{map.name}"？</AlertDialogTitle>
               <AlertDialogDescription>
-                这会删除地图表里的这条记录，以及已生成的俯视图 / 3D 预览产物，无法恢复；
+                这会删除地图表里的这条记录，以及已生成的 3D 预览产物，无法恢复；
                 存储路径 {map.storage_path} 下的原始点云数据不会被删除。
               </AlertDialogDescription>
             </AlertDialogHeader>

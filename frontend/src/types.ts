@@ -96,9 +96,10 @@ export interface TopviewMeta {
   resolution_m_per_px: number;
   width: number;
   height: number;
-  world_bounds: { x_min: number; x_max: number; y_min: number; y_max: number };
-  floor_z: number;
-  ceiling_z: number;
+  world_bounds: {
+    x_min: number; x_max: number; y_min: number; y_max: number;
+    z_min: number; z_max: number;
+  };
   hazard_z_range: [number, number];
   source_file: string;
   /** 只有带建图轨迹、能提取出高程面的地图才有 */
@@ -114,14 +115,28 @@ export interface TopviewMeta {
   };
 }
 
+/** 大地图分片清单(见 map_pipeline/generate_map_assets.py 的 export_tiles),
+ *  只有跨度超过阈值的地图才有 —— 小地图整图预览的精度就够用, 不分片。
+ *  PointCloudView 按当前相机看的地方动态加载/卸载对应的 tiles/tile_{ix}_{iy}.bin。 */
+export interface TilesMeta {
+  tile_size: number;
+  origin_x: number;
+  origin_y: number;
+  point_budget: number;
+  tiles: { ix: number; iy: number; num_points: number }[];
+}
+
 export interface PointcloudMeta {
   num_points: number;
-  voxel_size: number;
+  max_preview_points: number;
+  /** 降采样体素边长(米); 点数本来就没超阈值、没触发降采样时是 null */
+  voxel_size_m?: number | null;
   world_bounds: {
     x_min: number; x_max: number;
     y_min: number; y_max: number;
     z_min: number; z_max: number;
   };
+  tiles?: TilesMeta | null;
 }
 
 // 与 map_pipeline/generate_map_assets.py 里的 pixel_to_world / world_to_pixel 保持一致

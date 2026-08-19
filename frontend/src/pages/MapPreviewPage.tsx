@@ -1,88 +1,119 @@
-import { useEffect, useState } from "react";
+import { useRef, useState } from "react";
 import { useParams } from "react-router-dom";
+import { RefreshCw, Target } from "lucide-react";
 import { useMapInfo } from "../hooks/useMapInfo";
-import { PointCloudView } from "../components/PointCloudView";
-import { TopView } from "../components/TopView";
+import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PageHeader } from "../components/PageHeader";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Slider } from "@/components/ui/slider";
+import { Label } from "@/components/ui/label";
 
-// 俯视图是 Konva canvas, 需要显式像素尺寸, 用 ResizeObserver 量出 tab 内容区
-// 实际可用空间喂给它, 这样才能跟 3D 预览一样基本占满页面(而不是固定一个
-// 跟视口大小无关的尺寸)。这两个值只是首次量出之前的兜底, 量到就会被替换。
-const FALLBACK_TOPVIEW_WIDTH = 1000;
-const FALLBACK_TOPVIEW_HEIGHT = 600;
+const HEIGHT_LIMIT_STEP = 0.25;
 
 export default function MapPreviewPage() {
   const { name = "" } = useParams();
   const { info, error, loading } = useMapInfo(name);
+  const pcRef = useRef<PointCloudViewHandle>(null);
 
-  // 用回调 ref (而不是 useRef + 空依赖 useEffect): 这块容器挂在 tab 里, 首次
-  // 渲染时("3D 预览" 是默认 tab)它压根不存在, 空依赖的 effect 只跑一次会
-  // 完全错过它挂载的那一刻, 导致切到"俯视图" tab 后尺寸一直停在兜底值上。
-  const [topViewNode, setTopViewNode] = useState<HTMLDivElement | null>(null);
-  const [topViewSize, setTopViewSize] = useState({
-    width: FALLBACK_TOPVIEW_WIDTH,
-    height: FALLBACK_TOPVIEW_HEIGHT,
-  });
-  useEffect(() => {
-    if (!topViewNode) return;
-    const observer = new ResizeObserver(([entry]) => {
-      const { width, height } = entry.contentRect;
-      if (width > 0 && height > 0) setTopViewSize({ width, height });
-    });
-    observer.observe(topViewNode);
-    return () => observer.disconnect();
-  }, [topViewNode]);
+  // 高度限制(世界系绝对 z, 米), 高于这个高度的点云不渲染, 由 PointCloudView
+  // 用裁剪平面实现。滑杆范围钉在这份地图自己的 [z_min, z_max] 之间 —— 这两个
+  // 值要等 topview_meta 加载完才知道, 所以初值是 null, 拿到 meta 后默认给
+  // z_max(不裁剪, 显示全部点云)。
+  const [heightLimit, setHeightLimit] = useState<number | null>(null);
+  // 是否处于"点选新中心点"模式, 由 PointCloudView 通过 onRecenterModeChange
+  // 回调同步过来(点选成功 / resetView 都会自动关闭), 纯用来控制按钮高亮和
+  // 提示条的显示, 不直接驱动任何 three.js 逻辑。
+  const [recentering, setRecentering] = useState(false);
 
   return (
-    <div className="flex h-full flex-col px-8 py-6">
-      <PageHeader backTo="/" backLabel="地图列表" title={name} description="地图预览" />
+    // 这页不走 Layout(没有侧边栏/顶部应用栏), 头栏 + 预览内容自己撑满整个视口。
+    <div className="flex h-svh flex-col overflow-hidden">
+      <div className="shrink-0 border-b bg-card px-6 pt-4">
+        <PageHeader backTo="/" backLabel="地图列表" title={name} description="地图预览" />
+      </div>
 
-      {loading && <Skeleton className="min-h-0 flex-1 rounded-xl" />}
+      {loading && <Skeleton className="min-h-0 flex-1 rounded-none" />}
 
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-          {error}
+        <div className="flex min-h-0 flex-1 items-center justify-center px-6">
+          <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            {error}
+          </div>
         </div>
       )}
 
       {info && info.status !== "ready" && (
-        <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
-          这份地图还没有预处理完成 (当前状态: {info.status})，回地图列表触发预处理。
+        <div className="flex min-h-0 flex-1 items-center justify-center px-6">
+          <div className="w-full max-w-lg rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
+            这份地图还没有预处理完成 (当前状态: {info.status})，回地图列表触发预处理。
+          </div>
         </div>
       )}
 
-      {info?.status === "ready" && info.topview_meta && (
-        <Tabs defaultValue="3d" className="min-h-0 flex-1">
-          <TabsList>
-            <TabsTrigger value="3d">3D 预览</TabsTrigger>
-            <TabsTrigger value="top">俯视图</TabsTrigger>
-          </TabsList>
+      {info?.status === "ready" && info.topview_meta && (() => {
+        const { z_min: zMin, z_max: zMax } = info.topview_meta.world_bounds;
+        const effectiveHeightLimit = heightLimit ?? zMax;
+        return (
+        <div className="relative min-h-0 flex-1 overflow-hidden">
+          <PointCloudView
+            ref={pcRef}
+            mapName={name}
+            meta={info.topview_meta}
+            pointcloudMeta={info.pointcloud_meta}
+            heightLimit={effectiveHeightLimit}
+            controlMode="fixed"
+            onRecenterModeChange={setRecentering}
+          />
 
-          <TabsContent value="3d" className="min-h-0">
-            <div className="h-full overflow-hidden rounded-xl border">
-              <PointCloudView mapName={name} meta={info.topview_meta} />
-            </div>
-          </TabsContent>
+          {/* 固定视角: 旋转/缩放跟导航页一样交给鼠标(左键拖拽转、滚轮缩), 只是
+              关掉了拖拽平移 —— 换视角中心改成点选(下面这颗按钮), 不会被误拖走。 */}
+          <div className="absolute top-3 right-3 flex flex-col gap-1.5">
+            <button
+              type="button"
+              title={recentering ? "取消点选" : "点选新的旋转中心"}
+              onClick={() => pcRef.current?.toggleRecenter()}
+              className={`grid size-8 place-items-center rounded-md border backdrop-blur transition-colors ${
+                recentering
+                  ? "border-cyan-400/40 bg-cyan-500/20 text-cyan-100"
+                  : "border-white/20 bg-black/40 text-white/80 hover:bg-black/60"
+              }`}
+            >
+              <Target className="size-4" />
+            </button>
+            <button
+              type="button"
+              title="重置视角"
+              onClick={() => pcRef.current?.resetView()}
+              className="grid size-8 place-items-center rounded-md border border-white/20 bg-black/40 text-white/80 backdrop-blur transition-colors hover:bg-black/60"
+            >
+              <RefreshCw className="size-4" />
+            </button>
+          </div>
 
-          <TabsContent value="top" className="min-h-0">
-            <div ref={setTopViewNode} className="h-full overflow-hidden rounded-xl border">
-              <TopView
-                mapName={name}
-                meta={info.topview_meta}
-                waypoints={[]}
-                onChangeWaypoints={() => {}}
-                editable={false}
-                status={null}
-                showSafety={true}
-                maxWidth={topViewSize.width}
-                maxHeight={topViewSize.height}
-              />
+          {recentering && (
+            <div className="absolute top-3 left-1/2 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
+              点击点云上的一个点, 把它设为新的旋转中心
             </div>
-          </TabsContent>
-        </Tabs>
-      )}
+          )}
+
+          <div className="absolute bottom-3 left-3 flex w-64 items-center gap-3 rounded-md border border-white/20 bg-black/40 px-3 py-2 text-white/80 backdrop-blur">
+            <Label htmlFor="height-limit" className="shrink-0 text-xs">
+              高度限制
+            </Label>
+            <Slider
+              id="height-limit"
+              className="flex-1"
+              min={zMin}
+              max={zMax}
+              step={HEIGHT_LIMIT_STEP}
+              value={[effectiveHeightLimit]}
+              onValueChange={([v]) => setHeightLimit(v)}
+            />
+            <span className="w-12 shrink-0 text-right font-mono text-xs">{effectiveHeightLimit.toFixed(2)}m</span>
+          </div>
+        </div>
+        );
+      })()}
     </div>
   );
 }
