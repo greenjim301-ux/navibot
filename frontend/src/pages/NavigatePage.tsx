@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { MapPin, Play, Eraser, TriangleAlert, OctagonX } from "lucide-react";
+import { MapPin, Play, Eraser, Trash2, TriangleAlert, OctagonX } from "lucide-react";
 import { estop, getRoute, setInflationMap, setSelfInflation, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
@@ -13,10 +13,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
-import { Input } from "@/components/ui/input";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from "@/components/ui/dialog";
+import { Slider } from "@/components/ui/slider";
+import { Label } from "@/components/ui/label";
+
+const HEIGHT_LIMIT_STEP = 0.25;
 
 const STATE_LABEL: Record<string, string> = {
   idle: "空闲",
@@ -40,9 +43,6 @@ const TRAIL_MIN_STEP_M = 0.05;
 // 轨迹点数上限, 防止长时间挂着页面把内存吃掉。超了从头丢。
 const TRAIL_MAX_POINTS = 5000;
 
-const DIALOG_TOPVIEW_WIDTH = 760;
-const DIALOG_TOPVIEW_HEIGHT = 500;
-
 export default function NavigatePage() {
   const { name = "" } = useParams();
   const [searchParams] = useSearchParams();
@@ -59,12 +59,28 @@ export default function NavigatePage() {
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // 高度限制(世界系绝对 z, 米), 用法跟 MapPreviewPage 一样: 初值 null, 拿到
+  // topview_meta 后默认给 z_max(不裁剪, 显示全部点云)。
+  const [heightLimit, setHeightLimit] = useState<number | null>(null);
 
   // 设置路线弹窗: 在草稿上编辑, 点"提交"才生效, 直接关掉不影响已有路线
   const [dialogOpen, setDialogOpen] = useState(false);
   const [draft, setDraft] = useState<Waypoint[]>([]);
-  const [draftShowSafety, setDraftShowSafety] = useState(false);
-  const [draftShowStandable, setDraftShowStandable] = useState(true);
+  // 俯视图是 Konva canvas, 需要显式像素尺寸, 用 ResizeObserver 量出弹窗里
+  // 那块实际可用空间 —— 跟 RouteCreatePage/RoutePreviewPage 同款做法。用回调
+  // ref 而不是 useRef + 空依赖 useEffect: 这块容器只在弹窗打开时才挂载, 空
+  // 依赖的 effect 只跑一次会完全错过。
+  const [topViewNode, setTopViewNode] = useState<HTMLDivElement | null>(null);
+  const [topViewSize, setTopViewSize] = useState({ width: 1000, height: 480 });
+  useEffect(() => {
+    if (!topViewNode) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      if (width > 0 && height > 0) setTopViewSize({ width, height });
+    });
+    observer.observe(topViewNode);
+    return () => observer.disconnect();
+  }, [topViewNode]);
 
   const {
     status, optimalTraj, selfInflationEnabled, selfInflation,
@@ -165,136 +181,183 @@ export default function NavigatePage() {
   }
 
   return (
-    <div className="flex h-full flex-col px-8 py-6">
-      <PageHeader
-        backTo={locked ? "/routes" : "/"}
-        backLabel={locked ? "路线管理" : "地图列表"}
-        title={name}
-        description={
-          <span className="flex items-center gap-2">
-            <span className={`inline-block size-2 rounded-full ${connected ? "bg-green-500" : "bg-destructive"}`} />
-            {connected ? "已连接" : "未连接"}
-            {/* 定位失败时地图上所有绝对坐标都不可信, 这时候下发导航点是危险的 */}
-            {poseUnreliable(status?.robot_pose) && (
-              <Badge variant="destructive" className="gap-1">
-                <TriangleAlert className="size-3" />
-                定位失败
-              </Badge>
-            )}
-            <Badge variant={STATE_VARIANT[state] ?? "secondary"}>{STATE_LABEL[state] ?? state}</Badge>
-            {state === "running" && status && (
-              <span className="font-mono text-xs">
-                {status.current_index + 1}/{status.waypoints.length}
-              </span>
-            )}
-            <span>
-              · {savedRouteName ? `路线「${savedRouteName}」` : "路线"} {waypoints.length} 点
-            </span>
-          </span>
-        }
-        actions={
-          ready && (
-            <>
-              {/* self_inflation 是 200Hz 的话题, 默认不订阅, 勾上才让后端订阅并
-                  转发——跟"执行中不能编辑"无关, 导航过程中正好用来看避障包络。 */}
-              <label className="flex items-center gap-1.5 text-xs text-foreground">
-                自身膨胀
-                <Switch
-                  checked={selfInflationEnabled}
-                  disabled={selfInflationBusy}
-                  onCheckedChange={handleToggleSelfInflation}
-                />
-              </label>
-
-              {/* 膨胀地图 (/grid_map/occupancy_inflate) 同理: 默认不订阅, 勾上
-                  才让后端订阅并转发。 */}
-              <label className="flex items-center gap-1.5 text-xs text-foreground">
-                膨胀地图
-                <Switch
-                  checked={inflationMapEnabled}
-                  disabled={inflationMapBusy}
-                  onCheckedChange={handleToggleInflationMap}
-                />
-              </label>
-
-              <Button
-                size="sm"
-                variant="outline"
-                // 只读查看不受"执行中不能编辑"的限制, 跑着的时候也该能看路线
-                disabled={busy || (!locked && !editable)}
-                onClick={openRouteDialog}
-              >
-                <MapPin />
-                {locked ? "已设置路线" : "设置路线"}
-              </Button>
-
-              {state === "running" ? (
-                <Button size="sm" variant="destructive" disabled={busy} onClick={() => run(estop)}>
-                  <OctagonX />
-                  停止导航
-                </Button>
-              ) : (
-                <Button size="sm" disabled={busy || waypoints.length === 0} onClick={handleStart}>
-                  <Play />
-                  开始导航
-                </Button>
+    // 这页不走 Layout(没有侧边栏/顶部应用栏), 头栏 + 3D 预览自己撑满整个视口,
+    // 跟 MapPreviewPage 一样。
+    <div className="flex h-svh flex-col overflow-hidden">
+      <div className="shrink-0 border-b bg-card px-6 pt-4 pb-4">
+        <PageHeader
+          backTo={locked ? "/routes" : "/"}
+          backLabel={locked ? "路线管理" : "地图列表"}
+          title={name}
+          description={
+            <span className="flex items-center gap-2">
+              <span className={`inline-block size-2 rounded-full ${connected ? "bg-green-500" : "bg-destructive"}`} />
+              {connected ? "已连接" : "未连接"}
+              {/* 定位失败时地图上所有绝对坐标都不可信, 这时候下发导航点是危险的 */}
+              {poseUnreliable(status?.robot_pose) && (
+                <Badge variant="destructive" className="gap-1">
+                  <TriangleAlert className="size-3" />
+                  定位失败
+                </Badge>
               )}
+              <Badge variant={STATE_VARIANT[state] ?? "secondary"}>{STATE_LABEL[state] ?? state}</Badge>
+              {state === "running" && status && (
+                <span className="font-mono text-xs">
+                  {status.current_index + 1}/{status.waypoints.length}
+                </span>
+              )}
+              <span>
+                · {savedRouteName ? `路线「${savedRouteName}」` : "路线"} {waypoints.length} 点
+              </span>
+            </span>
+          }
+          actions={
+            ready && (
+              <>
+                {/* self_inflation 是 200Hz 的话题, 默认不订阅, 勾上才让后端订阅并
+                    转发——跟"执行中不能编辑"无关, 导航过程中正好用来看避障包络。 */}
+                <label className="flex items-center gap-1.5 text-xs text-foreground">
+                  自身膨胀
+                  <Switch
+                    checked={selfInflationEnabled}
+                    disabled={selfInflationBusy}
+                    onCheckedChange={handleToggleSelfInflation}
+                  />
+                </label>
+  
+                {/* 膨胀地图 (/grid_map/occupancy_inflate) 同理: 默认不订阅, 勾上
+                    才让后端订阅并转发。 */}
+                <label className="flex items-center gap-1.5 text-xs text-foreground">
+                  膨胀地图
+                  <Switch
+                    checked={inflationMapEnabled}
+                    disabled={inflationMapBusy}
+                    onCheckedChange={handleToggleInflationMap}
+                  />
+                </label>
+  
+                <Button
+                  size="sm"
+                  variant="outline"
+                  // 只读查看不受"执行中不能编辑"的限制, 跑着的时候也该能看路线
+                  disabled={busy || (!locked && !editable)}
+                  onClick={openRouteDialog}
+                >
+                  <MapPin />
+                  {locked ? "已设置路线" : "设置路线"}
+                </Button>
 
-              {/* 只在没跑的时候能清: 执行中清掉当前这趟的轨迹, 看到的就是一条从
-                  半路开始的线, 比留着更容易误读。editable 就是"不在 running",
-                  直接复用。 */}
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={!editable || (trail.length === 0 && !optimalTraj)}
-                title={editable ? "清除已画出的实际轨迹" : "导航进行中不能清除轨迹"}
-                onClick={() => {
-                  setTrail([]);
-                  setOptimalTrajHidden(true);
-                }}
-              >
-                <Eraser />
-                清除轨迹
-              </Button>
-            </>
-          )
-        }
-      />
+                {/* 不用打开"设置路线"弹窗、点里面那个"清空"+"提交"两步才能清空
+                    路线 —— 直接清掉已生效的 waypoints。锁定的已保存路线(locked)
+                    和执行中(!editable)都不让清, 跟"设置路线"按钮的可编辑判断
+                    保持一致。 */}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy || locked || !editable || waypoints.length === 0}
+                  title={
+                    locked ? "已保存的路线不能在这里清空"
+                      : !editable ? "导航进行中不能清空路线"
+                      : "清空当前设置的导航点"
+                  }
+                  onClick={() => setWaypoints([])}
+                >
+                  <Trash2 />
+                  清空路线
+                </Button>
+
+                {state === "running" ? (
+                  <Button size="sm" variant="destructive" disabled={busy} onClick={() => run(estop)}>
+                    <OctagonX />
+                    停止导航
+                  </Button>
+                ) : (
+                  <Button size="sm" disabled={busy || waypoints.length === 0} onClick={handleStart}>
+                    <Play />
+                    开始导航
+                  </Button>
+                )}
+  
+                {/* 只在没跑的时候能清: 执行中清掉当前这趟的轨迹, 看到的就是一条从
+                    半路开始的线, 比留着更容易误读。editable 就是"不在 running",
+                    直接复用。 */}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={!editable || (trail.length === 0 && !optimalTraj)}
+                  title={editable ? "清除已画出的实际轨迹" : "导航进行中不能清除轨迹"}
+                  onClick={() => {
+                    setTrail([]);
+                    setOptimalTrajHidden(true);
+                  }}
+                >
+                  <Eraser />
+                  清除轨迹
+                </Button>
+              </>
+            )
+          }
+        />
+      </div>
 
       {(metaError || actionError) && (
-        <div className="mb-3 shrink-0 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
+        <div className="mx-6 mt-3 shrink-0 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
           {metaError ?? actionError}
         </div>
       )}
 
-      {loading && <Skeleton className="min-h-0 flex-1 rounded-xl" />}
+      {loading && <Skeleton className="min-h-0 flex-1 rounded-none" />}
 
       {info && info.status !== "ready" && (
-        <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
-          这份地图还没有预处理完成 (当前状态: {info.status})，回
-          <Link to="/" className="underline">地图列表</Link>触发预处理。
+        <div className="flex min-h-0 flex-1 items-center justify-center px-6">
+          <div className="w-full max-w-lg rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
+            这份地图还没有预处理完成 (当前状态: {info.status})，回
+            <Link to="/" className="underline">地图列表</Link>触发预处理。
+          </div>
         </div>
       )}
 
-      {ready && info?.topview_meta && (
-        <div className="min-h-0 flex-1 overflow-hidden rounded-xl border">
+      {ready && info?.topview_meta && (() => {
+        const { z_min: zMin, z_max: zMax } = info.topview_meta.world_bounds;
+        const effectiveHeightLimit = heightLimit ?? zMax;
+        return (
+        <div className="relative min-h-0 flex-1 overflow-hidden">
           <PointCloudView
             mapName={name}
             meta={info.topview_meta}
+            pointcloudMeta={info.pointcloud_meta}
             waypoints={waypoints}
             status={status}
             trail={trail}
             optimalTraj={optimalTrajHidden ? null : optimalTraj}
             selfInflation={selfInflation}
             inflationMap={inflationMap}
+            heightLimit={effectiveHeightLimit}
             enableFollow
           />
+
+          <div className="absolute bottom-3 left-3 flex w-64 items-center gap-3 rounded-md border border-white/20 bg-black/40 px-3 py-2 text-white/80 backdrop-blur">
+            <Label htmlFor="height-limit" className="shrink-0 text-xs">
+              高度限制
+            </Label>
+            <Slider
+              id="height-limit"
+              className="flex-1"
+              min={zMin}
+              max={zMax}
+              step={HEIGHT_LIMIT_STEP}
+              value={[effectiveHeightLimit]}
+              onValueChange={([v]) => setHeightLimit(v)}
+            />
+            <span className="w-12 shrink-0 text-right font-mono text-xs">{effectiveHeightLimit.toFixed(2)}m</span>
+          </div>
         </div>
-      )}
+        );
+      })()}
 
       {ready && info?.topview_meta && (
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-          <DialogContent className="sm:max-w-[840px]">
+          <DialogContent className="flex h-[85vh] w-[92vw] flex-col sm:max-w-[1400px]">
             <DialogHeader>
               <DialogTitle>{locked ? `已设置路线${savedRouteName ? `：${savedRouteName}` : ""}` : "设置路线"}</DialogTitle>
               <DialogDescription>
@@ -304,65 +367,29 @@ export default function NavigatePage() {
               </DialogDescription>
             </DialogHeader>
 
-            <div className="flex items-center justify-between text-sm text-muted-foreground">
-              <span>
-                {locked ? "共" : "已选"} <strong className="text-foreground">{draft.length}</strong> 个导航点
-                {locked && "（数字为途经顺序）"}
-              </span>
-              <div className="flex items-center gap-4">
-                <label className="flex items-center gap-1.5 text-xs">
-                  可站立区
-                  <Switch checked={draftShowStandable} onCheckedChange={setDraftShowStandable} />
-                </label>
-                <label className="flex items-center gap-1.5 text-xs">
-                  安全边距
-                  <Switch checked={draftShowSafety} onCheckedChange={setDraftShowSafety} />
-                </label>
-              </div>
+            <p className="shrink-0 text-sm text-muted-foreground">
+              {locked ? "共" : "已选"} <strong className="text-foreground">{draft.length}</strong> 个导航点
+              {locked && "（数字为途经顺序）"}
+            </p>
+
+            <div ref={setTopViewNode} className="min-h-0 flex-1 overflow-hidden rounded-lg border">
+              {info.topview_meta.topview2d ? (
+                <TopView
+                  mapName={name}
+                  meta={info.topview_meta.topview2d}
+                  waypoints={draft}
+                  onChangeWaypoints={setDraft}
+                  editable={!locked}
+                  status={status}
+                  maxWidth={topViewSize.width}
+                  maxHeight={topViewSize.height}
+                />
+              ) : (
+                <div className="flex size-full items-center justify-center text-sm text-muted-foreground">
+                  这份地图没有 2D 栅格图 (2d_map/map_2d.pgm)，无法在这里点选设置路线。
+                </div>
+              )}
             </div>
-
-            <TopView
-              mapName={name}
-              meta={info.topview_meta}
-              waypoints={draft}
-              onChangeWaypoints={setDraft}
-              editable={!locked}
-              status={status}
-              showSafety={draftShowSafety}
-              showStandable={draftShowStandable}
-                maxWidth={DIALOG_TOPVIEW_WIDTH}
-              maxHeight={DIALOG_TOPVIEW_HEIGHT}
-            />
-
-            {draft.length > 0 && (
-              <div className="max-h-28 space-y-1 overflow-y-auto rounded-lg border p-2">
-                <p className="px-1 text-[11px] text-muted-foreground">
-                  抬高 z：机器狗爬不上某级台阶时把那个点的 z 往上调
-                  （SCAN-Planner 官方建议的做法）。留 0 就用地面高度自动算。
-                </p>
-                {draft.map((wp, i) => (
-                  <div key={i} className="flex items-center gap-2 px-1 text-xs">
-                    <span className="w-5 shrink-0 text-center font-mono text-muted-foreground">{i + 1}</span>
-                    <span className="w-28 shrink-0 font-mono text-muted-foreground">
-                      {wp.x.toFixed(2)}, {wp.y.toFixed(2)}
-                    </span>
-                    <span className="shrink-0 text-muted-foreground">抬高</span>
-                    <Input
-                      type="number"
-                      step="0.05"
-                      disabled={locked}
-                      className="h-7 w-20 font-mono text-xs"
-                      value={wp.z_offset ?? 0}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        setDraft(draft.map((w, k) => (k === i ? { ...w, z_offset: Number.isFinite(v) ? v : 0 } : w)));
-                      }}
-                    />
-                    <span className="shrink-0 text-muted-foreground">m</span>
-                  </div>
-                ))}
-              </div>
-            )}
 
             <DialogFooter>
               {locked ? (

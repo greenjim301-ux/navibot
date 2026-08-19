@@ -69,17 +69,22 @@ export default function RoutePreviewPage() {
               俯视图（数字为途经点顺序）
             </h2>
             <div ref={setTopViewNode} className="min-h-0 flex-1 overflow-hidden rounded-xl border">
-              <TopView
-                mapName={route.map_name}
-                meta={info.topview_meta}
-                waypoints={route.waypoints}
-                onChangeWaypoints={() => {}}
-                editable={false}
-                status={null}
-                showSafety={false}
-                maxWidth={topViewSize.width}
-                maxHeight={topViewSize.height}
-              />
+              {info.topview_meta.topview2d ? (
+                <TopView
+                  mapName={route.map_name}
+                  meta={info.topview_meta.topview2d}
+                  waypoints={route.waypoints}
+                  onChangeWaypoints={() => {}}
+                  editable={false}
+                  status={null}
+                  maxWidth={topViewSize.width}
+                  maxHeight={topViewSize.height}
+                />
+              ) : (
+                <div className="flex size-full items-center justify-center text-sm text-muted-foreground">
+                  这份地图没有 2D 栅格图 (2d_map/map_2d.pgm)，无法显示俯视图。
+                </div>
+              )}
             </div>
           </section>
 

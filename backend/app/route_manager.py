@@ -150,8 +150,10 @@ class RouteManager:
         for i, (wp, a) in enumerate(zip(waypoints, alts), 1):
             if a.ground is not None and a.delta is not None:
                 how = f"地面{a.ground:+.3f} + Δ{a.delta:+.3f}" + (f" + 微调{wp.z_offset:+.3f}" if wp.z_offset else "")
-            else:
+            elif pose is not None:
                 how = "无高程数据, 退回当前 odom 高度"
+            else:
+                how = "无高程数据, 也没收到过位姿, 按 0 兜底"
             dist = (math.dist((pose.x, pose.y, pose.z), (wp.x, wp.y, a.z)) if pose else float("nan"))
             # planNextWaypoint() 的重合点判据(不是到达判据): 只有跟机器狗当前位置
             # 几乎重合(<5cm)才会被跳过, 标出来
@@ -167,8 +169,11 @@ class RouteManager:
         机器狗不在认证可站立区上时才退回建图时量的 delta_sensor_m。
 
         地图完全没有高程数据(旧版资产/没有建图轨迹)时, 退回机器狗当前的 odom z
-        —— 单层平面图上这恰好是对的, 因为目标高度就等于它现在所处的高度。两者
-        都没有就报错, 不猜。
+        —— 单层平面图上这恰好是对的, 因为目标高度就等于它现在所处的高度。
+        连位姿都还没收到(刚打开页面/还没连上狗)时, 没有任何现场数据可退, 按 0
+        兜底(odom 系原点高度, 对单层平面图场景是合理默认) —— 只是让"设置路线"
+        不必因为还没收到过一次位姿就直接报错, 不是说这个 0 一定精确; 等真的收到
+        位姿后再提交, 就会退回上面那条更准的 fallback。
         """
         delta = self._odom_delta(map_name, pose)
         mapped = path_planner.mapping_delta(map_name) if map_name else None
@@ -183,16 +188,18 @@ class RouteManager:
                 delta, mapped, delta - mapped,
             )
 
+        if pose is None:
+            logger.warning("还没收到机器狗位姿, 高度按 0 兜底(+ z_offset)下发")
+
         out: List[_Altitude] = []
-        for i, wp in enumerate(waypoints, 1):
+        for wp in waypoints:
             ground = path_planner.ground_elevation(map_name, wp.x, wp.y) if map_name else None
             if ground is not None and delta is not None:
                 out.append(_Altitude(z=ground + delta + wp.z_offset, ground=ground, delta=delta))
                 continue
             if pose is None:
-                raise ValueError(
-                    f"第 {i} 个途经点无法确定高度: 地图没有高程数据, 也还没收到机器狗位姿"
-                )
+                out.append(_Altitude(z=wp.z_offset))
+                continue
             out.append(_Altitude(z=pose.z + wp.z_offset))
         return out
 

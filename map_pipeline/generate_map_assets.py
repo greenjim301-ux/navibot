@@ -2,19 +2,26 @@
 """
 离线地图资产生成脚本。
 
-输入: mapdata/<room>/ 下的
-  dense_cloud_map.pcd     稠密重建点云
+输入: <storage_path>/ 下的
+  3d_map/dense_cloud_map.pcd   稠密重建点云
+  2d_map/map_2d.pgm + .yaml    map_server 格式的 2D 占据栅格图 (没有就跳过,
+                                不是每份地图都有)
 输出 (web_assets/map/<room>/ 下):
-  topview_meta.json       地图基础几何信息 (world_bounds, 含 z_min/z_max)。文件名是
-                           历史遗留(以前这里还存俯视图的像素网格信息), 但后端仍然靠
-                           它是否存在判定这份地图预处理完没完 (MapStatus.READY), 不能
-                           改名/删掉, 否则地图列表会显示"未处理"。
+  topview_meta.json       地图基础几何信息: world_bounds(含 z_min/z_max, 从点云
+                           算, 3D 预览用) + topview2d(2D 栅格图的分辨率/像素尺寸/
+                           世界坐标范围, 设置路线用, 没有 2D 源图时这个字段不写)。
+                           文件名是历史遗留(以前这里还存俯视图的像素网格信息),
+                           但后端仍然靠它是否存在判定这份地图预处理完没完
+                           (MapStatus.READY), 不能改名/删掉, 否则地图列表会显示
+                           "未处理"。
+  topview.png              2D 占据栅格图转成的展示用 PNG(有 2D 源图才有这个文件)
   pointcloud.bin           降采样点云 (PCW1), 供前端 3D 预览
   pointcloud_meta.json
 
-不再生成俯视图 (topview.png 等)、逐格高程面 (elevation.npy) 和占据栅格
-(occupancy.npy) —— 这些是给 2D 俯视图编辑器和寻路用的, 现在只留 3D 点云预览
-这一条路径, 那三样都不需要了。等以后重做导航/寻路时再按新方案生成对应资产。
+不再生成逐格高程面 (elevation.npy) 和占据栅格 (occupancy.npy) —— 这些是给"整图
+假设单一地面高度"的寻路模型服务的, 寻路还没重做, 这两样先不生成。topview.png
+(2D 俯视图) 现在重新生成了, 但只是给"设置路线"页面点导航点用的展示图, 不参与
+寻路判断。
 
 不做去噪, 也不检测地面/天花板高度 —— 两者都是给"整图假设单一地面高度"这个
 (对带楼梯的图不成立的)简化模型服务的, 既然导航/寻路要重做, 这里不再猜地面在
@@ -29,12 +36,29 @@ import argparse
 import json
 import struct
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import open3d as o3d
+from PIL import Image
+
+# Pillow 默认给大图片加了个"解压炸弹"保护(超过约 1.8 亿像素就拒绝打开), 防的是
+# 处理不可信的上传文件。这里的 2D 栅格图是离线管线自己从本机 SLAM 输出读的
+# 可信文件, "big" 这种大范围室外图轻松超过这个像素数(444M 像素), 关掉这个
+# 检查(仅对这条离线管线, 不影响 backend 运行时——那边根本不用 Pillow)。
+Image.MAX_IMAGE_PIXELS = None
+
+# "设置路线" 页面(TopView)展示 2D 占据栅格图用的长边像素上限。定这个值主要是
+# 跨浏览器安全: canvas/image 元素的最大尺寸因浏览器而异, 移动端 Safari 尤其
+# 保守, 4096 是公认哪个主流浏览器都不会画崩的上限。精度上也够用: 这张图只是
+# "看全貌点导航点", 不需要看清每个栅格, 4096px 长边对应的有效分辨率对室内外
+# 地图都远超"看清楚点在哪"的需要, 换来的是文件体积可控(big 地图原始 pgm
+# 424MB, 不缩放直接怼给浏览器既有内存/传输问题, 35332px 的原始宽度本身也已经
+# 超出部分浏览器的 canvas 尺寸上限了)。
+TOPVIEW_LONG_EDGE_CAP = 4096
 
 # 大地图分片参数。只有跨度超过 TILE_EXTENT_THRESHOLD_M 的地图才分片 —— 小地图
 # (室内房间尺度)整图一份预览的精度就够用, 强行分片反而不划算: 室内点云密度
@@ -94,10 +118,88 @@ class _BooleanOptionalAction(argparse.Action):
         return " | ".join(self.option_strings)
 
 
+def _log_step_done(t0: float) -> None:
+    """跟 main() 里 "[N/5] ..." 那一行配对用: 每步结束时打一行用时, 方便事后从
+    日志里看出是哪一步(读点云/降采样/导出/分片...)占了大头, 不用去猜。"""
+    print(f"      用时 {time.perf_counter() - t0:.1f}s")
+
+
 def robust_xy_bounds(points: np.ndarray, pad: float = 0.3, lo=0.5, hi=99.5):
     x_min, x_max = np.percentile(points[:, 0], [lo, hi])
     y_min, y_max = np.percentile(points[:, 1], [lo, hi])
     return float(x_min - pad), float(x_max + pad), float(y_min - pad), float(y_max + pad)
+
+
+def _parse_map2d_yaml(path: Path) -> dict:
+    """手写的极简解析, 只认 ROS map_saver 输出的这种 flat key: value 格式(外加
+    一个 [a, b, c] 形式的 origin), 不引入 pyyaml 依赖 —— map_pipeline/
+    requirements.txt 没有它, 部署机器上不一定装了。"""
+    result = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key == "origin":
+            parts = value.strip("[]").split(",")
+            result["origin_x"] = float(parts[0])
+            result["origin_y"] = float(parts[1])
+        elif key == "resolution":
+            result["resolution"] = float(value)
+    return result
+
+
+def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path, long_edge_cap: int) -> dict:
+    """把 map_server 格式的 2D 占据栅格图 (pgm+yaml) 转成前端"设置路线"页面
+    展示用的 topview.png。
+
+    只做格式转换(pgm -> PNG, 占据栅格图大片同色区域, 白得的无损压缩率很可观)
+    + 必要时的整体降采样(长边超过 long_edge_cap 才降, 没超直接原样转, 不做
+    无谓的精度损失 —— 跟 3D 预览那边"点数没超阈值就不 voxel_down_sample"是
+    同一个思路)。不做 free/occupied/unknown 的阈值解读或重新配色: negate=0
+    时 pgm 原始灰度本来就是"黑占据/白空闲/灰未知", 直接展示即可, 这里只是
+    看图选点, 不需要真的按 occupied_thresh/free_thresh 二值化。
+
+    pgm 的 (row, col) 像素网格跟 world_bounds 的对应关系是 ROS map_server 的
+    约定: yaml 的 origin 是图像左下角像素的世界坐标, 而 pgm 文件本身是按常规
+    图像顺序(第一行在最上面)存的 —— 两者换算下来正好是 "pgm 第 0 行(图像最
+    上面) = world y_max, 第 0 列(图像最左边) = world x_min", 跟 TopView.tsx
+    的 pixelToWorld/worldToPixel(行号从上往下增大对应 y 减小)约定完全一致,
+    不需要做任何翻转。假定 origin 的 yaw 分量为 0(repo 里见过的 map_saver
+    输出都是 0, ROS 生态也基本不用非零值, 犯不着为没见过的情况先做旋转变换)。
+
+    返回写进 topview_meta.json 的 {resolution_m_per_px, width, height,
+    world_bounds}(width/height 是降采样后的实际输出尺寸, world_bounds 是物理
+    范围, 不随降采样变化)。
+    """
+    yaml_info = _parse_map2d_yaml(yaml_path)
+    resolution = yaml_info["resolution"]
+    origin_x, origin_y = yaml_info["origin_x"], yaml_info["origin_y"]
+
+    img = Image.open(pgm_path)
+    orig_w, orig_h = img.size
+
+    long_edge = max(orig_w, orig_h)
+    if long_edge > long_edge_cap:
+        scale = long_edge_cap / long_edge
+        new_w, new_h = max(1, round(orig_w * scale)), max(1, round(orig_h * scale))
+        img = img.resize((new_w, new_h), Image.Resampling.BOX)
+    else:
+        new_w, new_h = orig_w, orig_h
+
+    img.save(out_path)
+
+    effective_resolution = resolution * (orig_w / new_w)
+    return {
+        "resolution_m_per_px": effective_resolution,
+        "width": new_w,
+        "height": new_h,
+        "world_bounds": {
+            "x_min": origin_x, "x_max": origin_x + orig_w * resolution,
+            "y_min": origin_y, "y_max": origin_y + orig_h * resolution,
+        },
+    }
 
 
 def height_to_color(z: np.ndarray, vmin: float | None = None, vmax: float | None = None) -> np.ndarray:
@@ -279,7 +381,10 @@ def main():
     out_dir = repo_root / args.outdir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/4] 读取点云: {in_path}")
+    t_start = time.perf_counter()
+
+    print(f"[1/5] 读取点云: {in_path}")
+    t_step = time.perf_counter()
     pcd_raw = o3d.io.read_point_cloud(str(in_path))
     n_raw = len(pcd_raw.points)
     print(f"      点数={n_raw}")
@@ -295,8 +400,30 @@ def main():
     will_tile = max_extent_xy > TILE_EXTENT_THRESHOLD_M
     print(f"      x=[{x_min:.2f},{x_max:.2f}] y=[{y_min:.2f},{y_max:.2f}] z=[{z_min:.2f},{z_max:.2f}]"
           f"  跨度={max_extent_xy:.1f}m")
+    _log_step_done(t_step)
 
-    print("[2/4] 点云降采样(整图预览用)...")
+    print("[2/5] 生成 2D 俯视栅格图 (设置路线用)...")
+    t_step = time.perf_counter()
+    # 跟 3d_map 同级的 2d_map/ 目录, 是 map_registry.py 导入地图时约定的存储
+    # 布局(见 backend/app/config.py 的 MAP_SOURCE_SUBDIR 注释), 这里直接从
+    # --input(3d_map/dense_cloud_map.pcd)反推兄弟目录, 不用额外加命令行参数。
+    # 不是每份地图都有这个源图(比如只导了点云没导 2D 栅格图的旧地图), 没有
+    # 就跳过, topview_meta.json 里不写 topview2d 字段, 前端得处理"没有"这种
+    # 情况, 不能假设它总存在。
+    map2d_dir = in_path.parent.parent / "2d_map"
+    pgm_path, yaml_path = map2d_dir / "map_2d.pgm", map2d_dir / "map_2d.yaml"
+    topview2d = None
+    if pgm_path.is_file() and yaml_path.is_file():
+        topview2d = export_topview_png(pgm_path, yaml_path, out_dir / "topview.png", TOPVIEW_LONG_EDGE_CAP)
+        print(f"      {pgm_path} -> topview.png: {topview2d['width']}x{topview2d['height']}px, "
+              f"分辨率 {topview2d['resolution_m_per_px']:.4f}m/px")
+    else:
+        print(f"      {pgm_path} 不存在, 跳过(这份地图没有 2D 栅格图源, "
+              f"前端\"设置路线\"功能对这份地图不可用)")
+    _log_step_done(t_step)
+
+    print("[3/5] 点云降采样(整图预览用)...")
+    t_step = time.perf_counter()
     # 分片会不会触发决定整图预览要降到多细: 会分片的地图, 整图预览只是给"看
     # 全貌/导航去哪个区域"用的骨架层, 真正的细节交给分片(见 TILED_OVERVIEW_
     # TARGET_POINTS 的说明), 犯不着跟没有分片兜底的小地图一样按
@@ -314,8 +441,10 @@ def main():
         print(f"      点数 {n_raw} > {overview_target}, 按固定体素大小降采样到 {overview_target}")
         pcd_overview, voxel_size = voxel_downsample_to_target(pcd_raw, overview_target)
         print(f"      降采样后点数={len(pcd_overview.points)}  体素边长={voxel_size:.4f}m")
+    _log_step_done(t_step)
 
-    print("[3/4] 导出整图预览点云...")
+    print("[4/5] 导出整图预览点云...")
+    t_step = time.perf_counter()
     meta = {
         "world_bounds": {
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
@@ -323,6 +452,8 @@ def main():
         },
         "source_file": args.input,
     }
+    if topview2d is not None:
+        meta["topview2d"] = topview2d
     (out_dir / "topview_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
 
     # 高度限制现在完全按点云自身的 z 值判断(前端界面把滑杆范围钉在 [z_min, z_max]
@@ -336,8 +467,10 @@ def main():
     n_out, pts_out = export_pointcloud_bin(pcd_overview, out_dir / "pointcloud.bin",
                                             z_cutoff=z_cutoff, z_range=z_range)
     print(f"      导出点数: {n_out}")
+    _log_step_done(t_step)
 
-    print("[4/4] 大地图分片(可选)...")
+    print("[5/5] 大地图分片(可选)...")
+    t_step = time.perf_counter()
     tiles_meta = None
     if will_tile:
         print(f"      地图跨度 {max_extent_xy:.1f}m > {TILE_EXTENT_THRESHOLD_M:.0f}m, 生成分片"
@@ -382,8 +515,9 @@ def main():
         "tiles": tiles_meta,
     }
     (out_dir / "pointcloud_meta.json").write_text(json.dumps(pc_meta, indent=2, ensure_ascii=False))
+    _log_step_done(t_step)
 
-    print("完成。输出目录:", out_dir)
+    print(f"完成。输出目录: {out_dir}  总耗时 {time.perf_counter() - t_start:.1f}s")
 
 
 if __name__ == "__main__":

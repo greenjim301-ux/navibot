@@ -92,6 +92,36 @@ function parsePCW1(buf: ArrayBuffer) {
   return { count, positions, colors };
 }
 
+// 途经点编号标记: three.js 没有现成的"画文字"图元, 把数字画到一张离屏 canvas
+// 上当贴图, 做成 Sprite(始终朝向摄像机, 不用像 Mesh 文字那样操心朝向)。途经点
+// 数量很小(几个到几十个, 不是点云那种量级), 每次 waypoints 变化都整组重建
+// 这些贴图开销可以忽略, 不需要缓存/复用。
+// sizeAttenuation 用默认的 true(世界坐标系大小, 跟随缩放跟途经点小球一致),
+// 不用 3D 点云那套"固定屏幕像素大小"——数字标记只需要跟它标注的小球保持同一个
+// 观感比例, 没有点云那种"缩太小看不见/缩太大糊成一团"的两难。
+function createWaypointLabelSprite(text: string): THREE.Sprite {
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "rgba(17, 24, 39, 0.85)";
+  ctx.beginPath();
+  ctx.arc(size / 2, size / 2, size / 2 - 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 30px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, size / 2, size / 2 + 1);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true }));
+  sprite.scale.set(0.35, 0.35, 1);
+  return sprite;
+}
+
 export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function PointCloudView({
   mapName, meta, pointcloudMeta = null, waypoints = [], status = null, trail = null,
   optimalTraj = null, selfInflation = null, inflationMap = null, enableFollow = false,
@@ -619,10 +649,23 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         new THREE.SphereGeometry(0.08, 16, 16),
         new THREE.MeshBasicMaterial({ color }),
       );
-      // 高程还没查回来 / 该点附近没有可信高程时退回点云最低点兜底
-      const ground = waypointZ[idx] ?? meta.world_bounds.z_min;
+      // 地图没有高程数据(现在都没有, 见 generate_map_assets.py 的说明)时
+      // waypointZ[idx] 恒为 null —— 这时退回机器狗当前位姿的 z, 跟后端
+      // route_manager._resolve_altitudes 实际下发的高度算法(没有高程数据就用
+      // 机器狗当前 odom z)保持一致, 3D 预览看到的位置才跟真实下发的位置对得上,
+      // 不会出现"画在天花板/地板里"这种跟实际下发脱节的情况。机器狗位姿也还没
+      // 收到时(理论上的最后兜底)退回 0——同一套 fallback, 后端此时也是按 0
+      // 兜底下发(见 route_manager._resolve_altitudes), 3D 预览跟实际下发的
+      // 位置还是对得上, 不代表真实地面。
+      const ground = waypointZ[idx] ?? status?.robot_pose?.z ?? 0;
       mesh.position.set(wp.x, wp.y, ground + 0.1);
       group.add(mesh);
+
+      // 编号浮在小球正上方(+Z): 默认视角是俯视, 不管水平方向怎么转, "上方"
+      // 都读得出来是"上方", 不会像水平偏移那样随相机角度改变相对位置。
+      const label = createWaypointLabelSprite(String(idx + 1));
+      label.position.set(wp.x, wp.y, ground + 0.1 + 0.3);
+      group.add(label);
     });
   }, [waypoints, waypointZ, status, meta.world_bounds.z_min]);
 

@@ -3,21 +3,17 @@ import { Stage, Layer, Image as KonvaImage, Circle, Line, Text, RegularPolygon, 
 import useImage from "use-image";
 import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import type { NavStatus, TopviewMeta, Waypoint } from "../types";
+import type { NavStatus, Topview2D, Waypoint } from "../types";
 import { mapAssetUrl } from "../api";
 import { pixelToWorld, worldToPixel } from "../types";
 
 interface Props {
   mapName: string;
-  meta: TopviewMeta;
+  meta: Topview2D;
   waypoints: Waypoint[];
   onChangeWaypoints: (wps: Waypoint[]) => void;
   editable: boolean;
   status: NavStatus | null;
-  showSafety: boolean;
-  /** 叠加"可站立区"提示层: 绿色的地方才有可信的落脚高度, 导航点应该放在这里面。
-   *  离开这一层放点, 后端只能就近取高程(1m 内), 再远就无法确定 z 而报错。 */
-  showStandable?: boolean;
   maxWidth?: number;
   /** 画布可视高度上限, 内容超出的部分靠拖拽/缩放查看, 不传则不限制高度 */
   maxHeight?: number;
@@ -25,17 +21,40 @@ interface Props {
 
 const DEFAULT_MAX_STAGE_WIDTH = 900;
 const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 6;
+// 大地图(比如 big, 4096px 封顶降采样后 0.86m/px)一条几米宽的走廊本来就没剩
+// 几个原始像素, 6 倍缩放很快就顶到头, 想精确点导航点会觉得"最大也不够大"。
+// 30 倍能把单个栅格像素放大到屏幕上清清楚楚, 缩放本身不再是精度瓶颈(真正的
+// 精度上限是 topview.png 的降采样分辨率, 这个由生成脚本的 TOPVIEW_LONG_EDGE_CAP
+// 决定, 不是画布缩放能突破的)。
+const MAX_ZOOM = 30;
 // 默认(以及点"重置"后)的缩放。1 = 内容按 maxWidth 正好铺满画布宽度
 const DEFAULT_ZOOM = 0.7;
 const ZOOM_STEP = 1.2;
 const ROTATE_STEP_DEG = 15;
 
+// 十字准星/途经点圆点/机器人三角/悬停预览这些叠加图形, 用意是"标出位置", 不是
+// "跟着地图一起缩放的实体"——它们的坐标点乘了 baseScale 后又会被 Stage 的
+// scale(缩放/滚轮)再乘一遍, 不做任何补偿的话缩放越大这些图形在屏幕上就越大
+// (600% 缩放下 9px 的准星臂长看起来有 54px), 反而挡住底图、看不清真正要点的
+// 位置。下面这些常量是"希望在屏幕上呈现的固定像素大小", 用的地方都要除以当前
+// zoom 抵消 Stage 缩放, 让这些标记不管缩放多少都保持同一个视觉大小。
+const ORIGIN_CROSS_ARM_PX = 9;
+const ORIGIN_CROSS_STROKE_PX = 1.5;
+const WAYPOINT_RADIUS_PX = 7;
+const WAYPOINT_STROKE_PX = 1.5;
+const WAYPOINT_LABEL_OFFSET_PX = { x: 9, y: -8 };
+const WAYPOINT_LABEL_FONT_PX = 13;
+const ROUTE_LINE_STROKE_PX = 2;
+const ROUTE_LINE_DASH_PX: [number, number] = [6, 4];
+const ROBOT_RADIUS_PX = 10;
+const ROBOT_STROKE_PX = 1.5;
+const HOVER_RADIUS_PX = 4;
+
 /**
  * 把展示画布的世界坐标范围扩展成以原点 (0,0) 对称的区间, 这样原点总是落在
  * 画布正中间, 分辨率跟原始俯视图保持一致, 只是画布边界变了。
  */
-function centerOnOrigin(meta: TopviewMeta): TopviewMeta {
+function centerOnOrigin(meta: Topview2D): Topview2D {
   const { x_min, x_max, y_min, y_max } = meta.world_bounds;
   const halfX = Math.max(Math.abs(x_min), Math.abs(x_max));
   const halfY = Math.max(Math.abs(y_min), Math.abs(y_max));
@@ -49,13 +68,10 @@ function centerOnOrigin(meta: TopviewMeta): TopviewMeta {
 }
 
 export function TopView({
-  mapName, meta, waypoints, onChangeWaypoints, editable, status, showSafety, showStandable = false,
+  mapName, meta, waypoints, onChangeWaypoints, editable, status,
   maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight,
 }: Props) {
   const [topviewImg] = useImage(mapAssetUrl(mapName, "topview.png"), "anonymous");
-  const [safetyImg] = useImage(mapAssetUrl(mapName, "topview_safety.png"), "anonymous");
-  // 旧版预处理产物没有这张图, useImage 取不到就是 undefined, 不影响其它图层
-  const [standableImg] = useImage(mapAssetUrl(mapName, "topview_standable.png"), "anonymous");
   const stageRef = useRef<Konva.Stage>(null);
   const contentGroupRef = useRef<Konva.Group>(null);
 
@@ -211,24 +227,6 @@ export function TopView({
                 height={meta.height * baseScale}
               />
             )}
-            {showStandable && standableImg && (
-              <KonvaImage
-                image={standableImg}
-                x={imgOffset.col * baseScale}
-                y={imgOffset.row * baseScale}
-                width={meta.width * baseScale}
-                height={meta.height * baseScale}
-              />
-            )}
-            {showSafety && safetyImg && (
-              <KonvaImage
-                image={safetyImg}
-                x={imgOffset.col * baseScale}
-                y={imgOffset.row * baseScale}
-                width={meta.width * baseScale}
-                height={meta.height * baseScale}
-              />
-            )}
           </Group>
         </Layer>
 
@@ -241,26 +239,31 @@ export function TopView({
           >
             <Line
               points={[
-                originPx.col * baseScale - 9, originPx.row * baseScale,
-                originPx.col * baseScale + 9, originPx.row * baseScale,
+                originPx.col * baseScale - ORIGIN_CROSS_ARM_PX / zoom, originPx.row * baseScale,
+                originPx.col * baseScale + ORIGIN_CROSS_ARM_PX / zoom, originPx.row * baseScale,
               ]}
               stroke="#9333ea"
-              strokeWidth={1.5}
+              strokeWidth={ORIGIN_CROSS_STROKE_PX / zoom}
               listening={false}
             />
             <Line
               points={[
-                originPx.col * baseScale, originPx.row * baseScale - 9,
-                originPx.col * baseScale, originPx.row * baseScale + 9,
+                originPx.col * baseScale, originPx.row * baseScale - ORIGIN_CROSS_ARM_PX / zoom,
+                originPx.col * baseScale, originPx.row * baseScale + ORIGIN_CROSS_ARM_PX / zoom,
               ]}
               stroke="#9333ea"
-              strokeWidth={1.5}
+              strokeWidth={ORIGIN_CROSS_STROKE_PX / zoom}
               listening={false}
             />
 
             {/* 途经点之间的直连虚线只表达顺序, 不代表真会走直线 */}
             {linePoints.length >= 4 && (
-              <Line points={linePoints} stroke="#2376e5" strokeWidth={2} dash={[6, 4]} />
+              <Line
+                points={linePoints}
+                stroke="#2376e5"
+                strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
+                dash={ROUTE_LINE_DASH_PX.map((d) => d / zoom)}
+              />
             )}
             {waypoints.map((wp, idx) => {
               const p = worldToPixel(centeredMeta, wp.x, wp.y);
@@ -274,10 +277,10 @@ export function TopView({
                   <Circle
                     x={px}
                     y={py}
-                    radius={7}
+                    radius={WAYPOINT_RADIUS_PX / zoom}
                     fill={color}
                     stroke="#fff"
-                    strokeWidth={1.5}
+                    strokeWidth={WAYPOINT_STROKE_PX / zoom}
                     // 左键不拦截, 让它冒泡到 Stage 去"加点" —— 这样在已有的点上再点
                     // 一次就能加一个同位置的点, 巡逻路线才画得出"绕一圈回到起点"。
                     // 删点改成右键。
@@ -288,7 +291,14 @@ export function TopView({
                     }}
                   />
                   {/* 反向抵消父级 Group 的旋转, 让编号文字始终正立可读 */}
-                  <Text x={px + 9} y={py - 8} text={String(idx + 1)} fontSize={13} fill="#111" rotation={-rotation} />
+                  <Text
+                    x={px + WAYPOINT_LABEL_OFFSET_PX.x / zoom}
+                    y={py + WAYPOINT_LABEL_OFFSET_PX.y / zoom}
+                    text={String(idx + 1)}
+                    fontSize={WAYPOINT_LABEL_FONT_PX / zoom}
+                    fill="#111"
+                    rotation={-rotation}
+                  />
                 </Group>
               );
             })}
@@ -298,16 +308,16 @@ export function TopView({
                 x={robotPx.col * baseScale}
                 y={robotPx.row * baseScale}
                 sides={3}
-                radius={10}
+                radius={ROBOT_RADIUS_PX / zoom}
                 rotation={(status!.robot_pose!.yaw * 180) / Math.PI + 90}
                 fill="#d74747"
                 stroke="#fff"
-                strokeWidth={1.5}
+                strokeWidth={ROBOT_STROKE_PX / zoom}
               />
             )}
 
             {editable && hover && (
-              <Circle x={hover.x} y={hover.y} radius={4} fill="rgba(37,99,235,0.4)" listening={false} />
+              <Circle x={hover.x} y={hover.y} radius={HOVER_RADIUS_PX / zoom} fill="rgba(37,99,235,0.4)" listening={false} />
             )}
           </Group>
         </Layer>

@@ -114,6 +114,11 @@ MAPS_DB_FILE = os.environ.get("NAVIBOT_MAPS_DB_FILE", os.path.join(REPO_ROOT, "d
 #   <storage_path>/3d_map/dense_cloud_map.pcd
 #   <storage_path>/3d_map/keyframe_info_3d.txt
 # 例如存储路径填 /home/cat/map-1, 实际文件在 /home/cat/map-1/3d_map/ 下。
+#
+# 同级的 <storage_path>/2d_map/map_2d.pgm(+.yaml) 是可选的 (map_pipeline/
+# generate_map_assets.py 自己按这个约定去找, 找不到就跳过 2D 俯视图生成,
+# 这里不强制校验存在) —— 只有装了 2D 栅格图源的地图才能在"设置路线"页面
+# 点选导航点, 只导入点云的旧地图仍然能正常做 3D 预览。
 MAP_SOURCE_SUBDIR = "3d_map"
 MAP_SOURCE_FILENAME = "dense_cloud_map.pcd"
 

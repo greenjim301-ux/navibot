@@ -92,16 +92,28 @@ export interface MapInfo {
   updated_at: number;
 }
 
-export interface TopviewMeta {
+/** "设置路线"页面(TopView)展示用的 2D 占据栅格图, 来自地图目录
+ *  2d_map/map_2d.pgm(+.yaml), 由 generate_map_assets.py 转成 topview.png。
+ *  width/height 是(必要时降采样后的)实际图片像素尺寸, world_bounds 是这张图
+ *  覆盖的物理范围 —— 跟 TopviewMeta.world_bounds(点云算出来的、3D 预览用)是
+ *  两套独立的边界, 不能混用: 前者是 2D 栅格图的精确范围, 后者是点云的鲁棒
+ *  (带异常值裁剪的)包围盒。 */
+export interface Topview2D {
   resolution_m_per_px: number;
   width: number;
   height: number;
+  world_bounds: { x_min: number; x_max: number; y_min: number; y_max: number };
+}
+
+export interface TopviewMeta {
   world_bounds: {
     x_min: number; x_max: number; y_min: number; y_max: number;
     z_min: number; z_max: number;
   };
-  hazard_z_range: [number, number];
   source_file: string;
+  /** 没有 2D 栅格图源(旧地图 / 只导了点云没导 2d_map)的地图这里是
+   *  null/undefined, 前端得处理"没有"的情况, 不能假设总存在。 */
+  topview2d?: Topview2D | null;
   /** 只有带建图轨迹、能提取出高程面的地图才有 */
   elevation?: {
     resolution_m_per_cell: number;
@@ -139,8 +151,9 @@ export interface PointcloudMeta {
   tiles?: TilesMeta | null;
 }
 
-// 与 map_pipeline/generate_map_assets.py 里的 pixel_to_world / world_to_pixel 保持一致
-export function worldToPixel(meta: TopviewMeta, x: number, y: number) {
+// 与 map_pipeline/generate_map_assets.py 里 export_topview_png 的 pgm 像素<->世界
+// 坐标约定保持一致 (pgm 第 0 行/列 = world y_max/x_min, 不用翻转)
+export function worldToPixel(meta: Topview2D, x: number, y: number) {
   const { x_min, y_max } = meta.world_bounds;
   return {
     col: (x - x_min) / meta.resolution_m_per_px,
@@ -148,7 +161,7 @@ export function worldToPixel(meta: TopviewMeta, x: number, y: number) {
   };
 }
 
-export function pixelToWorld(meta: TopviewMeta, col: number, row: number) {
+export function pixelToWorld(meta: Topview2D, col: number, row: number) {
   const { x_min, y_max } = meta.world_bounds;
   return {
     x: x_min + col * meta.resolution_m_per_px,

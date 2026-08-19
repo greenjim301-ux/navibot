@@ -159,18 +159,22 @@ export default function RouteCreatePage() {
                   俯视图（左键添加导航点，右键点圆点删除）
                 </h2>
                 <div ref={setTopViewNode} className="min-h-0 flex-1 overflow-hidden rounded-xl border">
-                  <TopView
-                    showStandable
-                    mapName={mapName}
-                    meta={info.topview_meta}
-                    waypoints={waypoints}
-                    onChangeWaypoints={setWaypoints}
-                    editable
-                    status={null}
-                    showSafety={false}
-                    maxWidth={topViewSize.width}
-                    maxHeight={topViewSize.height}
-                  />
+                  {info.topview_meta.topview2d ? (
+                    <TopView
+                      mapName={mapName}
+                      meta={info.topview_meta.topview2d}
+                      waypoints={waypoints}
+                      onChangeWaypoints={setWaypoints}
+                      editable
+                      status={null}
+                      maxWidth={topViewSize.width}
+                      maxHeight={topViewSize.height}
+                    />
+                  ) : (
+                    <div className="flex size-full items-center justify-center text-sm text-muted-foreground">
+                      这份地图没有 2D 栅格图 (2d_map/map_2d.pgm)，无法在这里点选设置路线。
+                    </div>
+                  )}
                 </div>
               </section>
 
