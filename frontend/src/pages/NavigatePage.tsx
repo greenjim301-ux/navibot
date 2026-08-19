@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { MapPin, Play, Eraser, Trash2, TriangleAlert, OctagonX } from "lucide-react";
-import { estop, getRoute, setInflationMap, setSelfInflation, submitRoute } from "../api";
+import { estop, getRoute, setInflationMap, setSelfInflation, setSurfCloud, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
@@ -84,7 +84,7 @@ export default function NavigatePage() {
 
   const {
     status, optimalTraj, selfInflationEnabled, selfInflation,
-    inflationMapEnabled, inflationMap, connected,
+    inflationMapEnabled, inflationMap, surfCloudEnabled, surfCloud, connected,
   } = useNavStatus();
   // self_inflation / 膨胀地图都是后端的全局订阅开关(默认不订阅, 话题本身很吵),
   // 勾选框直接提交开关状态, 真正的 enabled/数据都是从 ws 推回来的 —— 这样多开
@@ -109,6 +109,17 @@ export default function NavigatePage() {
       setActionError(String(e));
     } finally {
       setInflationMapBusy(false);
+    }
+  }
+  const [surfCloudBusy, setSurfCloudBusy] = useState(false);
+  async function handleToggleSurfCloud(checked: boolean) {
+    setSurfCloudBusy(true);
+    try {
+      await setSurfCloud(checked);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setSurfCloudBusy(false);
     }
   }
   // "清除轨迹" 也要把 planner 局部轨迹线擦掉, 但那条线是 ws 推来的、页面并不
@@ -235,7 +246,18 @@ export default function NavigatePage() {
                     onCheckedChange={handleToggleInflationMap}
                   />
                 </label>
-  
+
+                {/* 雷达点云 (/surf_cloud_in_map) 同理: 默认不订阅, 勾上才让后端
+                    订阅并转发, 只渲染最新一帧, 不叠加历史帧。 */}
+                <label className="flex items-center gap-1.5 text-xs text-foreground">
+                  雷达点云
+                  <Switch
+                    checked={surfCloudEnabled}
+                    disabled={surfCloudBusy}
+                    onCheckedChange={handleToggleSurfCloud}
+                  />
+                </label>
+
                 <Button
                   size="sm"
                   variant="outline"
@@ -332,6 +354,7 @@ export default function NavigatePage() {
             optimalTraj={optimalTrajHidden ? null : optimalTraj}
             selfInflation={selfInflation}
             inflationMap={inflationMap}
+            surfCloud={surfCloud}
             heightLimit={effectiveHeightLimit}
             enableFollow
           />

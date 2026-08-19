@@ -32,6 +32,10 @@ interface Props {
   /** /grid_map/occupancy_inflate 原样转发, 拍平的 [x0,y0,z0, x1,y1,z1, ...],
    *  只在页面上的勾选框打开时后端才会有数据。 */
   inflationMap?: number[] | null;
+  /** /surf_cloud_in_map 原样转发, 拍平的 [x0,y0,z0, x1,y1,z1, ...], 雷达当前帧
+   *  降采样点云(每帧整体替换, 不叠加历史帧), 只在页面上的勾选框打开时后端才会
+   *  有数据。 */
+  surfCloud?: number[] | null;
   /** 是否提供"镜头跟随机器狗"开关 (预览页没有实时位姿, 不需要) */
   enableFollow?: boolean;
   /** 高度限制(世界系绝对 z, 米): 只渲染 z <= heightLimit 的点, 用 GPU 裁剪平面
@@ -106,7 +110,7 @@ function createWaypointLabelSprite(text: string): THREE.Sprite {
 
 export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function PointCloudView({
   mapName, meta, pointcloudMeta = null, waypoints = [], status = null, trail = null,
-  optimalTraj = null, selfInflation = null, inflationMap = null, enableFollow = false,
+  optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, enableFollow = false,
   heightLimit, controlMode = "orbit", onRecenterModeChange,
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -141,6 +145,10 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // 整个丢掉重建; capacity 记录当前顶点/颜色缓冲区能容纳的点数上限。
   const inflationPointsRef = useRef<THREE.Points | null>(null);
   const inflationCapacityRef = useRef(0);
+  const surfCloudGroupRef = useRef<THREE.Group | null>(null);
+  // 雷达实时点云同样用持久 Points/缓冲区(见下面那个 effect), 不逐帧整个重建。
+  const surfCloudPointsRef = useRef<THREE.Points | null>(null);
+  const surfCloudCapacityRef = useRef(0);
   // 按需渲染: 场景大多数时候是静止的(尤其点云可能有几百万个点), 不值得每帧都
   // 真跑一次 renderer.render()。这个 flag 由所有会改变画面的地方(相机交互/跟随
   // 动画/props 驱动的场景更新/resize)置位, animate() 里渲染完就清掉, 空闲时
@@ -352,6 +360,12 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     inflationMapGroupRef.current = inflationMapGroup;
     inflationPointsRef.current = null;
     inflationCapacityRef.current = 0;
+
+    const surfCloudGroup = new THREE.Group();
+    scene.add(surfCloudGroup);
+    surfCloudGroupRef.current = surfCloudGroup;
+    surfCloudPointsRef.current = null;
+    surfCloudCapacityRef.current = 0;
 
     let disposed = false;
     let points: THREE.Points | null = null;
@@ -610,6 +624,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         p.geometry.dispose();
         (p.material as THREE.Material).dispose();
       });
+      surfCloudGroup.children.forEach((c) => {
+        const p = c as THREE.Points;
+        p.geometry.dispose();
+        (p.material as THREE.Material).dispose();
+      });
       renderer.dispose();
       container.removeChild(renderer.domElement);
     };
@@ -850,6 +869,49 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     geometry.setDrawRange(0, count);
     geometry.computeBoundingSphere();
   }, [inflationMap]);
+
+  // 雷达实时点云 (/surf_cloud_in_map): 每帧整体替换的当前帧降采样点云, 5Hz,
+  // 跟膨胀地图一样原地复用 GPU 缓冲区(见上面 inflationMap 那个 effect 的说明),
+  // 不同的是这里用单一颜色(material.color), 不需要逐点算颜色, 只有位置一个
+  // buffer 要写, 比膨胀地图那个 effect 还要轻。
+  useEffect(() => {
+    const group = surfCloudGroupRef.current;
+    if (!group) return;
+    needsRenderRef.current = true;
+
+    if (!surfCloud || surfCloud.length < 3) {
+      if (surfCloudPointsRef.current) surfCloudPointsRef.current.visible = false;
+      return;
+    }
+
+    const count = Math.floor(surfCloud.length / 3);
+    let points = surfCloudPointsRef.current;
+
+    if (!points || count > surfCloudCapacityRef.current) {
+      if (points) {
+        points.geometry.dispose();
+        (points.material as THREE.Material).dispose();
+        group.remove(points);
+      }
+      const capacity = Math.ceil(count * 1.5);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
+      const material = new THREE.PointsMaterial({ size: 0.05, color: 0x38bdf8 });
+      points = new THREE.Points(geometry, material);
+      points.renderOrder = 8;
+      group.add(points);
+      surfCloudPointsRef.current = points;
+      surfCloudCapacityRef.current = capacity;
+    }
+    points.visible = true;
+
+    const geometry = points.geometry;
+    const posAttr = geometry.getAttribute("position") as THREE.BufferAttribute;
+    (posAttr.array as Float32Array).set(surfCloud);
+    posAttr.needsUpdate = true;
+    geometry.setDrawRange(0, count);
+    geometry.computeBoundingSphere();
+  }, [surfCloud]);
 
   const hasPose = Boolean(status?.robot_pose);
 

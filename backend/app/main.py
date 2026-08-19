@@ -17,6 +17,7 @@ from .models import (
     InflationMapRequest,
     RouteCreateRequest, RouteInfo, RouteRequest,
     SelfInflationRequest,
+    SurfCloudRequest,
 )
 from .route_store import RouteStore
 from . import path_planner
@@ -98,9 +99,12 @@ async def on_startup() -> None:
     def _on_inflation_map(points):
         route_manager.on_inflation_map(points)
 
+    def _on_surf_cloud(points):
+        route_manager.on_surf_cloud(points)
+
     ros_bridge = RosBridge(
         on_pose=_on_pose, on_optimal_traj=_on_optimal_traj, on_self_inflation=_on_self_inflation,
-        on_inflation_map=_on_inflation_map,
+        on_inflation_map=_on_inflation_map, on_surf_cloud=_on_surf_cloud,
     )
     route_manager = RouteManager(ros_bridge, ws_manager)
     ros_bridge.start()
@@ -153,6 +157,16 @@ async def set_inflation_map(req: InflationMapRequest):
     并转发, 关就取消订阅。"""
     try:
         return await run_in_threadpool(route_manager.set_inflation_map_enabled, req.enabled)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+@app.post("/api/surf_cloud")
+async def set_surf_cloud(req: SurfCloudRequest):
+    """勾选框打开/关闭雷达实时点云展示: 开就让后端订阅 /surf_cloud_in_map 并
+    转发, 关就取消订阅。"""
+    try:
+        return await run_in_threadpool(route_manager.set_surf_cloud_enabled, req.enabled)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 
@@ -247,6 +261,7 @@ async def ws_nav(ws: WebSocket):
             await ws.send_json({"type": "optimal_traj", "data": {"points": optimal_traj}})
         await ws.send_json({"type": "self_inflation", "data": route_manager.get_self_inflation_state()})
         await ws.send_json({"type": "inflation_map", "data": route_manager.get_inflation_map_state()})
+        await ws.send_json({"type": "surf_cloud", "data": route_manager.get_surf_cloud_state()})
         while True:
             # 前端目前不需要往这条连接发消息, 只是保持连接存活/感知断开
             await ws.receive_text()

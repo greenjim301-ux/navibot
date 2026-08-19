@@ -60,6 +60,18 @@ export async function setInflationMap(enabled: boolean): Promise<{ enabled: bool
   );
 }
 
+/** 勾选框开关雷达实时点云展示 (/surf_cloud_in_map), 逻辑跟 setSelfInflation
+ *  一样: 全局开关, 实际状态和数据都通过 ws 的 "surf_cloud" 消息推送。 */
+export async function setSurfCloud(enabled: boolean): Promise<{ enabled: boolean }> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/surf_cloud`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
 export async function listMaps(): Promise<MapInfo[]> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/maps`));
 }

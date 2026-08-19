@@ -70,6 +70,9 @@ class RouteManager:
         self._inflation_map_enabled: bool = False
         self._inflation_map: List[float] = []  # 拍平的 [x0,y0,z0, x1,y1,z1, ...]
         self._last_inflation_map_broadcast_at: float = 0.0
+        self._surf_cloud_enabled: bool = False
+        self._surf_cloud: List[float] = []  # 拍平的 [x0,y0,z0, x1,y1,z1, ...], 每帧整体替换
+        self._last_surf_cloud_broadcast_at: float = 0.0
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -106,6 +109,11 @@ class RouteManager:
         """当前是否订阅了膨胀地图 + 最新一片点云, 给新连上的 ws 客户端补发用。"""
         with self._lock:
             return self._inflation_map_payload_locked()
+
+    def get_surf_cloud_state(self) -> dict:
+        """当前是否订阅了雷达点云 + 最新一帧, 给新连上的 ws 客户端补发用。"""
+        with self._lock:
+            return self._surf_cloud_payload_locked()
 
     # ---- 指令 ----
     # 运行时实测 Δ 和建图时那个差超过这么多就告警 —— 多半是外参改了
@@ -384,6 +392,37 @@ class RouteManager:
                 self._inflation_map = []
             payload = self._inflation_map_payload_locked()
         self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
+        return payload
+
+    def _surf_cloud_payload_locked(self) -> dict:
+        return {"enabled": self._surf_cloud_enabled, "points": list(self._surf_cloud)}
+
+    def on_surf_cloud(self, points: List[float]) -> None:
+        """转发 /surf_cloud_in_map 的当前帧点云(拍平的 [x,y,z, ...]), 每次整帧
+        替换(不叠加历史帧)。源头本身 5Hz, 只在勾选框打开时才会被订阅(见
+        ros_bridge.set_surf_cloud_enabled), 这里再按 SURF_CLOUD_BROADCAST_HZ
+        限流一次广播动作。"""
+        with self._lock:
+            if not self._surf_cloud_enabled:
+                return
+            self._surf_cloud = points
+            now = time.time()
+            if now - self._last_surf_cloud_broadcast_at < 1.0 / config.SURF_CLOUD_BROADCAST_HZ:
+                return
+            self._last_surf_cloud_broadcast_at = now
+            payload = self._surf_cloud_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
+
+    def set_surf_cloud_enabled(self, enabled: bool) -> dict:
+        """开关雷达点云展示。状态变化立刻广播给所有 ws 客户端(不受限流影响),
+        好让多开的标签页里勾选框保持一致。"""
+        self._ros.set_surf_cloud_enabled(enabled)
+        with self._lock:
+            self._surf_cloud_enabled = enabled
+            if not enabled:
+                self._surf_cloud = []
+            payload = self._surf_cloud_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
         return payload
 
     def _check_stuck_locked(self) -> None:

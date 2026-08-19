@@ -30,6 +30,8 @@ OptimalTrajCallback = Callable[[List[dict]], None]
 SelfInflationCallback = Callable[[dict], None]
 # 膨胀地图整片点云, 拍平成 [x0,y0,z0, x1,y1,z1, ...] (每次整片替换, 不是增量)
 InflationMapCallback = Callable[[List[float]], None]
+# 雷达实时点云 (/surf_cloud_in_map), 同样拍平成 [x0,y0,z0, ...], 每帧整体替换
+SurfCloudCallback = Callable[[List[float]], None]
 
 
 class RosBridge:
@@ -39,15 +41,18 @@ class RosBridge:
         on_optimal_traj: Optional[OptimalTrajCallback] = None,
         on_self_inflation: Optional[SelfInflationCallback] = None,
         on_inflation_map: Optional[InflationMapCallback] = None,
+        on_surf_cloud: Optional[SurfCloudCallback] = None,
     ) -> None:
         self._on_pose = on_pose
         self._on_optimal_traj = on_optimal_traj
         self._on_self_inflation = on_self_inflation
         self._on_inflation_map = on_inflation_map
+        self._on_surf_cloud = on_surf_cloud
         self._wp_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
         self._self_inflation_sub: Optional[rospy.Subscriber] = None
         self._inflation_map_sub: Optional[rospy.Subscriber] = None
+        self._surf_cloud_sub: Optional[rospy.Subscriber] = None
         self._started = False
 
     def start(self) -> None:
@@ -136,13 +141,18 @@ class RosBridge:
     def _handle_inflation_map(self, msg: PointCloud2) -> None:
         """/grid_map/occupancy_inflate 是 grid_map.cpp 的膨胀后占据栅格, 每次
         整片重发(不是增量), 只有 x/y/z 三个字段。原样转发, 不做下采样——是否
-        订阅这个话题本身就已经是"要不要看"的开关了。"""
+        订阅这个话题本身就已经是"要不要看"的开关了。
+
+        round 到 3 位小数(毫米级, 展示用完全够): 消息里的坐标本来就是 float32,
+        直接 float() 提升成 double 会把 float32 的精度噪声原样带进 JSON 文本
+        (比如 1.23 变成 1.2299999713897705), 不是真精度, 只是白白撑大 payload
+        和 json.dumps/JSON.parse 两端的开销。"""
         assert self._on_inflation_map is not None
         flat: List[float] = []
         for x, y, z in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-            flat.append(float(x))
-            flat.append(float(y))
-            flat.append(float(z))
+            flat.append(round(float(x), 3))
+            flat.append(round(float(y), 3))
+            flat.append(round(float(z), 3))
         self._on_inflation_map(flat)
 
     def set_inflation_map_enabled(self, enabled: bool) -> None:
@@ -160,6 +170,35 @@ class RosBridge:
             if self._inflation_map_sub is not None:
                 self._inflation_map_sub.unregister()
                 self._inflation_map_sub = None
+
+    def _handle_surf_cloud(self, msg: PointCloud2) -> None:
+        """/surf_cloud_in_map: hand-lio 降采样+畸变校正后的当前帧激光点云, 已经
+        转到 map 系, 5Hz。原样转发, 只取 x/y/z——每帧整体替换, 不在这里做叠加。
+
+        round 到 3 位小数, 理由同 _handle_inflation_map: 消息本来就是 float32,
+        直接提升成 double 只会把精度噪声原样带进 JSON, 白白撑大 payload。"""
+        assert self._on_surf_cloud is not None
+        flat: List[float] = []
+        for x, y, z in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            flat.append(round(float(x), 3))
+            flat.append(round(float(y), 3))
+            flat.append(round(float(z), 3))
+        self._on_surf_cloud(flat)
+
+    def set_surf_cloud_enabled(self, enabled: bool) -> None:
+        """跟 self_inflation/膨胀地图一样默认不订阅, 前端"雷达点云"勾选框打开
+        才让后端订阅, 关掉就取消订阅。"""
+        if not self._started:
+            raise RuntimeError("ROS bridge 尚未启动")
+        if enabled:
+            if self._surf_cloud_sub is None:
+                self._surf_cloud_sub = rospy.Subscriber(
+                    config.SURF_CLOUD_TOPIC, PointCloud2, self._handle_surf_cloud, queue_size=2,
+                )
+        else:
+            if self._surf_cloud_sub is not None:
+                self._surf_cloud_sub.unregister()
+                self._surf_cloud_sub = None
 
     def publish_waypoints(self, waypoints: List[dict]) -> None:
         """下发一整轮路线。waypoints 里的 z 必须已经是 odom 系机体高度。

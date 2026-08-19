@@ -64,6 +64,11 @@ SELF_INFLATION_TOPIC = os.environ.get("NAVIBOT_SELF_INFLATION_TOPIC", "/scan_pla
 # (map_inf_pub_.getNumSubscribers() <= 0 时直接不发布), 我们只是把这个"按需"
 # 特性透到前端一个勾选框。
 INFLATION_MAP_TOPIC = os.environ.get("NAVIBOT_INFLATION_MAP_TOPIC", "/grid_map/occupancy_inflate")
+# hand-lio 侧 -> backend, sensor_msgs/PointCloud2 (见 hand-lio/hand-topic.csv):
+# "降采样后的激光点云,已进行降采样,经过畸变校正,转到地图坐标系下", 5Hz, 只有
+# x/y/z。跟 inflation_map 一样默认不订阅, 前端"雷达点云"勾选框打开才让后端订阅,
+# 每次整帧替换(不叠加历史帧)。
+SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURF_CLOUD_TOPIC", "/surf_cloud_in_map")
 
 # 对齐 fsm/waypoint_arrival_radius (advanced_param.xml 里配的 0.3): 途中点提前切
 # 下一个的半径, 不是到达判据本身; 最后一个点没有这条, 精度比这个值高得多——见上面
@@ -91,6 +96,9 @@ SELF_INFLATION_BROADCAST_HZ = float(os.environ.get("NAVIBOT_SELF_INFLATION_BROAD
 # 膨胀地图是 grid_map.cpp 定时器发布的, 最快 20Hz, 但一片点云通常是几千到上万个点,
 # 环境本身变化没那么快, 没必要跟着 20Hz 转发, 默认降到 5Hz
 INFLATION_MAP_BROADCAST_HZ = float(os.environ.get("NAVIBOT_INFLATION_MAP_BROADCAST_HZ", "5.0"))
+# surf_cloud_in_map 源头本身就是 5Hz, 这里的限流基本不生效, 只是留一道保险
+# (topic 换成更高频的源时不至于失控), 跟其它几个话题的配置方式保持一致
+SURF_CLOUD_BROADCAST_HZ = float(os.environ.get("NAVIBOT_SURF_CLOUD_BROADCAST_HZ", "5.0"))
 # 给某个客户端发一条 ws 消息等这么久还没发完就放弃并断开它。膨胀地图这类大 payload
 # (几千到上万个点的 JSON) 如果客户端(浏览器主线程忙着重建 Three.js 几何体)跟不上
 # 消费速度, ws.send_json 会一直卡在 TCP 背压上不返回——不设超时的话, WebSocketManager

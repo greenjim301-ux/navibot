@@ -91,6 +91,12 @@ class InflationMapRequest(BaseModel):
     前端页面上的勾选框打开时才让后端订阅它。"""
 
 
+class SurfCloudRequest(BaseModel):
+    enabled: bool
+    """是否订阅 /surf_cloud_in_map (雷达实时点云) 并转发给前端。默认不订阅,
+    只有前端页面上的勾选框打开时才让后端订阅它。"""
+
+
 class GroundZRequest(BaseModel):
     points: List[Waypoint] = Field(min_length=1)
 

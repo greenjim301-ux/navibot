@@ -14,6 +14,10 @@ export function useNavStatus() {
   // [x0,y0,z0, x1,y1,z1, ...] —— 一片点云可能上万个点, 不用一堆对象。
   const [inflationMapEnabled, setInflationMapEnabled] = useState(false);
   const [inflationMap, setInflationMap] = useState<number[]>([]);
+  // 雷达实时点云 (/surf_cloud_in_map) 同样是全局开关, points 是拍平的
+  // [x0,y0,z0, ...], 每帧整体替换(不叠加历史帧)。
+  const [surfCloudEnabled, setSurfCloudEnabled] = useState(false);
+  const [surfCloud, setSurfCloud] = useState<number[]>([]);
   const [connected, setConnected] = useState(false);
   const retryRef = useRef(0);
 
@@ -43,6 +47,10 @@ export function useNavStatus() {
             const data = msg.data as { enabled: boolean; points: number[] };
             setInflationMapEnabled(data.enabled);
             setInflationMap(data.points);
+          } else if (msg.type === "surf_cloud") {
+            const data = msg.data as { enabled: boolean; points: number[] };
+            setSurfCloudEnabled(data.enabled);
+            setSurfCloud(data.points);
           }
         } catch {
           // ignore malformed message
@@ -70,6 +78,6 @@ export function useNavStatus() {
 
   return {
     status, optimalTraj, selfInflationEnabled, selfInflation,
-    inflationMapEnabled, inflationMap, connected,
+    inflationMapEnabled, inflationMap, surfCloudEnabled, surfCloud, connected,
   };
 }
