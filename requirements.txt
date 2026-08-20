@@ -1,15 +1,32 @@
-# 离线地图预处理 (map_pipeline/) 的依赖。已装进 mamba 环境 ros_host, 这个文件只是
-# 记录版本, 不需要单独建 venv:
-#   mamba run -n ros_host python -m pip install -r map_pipeline/requirements.txt
+# navibot 全部依赖 —— backend/ (导航后端) + map_pipeline/ (离线地图预处理)
+# 合在一起装进同一个运行环境, 不需要分开建 venv:
+#   python -m pip install -r requirements.txt
+# 开发机上是装进 mamba 环境:
+#   mamba run -n ros_host python -m pip install -r requirements.txt
 #
-# 只跑离线预处理才需要这些包 —— 后端 (backend/) 不依赖它们, 机器上的运行时
-# 环境不用装, 见 backend/requirements.txt。
+# **必须兼容 Python 3.8** —— 机器 (lubancat) 上跑的是 ROS Noetic 自带的 3.8,
+# rospy 也是为它编译的。开发机用 mamba ros_host 里的 3.12, 写 dict[str,int]、
+# X | None、asyncio.to_thread 都不报错, 推到机器上才在 import 阶段炸掉。
+# 提交前跑一次: python3 tools/check_py38.py
+
+# ---- backend/ ----
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+
+# ---- backend/ 读 elevation.npy + map_pipeline/ 点云数值运算, 两边都要 ----
 numpy>=1.24
+
+# ---- map_pipeline/ 离线地图预处理专用, backend 本身不依赖 ----
 scipy>=1.10
 open3d>=0.14
 pillow>=10.4
 
-# ---- Python 3.8 兼容性 ----
+# 以下由 ROS 环境提供, 不用 pip 装(只有 backend 用到):
+#   rospy, tf, geometry_msgs, nav_msgs, std_msgs, visualization_msgs
+
+# ---- 版本区间的 Python 3.8 兼容性说明(下面几条只跟 map_pipeline 那三个包有关)----
 # 代码本身兼容 3.8 (map_pipeline/*.py 都带 `from __future__ import annotations`,
 # 用 tools/check_py38.py 校验过)。版本下限按功能需要给的, 不是照搬某个环境里
 # 装到的版本 —— 用到的 open3d API (read_point_cloud/.points/select_by_index/
