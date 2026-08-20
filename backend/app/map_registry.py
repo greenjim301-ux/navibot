@@ -1,14 +1,18 @@
 """
-地图注册表: 地图"是什么/从哪来"记在 SQLite (见 map_store.py, 表 maps 只存
-名称 + 存储路径), 这里只管两件事——
+地图注册表: 地图列表不再落 SQLite——地图数据根目录 (config.MAP_DATA_DIR) 下的每个
+子目录就是一张地图, 目录名就是地图名, 存在与否直接扫文件系统判断 (见
+_is_valid_map_dir), 不再需要单独"记一笔账"的导入动作。
 
-  1. 由存储路径算出源文件在哪 (<storage_path>/3d_map/dense_cloud_map.pcd,
-     旁边的 keyframe_info_3d.txt 由 map_pipeline 自动找), 以及预处理产物落在
-     web_assets/map/<name>/ 下的哪个子目录。
-  2. 跟踪预处理状态 (进行中 / 出错), 触发 map_pipeline/generate_map_assets.py。
+固定的目录结构 (常量定义见 config.py):
+  <map-data-dir>/<name>/3d_map/dense_cloud_map.pcd
+  <map-data-dir>/<name>/3d_map/keyframe_info_3d.txt
+  <map-data-dir>/<name>/2d_map/map_2d.pgm
+  <map-data-dir>/<name>/2d_map/map_2d.yaml
+四个文件都在, 这个子目录才算一张地图; 少任何一个都不会出现在列表里(不是
+"error" 状态, 是根本不存在), 也拿不到它的详情。
 
-地图的原始数据不归这里管: 导入只是记一笔"名字 -> 路径"的账, 不拷贝也不接管;
-删除地图只删自己生成的预处理产物和这笔账, 不碰用户存储路径下的原始文件。
+这里管的另一件事跟以前一样: 跟踪预处理状态(进行中/出错), 触发
+map_pipeline/generate_map_assets.py, 产物落在 web_assets/map/<name>/ 下。
 """
 import json
 import logging
@@ -20,22 +24,32 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from . import config
-from .map_store import MapStore
 from .models import MapInfo, MapStatus
 
 logger = logging.getLogger("navibot.map_registry")
 
 
 def _validate_name(name: str) -> None:
-    """地图名会拼进 web_assets/map/<name>/ 这样的文件系统路径, 挡掉 '/'、'..'
-    这类会跳出目标目录的输入。"""
+    """地图名会拼进 web_assets/map/<name>/、map-data-dir/<name>/ 这样的文件系统
+    路径, 挡掉 '/'、'..' 这类会跳出目标目录的输入。"""
     if not name or name in (".", "..") or "/" in name or "\\" in name:
         raise ValueError(f"非法地图名: {name!r}")
 
 
+def _is_valid_map_dir(path: Path) -> bool:
+    """path 是否满足 map-data-dir/<name>/ 的固定结构(见模块 docstring)。"""
+    d3 = path / config.MAP_3D_SUBDIR
+    d2 = path / config.MAP_2D_SUBDIR
+    return (
+        (d3 / config.MAP_3D_PCD_FILENAME).is_file()
+        and (d3 / config.MAP_3D_KEYFRAME_FILENAME).is_file()
+        and (d2 / config.MAP_2D_PGM_FILENAME).is_file()
+        and (d2 / config.MAP_2D_YAML_FILENAME).is_file()
+    )
+
+
 class MapRegistry:
-    def __init__(self, store: Optional[MapStore] = None) -> None:
-        self._store = store or MapStore()
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._processing: Dict[str, threading.Thread] = {}
         self._errors: Dict[str, str] = {}
@@ -44,41 +58,26 @@ class MapRegistry:
         _validate_name(name)
         return Path(config.MAP_ASSETS_DIR) / name
 
-    def _source_pcd(self, storage_path: str) -> Path:
-        return Path(storage_path) / config.MAP_SOURCE_SUBDIR / config.MAP_SOURCE_FILENAME
-
-    # ---- 导入 ----
-    def import_map(self, name: str, storage_path: str) -> MapInfo:
-        """记一笔"名字 -> 存储路径"。不拷贝文件, 也不自动触发预处理——用户导入
-        之后还得手动点一下预处理。"""
-        name = name.strip()
+    def _map_dir(self, name: str) -> Path:
         _validate_name(name)
-        storage_path = storage_path.strip()
-        if not storage_path:
-            raise ValueError("存储路径不能为空")
+        return Path(config.MAP_DATA_DIR) / name
 
-        src = self._source_pcd(storage_path)
-        if not src.is_file():
-            raise ValueError(
-                f"没找到 {src} —— 存储路径下应该有 "
-                f"{config.MAP_SOURCE_SUBDIR}/{config.MAP_SOURCE_FILENAME}"
-            )
-
-        self._store.create_map(name, storage_path)
-        logger.info("map imported: name=%s storage_path=%s", name, storage_path)
-        info = self.get_map_info(name)
-        assert info is not None
-        return info
+    def _source_pcd(self, name: str) -> Path:
+        return self._map_dir(name) / config.MAP_3D_SUBDIR / config.MAP_3D_PCD_FILENAME
 
     # ---- 查询 ----
     def list_map_names(self) -> List[str]:
-        return [r["name"] for r in self._store.list_maps()]
+        root = Path(config.MAP_DATA_DIR)
+        if not root.is_dir():
+            return []
+        names = [p.name for p in root.iterdir() if p.is_dir() and _is_valid_map_dir(p)]
+        return sorted(names)
 
     def get_map_info(self, name: str) -> Optional[MapInfo]:
-        record = self._store.get_map(name)
-        if record is None:
+        map_dir = self._map_dir(name)
+        if not _is_valid_map_dir(map_dir):
             return None
-        storage_path = record["storage_path"]
+        storage_path = str(map_dir)
 
         with self._lock:
             processing = name in self._processing
@@ -109,12 +108,10 @@ class MapRegistry:
 
     # ---- 预处理 ----
     def start_preprocess(self, name: str) -> MapInfo:
-        record = self._store.get_map(name)
-        if record is None:
+        map_dir = self._map_dir(name)
+        if not _is_valid_map_dir(map_dir):
             raise ValueError(f"地图 '{name}' 不存在")
-        src = self._source_pcd(record["storage_path"])
-        if not src.is_file():
-            raise ValueError(f"地图 '{name}' 的源文件不存在: {src} (存储路径是否还挂着?)")
+        src = self._source_pcd(name)
 
         with self._lock:
             if name in self._processing:
@@ -123,7 +120,7 @@ class MapRegistry:
             thread = threading.Thread(target=self._run_preprocess, args=(name, src), daemon=True)
             self._processing[name] = thread
         thread.start()
-        return MapInfo(name=name, status=MapStatus.PROCESSING, storage_path=record["storage_path"])
+        return MapInfo(name=name, status=MapStatus.PROCESSING, storage_path=str(map_dir))
 
     def _run_preprocess(self, name: str, src: Path) -> None:
         out_dir = self._assets_dir(name)
@@ -152,17 +149,22 @@ class MapRegistry:
 
     # ---- 删除 ----
     def delete_map(self, name: str) -> None:
-        """删除地图: 地图表里的这一行和 web_assets/map/<name>/ 下自己生成的预处理
-        产物会被删掉, 不可恢复; 用户存储路径下的原始点云/轨迹文件不属于我们,
-        不会碰。"""
-        record = self._store.get_map(name)
-        if record is None:
+        """删除地图: map-data-dir/<name>/ 下的原始数据 (2d_map + 3d_map) 和
+        web_assets/map/<name>/ 下自己生成的预处理产物一并删掉, 不可恢复。
+
+        跟以前"导入地图只记账, 不碰用户存储路径下的原始文件"的模式不一样——
+        现在 map-data-dir 是 navibot 自己独占管理的地图数据根目录 (不再是导入
+        时用户随手指的任意外部路径), 地图列表本身就是扫这个目录来的, 删除地图
+        就是删这张地图本身, 否则它会在下次扫描时重新出现在列表里。
+        """
+        map_dir = self._map_dir(name)
+        if not _is_valid_map_dir(map_dir):
             raise ValueError(f"地图 '{name}' 不存在")
         with self._lock:
             if name in self._processing:
                 raise ValueError(f"地图 '{name}' 正在预处理中, 不能删除")
             self._errors.pop(name, None)
 
-        self._store.delete_map(name)
+        shutil.rmtree(map_dir, ignore_errors=True)
         shutil.rmtree(self._assets_dir(name), ignore_errors=True)
         logger.info("deleted map=%s", name)

@@ -114,21 +114,37 @@ _REPO_ROOT = REPO_ROOT
 # 每个地图是 web_assets/map/<name>/ 下的一份预处理产物 (topview.png / pointcloud.bin 等)
 MAP_ASSETS_DIR = os.environ.get("NAVIBOT_MAP_ASSETS_DIR", os.path.join(_REPO_ROOT, "web_assets", "map"))
 
-# 地图表 (名称 -> 存储路径) 落在这个 SQLite 文件里, 见 map_store.py。地图的原始
-# 数据本身不归 navibot 管, 导入只是记一笔账。
-MAPS_DB_FILE = os.environ.get("NAVIBOT_MAPS_DB_FILE", os.path.join(REPO_ROOT, "data", "maps.db"))
+# 地图数据根目录: 地图列表不落 SQLite, 直接扫这个目录——每个直接子目录是一张
+# 地图, 目录名就是地图名。子目录必须同时满足下面这个固定结构才会被认成一张地图
+# (见 map_registry.py 的 _is_valid_map_dir), 否则既不出现在列表里, 也查不到详情:
+#   <map-data-dir>/<name>/3d_map/dense_cloud_map.pcd
+#   <map-data-dir>/<name>/3d_map/keyframe_info_3d.txt
+#   <map-data-dir>/<name>/2d_map/map_2d.pgm
+#   <map-data-dir>/<name>/2d_map/map_2d.yaml
+MAP_DATA_DIR = os.environ.get("NAVIBOT_MAP_DATA_DIR", "/home/lisi/Documents/map-data")
 
-# 导入地图时, 用户填的存储路径下应该有这个子目录, 里面放着源点云和建图轨迹:
-#   <storage_path>/3d_map/dense_cloud_map.pcd
-#   <storage_path>/3d_map/keyframe_info_3d.txt
-# 例如存储路径填 /home/cat/map-1, 实际文件在 /home/cat/map-1/3d_map/ 下。
-#
-# 同级的 <storage_path>/2d_map/map_2d.pgm(+.yaml) 是可选的 (map_pipeline/
-# generate_map_assets.py 自己按这个约定去找, 找不到就跳过 2D 俯视图生成,
-# 这里不强制校验存在) —— 只有装了 2D 栅格图源的地图才能在"设置路线"页面
-# 点选导航点, 只导入点云的旧地图仍然能正常做 3D 预览。
-MAP_SOURCE_SUBDIR = "3d_map"
-MAP_SOURCE_FILENAME = "dense_cloud_map.pcd"
+MAP_3D_SUBDIR = "3d_map"
+MAP_3D_PCD_FILENAME = "dense_cloud_map.pcd"
+MAP_3D_KEYFRAME_FILENAME = "keyframe_info_3d.txt"
+MAP_2D_SUBDIR = "2d_map"
+MAP_2D_PGM_FILENAME = "map_2d.pgm"
+MAP_2D_YAML_FILENAME = "map_2d.yaml"
+
+# handbot_slam 建图时把产物存到的目录 (dense_cloud_map.pcd / keyframe_info_3d.txt
+# 等), 跟上面的 MAP_DATA_DIR 是两个不同的目录——这个是建图侧的输出位置, 还没搬进
+# navibot 的地图数据根目录。留着给后面"新建地图"功能用 (把这里新建好的图导入/
+# 搬到 MAP_DATA_DIR 下)。
+HANDBOT_SLAM_MAP_DIR = os.environ.get(
+    "NAVIBOT_HANDBOT_SLAM_MAP_DIR",
+    "/home/cat/handbot_slam/catkin_ws_grslam/save_map/3d_map",
+)
+
+# handbot_slam 定位服务 (3DSLAM 重定位/localization, 跟建图是两个不同的 launch)
+# 用的配置文件, 里面应该指定了要加载哪张地图。留着给后面切换定位地图的功能用。
+HANDBOT_SLAM_LOC_CONFIG_FILE = os.environ.get(
+    "NAVIBOT_HANDBOT_SLAM_LOC_CONFIG_FILE",
+    "/home/cat/handbot_slam/catkin_ws_grslam/src/grslam/params/3DSLAM_mid360_loc.yaml",
+)
 
 # 已保存路线 (用户画好命名保存的途经点序列)
 ROUTES_FILE = os.environ.get("NAVIBOT_ROUTES_FILE", os.path.join(REPO_ROOT, "data", "routes.json"))

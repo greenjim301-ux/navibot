@@ -84,7 +84,8 @@ export type MapStatus = "not_processed" | "processing" | "ready" | "error";
 export interface MapInfo {
   name: string;
   status: MapStatus;
-  /** 地图表里记的存储路径, 其下应有 3d_map/dense_cloud_map.pcd */
+  /** map-data-dir/<name>/ 的绝对路径, 由地图名直接算出来 (见 backend/app/config.py
+   *  的 MAP_DATA_DIR), 其下应有 3d_map/dense_cloud_map.pcd + 2d_map/map_2d.pgm */
   storage_path: string;
   error_message: string | null;
   topview_meta: TopviewMeta | null;

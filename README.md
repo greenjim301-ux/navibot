@@ -33,26 +33,26 @@ frontend/         React + Vite + Three.js + Konva: 地图管理、俯视图选�
 ### 数据流
 
 ```
-data/maps.db (SQLite)                地图表: 名称 -> 存储路径, 网页"导入地图"按钮写入
+map-data-dir/<name>/                 地图数据根目录 (默认 /home/lisi/Documents/map-data),
+                                      地图列表直接扫这个目录, 不落数据库
         │
         ▼
-<存储路径>/3d_map/dense_cloud_map.pcd    HandBot-S1 建的稠密点云
-<存储路径>/3d_map/keyframe_info_3d.txt   建图轨迹 —— 高程提取的种子, 缺了它带楼梯的图就没法处理
+<map-data-dir>/<name>/3d_map/dense_cloud_map.pcd    HandBot-S1 建的稠密点云
+<map-data-dir>/<name>/3d_map/keyframe_info_3d.txt   建图轨迹 —— 后端运行时直接查它算导航点 z (见下文), 不
+                                                     经过预处理, 缺了它这份地图不满足目录结构, 不会出现在列表里
+<map-data-dir>/<name>/2d_map/map_2d.pgm(+.yaml)     2D 占据栅格图, "设置路线"页面点选导航点用
         │
         │  map_pipeline/generate_map_assets.py
         ▼
 web_assets/map/<name>/
-    elevation.npy          逐格可站立高度 (float32, NaN=不可站立)
-    occupancy.npy          占据栅格 (0不可站立 / 1可通行 / 2障碍)
-    topview.png            俯视图 (两色平面图 + 楼梯按抬升着色)
-    topview_standable.png  可站立区提示层
-    topview_safety.png     安全边距提示层
-    overlaps.json          自检: 同一格存在多个可站立高度 (非空 = 单值表示已不够用)
-    pointcloud.bin         降采样点云 (自定义 PCW1 格式), 供前端 3D 预览
-    topview_meta.json      坐标元数据 + 高程统计
+    topview.png             2D 占据栅格图转成的展示用 PNG
+    pointcloud.bin          降采样点云 (自定义 PCW1 格式), 供前端 3D 预览
+    pointcloud_meta.json    点数/降采样体素/分片清单等
+    topview_meta.json       坐标元数据(世界边界 + 2D 栅格图的分辨率/像素尺寸);
+                            这个文件是否存在就是 MapStatus.READY 的判定依据
 ```
 
-地图的原始数据（`dense_cloud_map.pcd` / `keyframe_info_3d.txt`）不归 navibot 管，留在用户自己的存储路径下；"导入地图"只是往 `data/maps.db` 里记一笔名字和路径，不拷贝文件。删除地图只删数据库这一行和 `web_assets/map/<name>/` 下自己生成的预处理产物，不会碰存储路径下的原始文件。
+地图目录名就是地图名，四个源文件齐了才会出现在地图列表里（少任何一个都视为不存在）。删除地图会把 `map-data-dir/<name>/` 下的原始数据和 `web_assets/map/<name>/` 下自己生成的预处理产物一起删掉，不可恢复。
 
 ---
 
@@ -70,11 +70,13 @@ web_assets/map/<name>/
 > ```
 
 ```bash
-# 1. 准备一份地图数据, 目录里要有 3d_map/ 子目录 (带楼梯的图 keyframe_info_3d.txt 必须有)
-#   /path/to/myroom/3d_map/dense_cloud_map.pcd
-#   /path/to/myroom/3d_map/keyframe_info_3d.txt
-# 然后在网页"地图管理"里点"导入地图", 名称填 myroom, 存储路径填 /path/to/myroom
-# (只是往 data/maps.db 记一笔账, 不拷贝文件)
+# 1. 把地图数据放进 map-data-dir (默认 /home/lisi/Documents/map-data, 可用
+#    NAVIBOT_MAP_DATA_DIR 覆盖), 目录名就是地图名, 要有下面 4 个文件才会出现
+#    在网页"地图管理"的列表里:
+#   map-data-dir/myroom/3d_map/dense_cloud_map.pcd
+#   map-data-dir/myroom/3d_map/keyframe_info_3d.txt
+#   map-data-dir/myroom/2d_map/map_2d.pgm
+#   map-data-dir/myroom/2d_map/map_2d.yaml
 
 # 2. 预处理 (也可以在网页的"地图管理"里点按钮触发)
 mamba run -n ros_host python map_pipeline/generate_map_assets.py \

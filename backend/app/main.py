@@ -13,7 +13,7 @@ from . import config
 from .map_registry import MapRegistry
 from .models import (
     GroundZRequest, GroundZResponse,
-    MapImportRequest, MapInfo, NavStatus,
+    MapInfo, NavStatus,
     InflationMapRequest,
     RouteCreateRequest, RouteInfo, RouteRequest,
     SelfInflationRequest,
@@ -182,15 +182,9 @@ async def map_ground(name: str, req: GroundZRequest):
 
 @app.get("/api/maps", response_model=List[MapInfo])
 async def list_maps():
+    """地图列表来自扫 config.MAP_DATA_DIR (见 map_registry.py), 没有单独的导入
+    接口——把符合固定目录结构的地图数据放进这个目录就会自动出现在列表里。"""
     return await run_in_threadpool(map_registry.list_maps)
-
-
-@app.post("/api/maps", response_model=MapInfo)
-async def import_map(req: MapImportRequest):
-    try:
-        return await run_in_threadpool(map_registry.import_map, req.name, req.storage_path)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
 
 
 @app.get("/api/maps/{name}", response_model=MapInfo)

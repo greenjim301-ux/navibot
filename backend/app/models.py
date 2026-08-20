@@ -102,27 +102,21 @@ class GroundZRequest(BaseModel):
 
 
 class GroundZResponse(BaseModel):
-    """每个点的地面高程 (可站立高度), null = 该点附近没有可信高程。
+    """每个点附近建图轨迹的高度 (地面高程近似), null = 该点附近没有轨迹经过。
 
     给 3D 预览用: 途经点标记要画在各自的实际高度上, 否则楼上楼下的点会挤在
-    同一个平面里。前端自己算不了 —— 高程在 elevation.npy 里, 只有后端能查。
+    同一个平面里。前端自己算不了 —— 建图轨迹 (keyframe_info_3d.txt) 只有后端能查,
+    见 path_planner.py。
     """
     z: List[Optional[float]] = []
-
-
-class MapImportRequest(BaseModel):
-    name: str
-    """地图名, 会拼进 web_assets/map/<name>/ 这样的路径, 不能有 '/' 等字符。"""
-    storage_path: str
-    """存储路径, 其下应有 3d_map/dense_cloud_map.pcd + 3d_map/keyframe_info_3d.txt。
-    例如实际文件在 /home/cat/map-1/3d_map/dense_cloud_map.pcd, 这里填
-    /home/cat/map-1。"""
 
 
 class MapInfo(BaseModel):
     name: str
     status: MapStatus
     storage_path: str
+    """map-data-dir/<name>/ 的绝对路径 (见 backend/app/config.py 的 MAP_DATA_DIR), 由
+    地图名直接算出来, 不再是导入时用户填的任意路径。"""
     error_message: Optional[str] = None
     topview_meta: Optional[dict] = None
     pointcloud_meta: Optional[dict] = None

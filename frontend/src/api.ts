@@ -72,20 +72,11 @@ export async function setSurfCloud(enabled: boolean): Promise<{ enabled: boolean
   );
 }
 
+/** 地图列表来自后端扫 map-data-dir (见 backend/app/config.py 的 MAP_DATA_DIR),
+ *  没有单独的导入接口——把符合固定目录结构的地图数据放进那个目录, 刷新这个
+ *  列表就能看到。 */
 export async function listMaps(): Promise<MapInfo[]> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/maps`));
-}
-
-/** 导入地图: 只是往地图表里记一笔"名字 -> 存储路径", 不拷贝文件, 也不会自动
- *  触发预处理。storagePath 下应有 3d_map/dense_cloud_map.pcd。 */
-export async function importMap(name: string, storagePath: string): Promise<MapInfo> {
-  return asJson(
-    await fetch(`${BACKEND_HTTP}/api/maps`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, storage_path: storagePath }),
-    }),
-  );
 }
 
 export async function getMap(name: string): Promise<MapInfo> {

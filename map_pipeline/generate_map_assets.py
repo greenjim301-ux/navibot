@@ -404,8 +404,8 @@ def main():
 
     print("[2/5] 生成 2D 俯视栅格图 (设置路线用)...")
     t_step = time.perf_counter()
-    # 跟 3d_map 同级的 2d_map/ 目录, 是 map_registry.py 导入地图时约定的存储
-    # 布局(见 backend/app/config.py 的 MAP_SOURCE_SUBDIR 注释), 这里直接从
+    # 跟 3d_map 同级的 2d_map/ 目录, 是 map-data-dir/<name>/ 的固定目录结构
+    # (见 backend/app/config.py 的 MAP_DATA_DIR 注释), 这里直接从
     # --input(3d_map/dense_cloud_map.pcd)反推兄弟目录, 不用额外加命令行参数。
     # 不是每份地图都有这个源图(比如只导了点云没导 2D 栅格图的旧地图), 没有
     # 就跳过, topview_meta.json 里不写 topview2d 字段, 前端得处理"没有"这种
