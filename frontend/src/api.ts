@@ -121,9 +121,9 @@ export async function deleteRoute(id: string): Promise<void> {
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
 }
 
-/** 批量查地面高程 (可站立高度)。null = 该点附近没有可信高程。
- *  3D 预览把途经点画在各自实际高度上要用 —— 高程在后端的 elevation.npy 里,
- *  前端自己算不了。 */
+/** 批量查地面高程 (附近建图轨迹的高度近似)。null = 该点附近没有轨迹经过。
+ *  3D 预览把途经点画在各自实际高度上要用 —— 建图轨迹只有后端能查, 前端自己
+ *  算不了。 */
 export async function groundZ(
   mapName: string,
   points: { x: number; y: number }[],

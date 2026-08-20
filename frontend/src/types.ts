@@ -115,17 +115,6 @@ export interface TopviewMeta {
   /** 没有 2D 栅格图源(旧地图 / 只导了点云没导 2d_map)的地图这里是
    *  null/undefined, 前端得处理"没有"的情况, 不能假设总存在。 */
   topview2d?: Topview2D | null;
-  /** 只有带建图轨迹、能提取出高程面的地图才有 */
-  elevation?: {
-    resolution_m_per_cell: number;
-    width: number;
-    height: number;
-    /** 实测的 odom 离地高度, 导航点 z = 地面高程 + 这个值 + z_offset */
-    delta_sensor_m: number;
-    band_m: [number, number];
-    overlap_cells: number;
-    stats: Record<string, unknown>;
-  };
 }
 
 /** 大地图分片清单(见 map_pipeline/generate_map_assets.py 的 export_tiles),

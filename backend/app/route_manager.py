@@ -116,20 +116,17 @@ class RouteManager:
             return self._surf_cloud_payload_locked()
 
     # ---- 指令 ----
-    # 运行时实测 Δ 和建图时那个差超过这么多就告警 —— 多半是外参改了
-    DELTA_MISMATCH_WARN_M = 0.10
-
     def _odom_delta(self, map_name: Optional[str], pose: Optional[Pose]) -> Optional[float]:
-        """实测"odom 离地高度" = 机器狗当前 odom z - 它脚下的地面高程。
+        """机器狗当前 odom.z 与它脚下建图轨迹高度的差值(标定偏移量)。
 
-        为什么不能直接用预处理存下来的 delta_sensor_m: 那个是从**建图轨迹**
-        (HandBot-S1 自己的位姿)量出来的, 而运行时的 odom 是
-        /hand_lio/odom_vehicle = world_T_imu · imu_T_lidar · lidar_T_body,
-        中间还隔着两次外参变换。给 lidar_t_body 填上实测的 -0.24m 之后, 运行时
-        odom 的 z 基准整体降了约 0.196m, 建图轨迹却纹丝不动 —— 继续用建图那个值
-        会让下发的 z 系统性偏高约 0.2m, 而 planner 途中点提前切换的半径只有 0.3m。
+        这个值同时吸收了两件事: (1) 建图设备的传感器离地高度, (2) 建图轨迹的 z
+        基准和运行时 /hand_lio/odom_vehicle 的 z 基准之间的差异(imu_T_lidar /
+        lidar_T_body 外参不同导致, 实测约 0.2m)。用这个偏移去修正其它途经点的
+        轨迹高度时, 这两个常数会在"目标点高度 + Δ"里自动抵消/合并, 不需要分别
+        估计, 也不需要在预处理阶段用点云单独去量——推导见 path_planner.py 模块
+        docstring。
 
-        现场量就没这个问题: 无论外参怎么改、以后换什么硬件, 这个差值都自动对上。
+        机器狗当前位置附近没有建图轨迹经过(还没走到这张图覆盖的区域)时返回 None。
         """
         if not map_name or pose is None:
             return None
@@ -152,16 +149,16 @@ class RouteManager:
             logger.info(
                 "  机器狗当前: x=%.3f y=%.3f z=%.3f yaw=%.1f°  脚下地面=%s  定位cov=%.3f%s",
                 pose.x, pose.y, pose.z, math.degrees(pose.yaw),
-                f"{ground:.3f}" if ground is not None else "未知(不在认证可站立区)",
+                f"{ground:.3f}" if ground is not None else "未知(附近无建图轨迹)",
                 pose.cov, "  【定位失败!】" if pose.cov >= config.POSE_COV_BAD else "",
             )
         for i, (wp, a) in enumerate(zip(waypoints, alts), 1):
             if a.ground is not None and a.delta is not None:
-                how = f"地面{a.ground:+.3f} + Δ{a.delta:+.3f}" + (f" + 微调{wp.z_offset:+.3f}" if wp.z_offset else "")
+                how = f"轨迹{a.ground:+.3f} + Δ{a.delta:+.3f}" + (f" + 微调{wp.z_offset:+.3f}" if wp.z_offset else "")
             elif pose is not None:
-                how = "无高程数据, 退回当前 odom 高度"
+                how = "附近无建图轨迹, 退回当前 odom 高度"
             else:
-                how = "无高程数据, 也没收到过位姿, 按 0 兜底"
+                how = "附近无建图轨迹, 也没收到过位姿, 按 0 兜底"
             dist = (math.dist((pose.x, pose.y, pose.z), (wp.x, wp.y, a.z)) if pose else float("nan"))
             # planNextWaypoint() 的重合点判据(不是到达判据): 只有跟机器狗当前位置
             # 几乎重合(<5cm)才会被跳过, 标出来
@@ -173,31 +170,22 @@ class RouteManager:
                             pose: Optional[Pose]) -> List["_Altitude"]:
         """给每个途经点算下发用的 z (odom 系机体高度)。
 
-        z = 该点地面高程 + Δ + z_offset。Δ 优先用运行时实测值(见 _odom_delta),
-        机器狗不在认证可站立区上时才退回建图时量的 delta_sensor_m。
+        z = 该点附近建图轨迹的高度 + Δ(机器狗当前位置的标定偏移, 见 _odom_delta)
+        + z_offset。地面高度来自 path_planner.ground_elevation, 数据源是建图
+        轨迹(不再是点云预处理出的高程面, 见该模块 docstring 里的说明和推导)。
 
-        地图完全没有高程数据(旧版资产/没有建图轨迹)时, 退回机器狗当前的 odom z
-        —— 单层平面图上这恰好是对的, 因为目标高度就等于它现在所处的高度。
-        连位姿都还没收到(刚打开页面/还没连上狗)时, 没有任何现场数据可退, 按 0
-        兜底(odom 系原点高度, 对单层平面图场景是合理默认) —— 只是让"设置路线"
+        机器狗当前位置附近没有建图轨迹经过(算不出 Δ)、或者该途经点附近没有建图
+        轨迹经过时, 退回机器狗当前的 odom z —— 单层平面图上这恰好是对的, 因为
+        目标高度就等于它现在所处的高度。连位姿都还没收到(刚打开页面/还没连上狗)
+        时, 没有任何现场数据可退, 按 0 兜底(odom 系原点高度) —— 只是让"设置路线"
         不必因为还没收到过一次位姿就直接报错, 不是说这个 0 一定精确; 等真的收到
         位姿后再提交, 就会退回上面那条更准的 fallback。
         """
         delta = self._odom_delta(map_name, pose)
-        mapped = path_planner.mapping_delta(map_name) if map_name else None
-        if delta is None:
-            delta = mapped
-            if delta is not None:
-                logger.warning("机器狗不在认证可站立区上, Δ 退回建图值 %.3f (可能偏)", delta)
-        elif mapped is not None and abs(delta - mapped) > self.DELTA_MISMATCH_WARN_M:
-            logger.warning(
-                "实测 Δ=%.3f 与建图 Δ=%.3f 差 %.3fm。建图设备位姿和运行时 odom 不是"
-                "同一个基准(hand-lio 的 lidar_t_body/imu_t_lidar 外参), 已按实测值下发",
-                delta, mapped, delta - mapped,
-            )
-
         if pose is None:
             logger.warning("还没收到机器狗位姿, 高度按 0 兜底(+ z_offset)下发")
+        elif delta is None and map_name:
+            logger.warning("机器狗当前位置附近无建图轨迹, 高度退回当前 odom 高度下发")
 
         out: List[_Altitude] = []
         for wp in waypoints:
