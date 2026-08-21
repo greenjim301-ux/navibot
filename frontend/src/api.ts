@@ -1,4 +1,4 @@
-import type { MapInfo, NavStatus, SavedRoute, Waypoint } from "./types";
+import type { MapInfo, NavStatus, Waypoint } from "./types";
 
 export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "http://localhost:8000";
 export const BACKEND_WS = import.meta.env.VITE_BACKEND_WS ?? "ws://localhost:8000";
@@ -93,32 +93,6 @@ export async function deleteMap(name: string): Promise<void> {
     const body = await res.text();
     throw new Error(`${res.status} ${body}`);
   }
-}
-
-// ---- 已保存的路线 ----
-
-export async function listRoutes(mapName?: string): Promise<SavedRoute[]> {
-  const q = mapName ? `?map_name=${encodeURIComponent(mapName)}` : "";
-  return asJson(await fetch(`${BACKEND_HTTP}/api/routes${q}`));
-}
-
-export async function getRoute(id: string): Promise<SavedRoute> {
-  return asJson(await fetch(`${BACKEND_HTTP}/api/routes/${encodeURIComponent(id)}`));
-}
-
-export async function createRoute(name: string, mapName: string, waypoints: Waypoint[]): Promise<SavedRoute> {
-  return asJson(
-    await fetch(`${BACKEND_HTTP}/api/routes`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, map_name: mapName, waypoints }),
-    }),
-  );
-}
-
-export async function deleteRoute(id: string): Promise<void> {
-  const res = await fetch(`${BACKEND_HTTP}/api/routes/${encodeURIComponent(id)}`, { method: "DELETE" });
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
 }
 
 /** 批量查地面高程 (附近建图轨迹的高度近似)。null = 该点附近没有轨迹经过。

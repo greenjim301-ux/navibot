@@ -1,8 +1,15 @@
 import { useEffect, useState } from "react";
 import { Outlet } from "react-router-dom";
+import { Diamond } from "lucide-react";
 import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
 import { AppSidebar } from "./AppSidebar";
+
+const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+function pad2(n: number): string {
+  return n.toString().padStart(2, "0");
+}
 
 function LiveClock() {
   const [now, setNow] = useState(() => new Date());
@@ -10,9 +17,14 @@ function LiveClock() {
     const timer = window.setInterval(() => setNow(new Date()), 1000);
     return () => window.clearInterval(timer);
   }, []);
+  const date = `${now.getFullYear()}.${pad2(now.getMonth() + 1)}.${pad2(now.getDate())}`;
+  const time = `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
   return (
-    <span className="font-mono text-[11px] text-muted-foreground">
-      {now.toLocaleDateString("zh-CN")} {now.toLocaleTimeString("zh-CN", { hour12: false })}
+    <span className="flex items-center gap-2 text-[13px]">
+      <span className="text-muted-foreground">
+        {date} {WEEKDAYS[now.getDay()]}
+      </span>
+      <span className="font-mono font-bold tracking-wide text-foreground">{time}</span>
     </span>
   );
 }
@@ -27,8 +39,17 @@ export function Layout() {
         <header className="flex h-14 shrink-0 items-center gap-2 border-b bg-card px-4">
           <SidebarTrigger />
           <Separator orientation="vertical" className="h-4" />
-          <span className="text-sm text-muted-foreground">机器狗导航控制台</span>
-          <div className="ml-auto">
+          <nav className="text-xs text-muted-foreground">
+            控制台　/　地图管理
+          </nav>
+          <div className="ml-auto flex items-center gap-4">
+            <div className="flex items-center gap-1.5 text-xs font-medium text-[#477197]">
+              <span className="grid size-[21px] shrink-0 place-items-center rounded-full border border-[#b9cde0] bg-[#f5f9fd] text-[#397bb8]">
+                <Diamond className="size-3" />
+              </span>
+              具身智能驾驶舱
+            </div>
+            <Separator orientation="vertical" className="h-4" />
             <LiveClock />
           </div>
         </header>

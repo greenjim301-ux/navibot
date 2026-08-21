@@ -36,8 +36,18 @@ interface Props {
    *  降采样点云(每帧整体替换, 不叠加历史帧), 只在页面上的勾选框打开时后端才会
    *  有数据。 */
   surfCloud?: number[] | null;
-  /** 是否提供"镜头跟随机器狗"开关 (预览页没有实时位姿, 不需要) */
+  /** 是否支持"镜头跟随机器狗": 决定 updateFollow() 有没有意义(还得看
+   *  status.robot_pose 有没有值), 跟下面 showFollowButton 是两件事——这个控制
+   *  能力, 那个只控制"要不要画组件自带的那颗按钮"。 */
   enableFollow?: boolean;
+  /** 组件自己要不要画那颗固定在右上角的"跟随机器狗"按钮。默认 true(跟以前
+   *  行为一样, NavigatePage 用的就是这颗)。传 false 时按钮不画, 但 toggleFollow
+   *  handle 和 onFollowingChange 回调照样有效——地图预览页把它放进右侧面板的
+   *  "视角"栏, 自己画按钮, 不要组件内置这颗跟已有面板重复。 */
+  showFollowButton?: boolean;
+  /** 跟随状态变化时回调(手动切换 / 外部通过 handle.toggleFollow() 切换都会触发),
+   *  给外部自己画的按钮同步高亮状态用, 用法跟 onRecenterModeChange 一样。 */
+  onFollowingChange?: (following: boolean) => void;
   /** 高度限制(世界系绝对 z, 米): 只渲染 z <= heightLimit 的点, 用 GPU 裁剪平面
    *  实现, 不重建几何体。不传则不裁剪。 */
   heightLimit?: number;
@@ -50,6 +60,17 @@ interface Props {
    *  开关状态变化(手动切换 / 点选成功 / resetView 顺带取消)时回调一次, 给外部
    *  按钮同步高亮状态用。 */
   onRecenterModeChange?: (active: boolean) => void;
+  /** "设置路线"模式是否开启: 开启后鼠标变十字光标, 左键点点云上一点(按下/
+   *  抬起间几乎没有移动)加一个途经点(朝向按"上一个途经点 -> 新点"算, 策略
+   *  跟 TopView.handleClick 一致), 右键点已有途经点的标记删掉它——都是通过
+   *  onChangeWaypoints 报回全量新数组。是个纯 prop(不是 toggleRecenter 那种
+   *  imperative 开关), 跟"点选新中心点"是否同时互斥由外面调用方自己保证
+   *  (地图预览页的做法: 两个按钮互斥禁用), 这里不做强制。 */
+  routeEditMode?: boolean;
+  /** routeEditMode 为 true 时, 途经点数组变化(新增/删除各触发一次)的回调,
+   *  语义跟 TopView 的 onChangeWaypoints 完全一致: 每次给全量新数组, 这里
+   *  不维护内部状态, 由页面自己存。 */
+  onChangeWaypoints?: (wps: Waypoint[]) => void;
 }
 
 export interface PointCloudViewHandle {
@@ -60,6 +81,10 @@ export interface PointCloudViewHandle {
   toggleRecenter(): void;
   /** 恢复挂载时的默认视角: 相机位置/朝向和旋转中心(controls.target)全部复位。 */
   resetView(): void;
+  /** 切换"镜头跟随机器狗"。没有 status.robot_pose 时切了也不会真的动
+   *  (updateFollow 里 !robot 直接跳过), 外部按钮自己根据有没有位姿决定要不要
+   *  disabled。 */
+  toggleFollow(): void;
 }
 
 // 解析 map_pipeline/generate_map_assets.py 导出的 PCW1 自定义二进制格式:
@@ -111,7 +136,9 @@ function createWaypointLabelSprite(text: string): THREE.Sprite {
 export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function PointCloudView({
   mapName, meta, pointcloudMeta = null, waypoints = [], status = null, trail = null,
   optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, enableFollow = false,
+  showFollowButton = true, onFollowingChange,
   heightLimit, controlMode = "orbit", onRecenterModeChange,
+  routeEditMode = false, onChangeWaypoints,
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   // toggleRecenter/resetView 的实际实现绑定着某一套 camera/controls, 每次挂载
@@ -122,12 +149,31 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   useImperativeHandle(ref, () => ({
     toggleRecenter: () => toggleRecenterRef.current(),
     resetView: () => resetViewRef.current(),
+    toggleFollow: () => setFollowing((v) => !v),
   }), []);
-  // onRecenterModeChange 是外部传的回调, 引用可能每次渲染都变(调用方没包
-  // useCallback 的话), 用 ref 存最新值, 挂载 effect 就不用把它放进依赖数组
-  // (放进去的话回调一变整个 three.js 场景都要重建, 没必要)。
+  // onRecenterModeChange/onChangeWaypoints 是外部传的回调, 引用可能每次渲染
+  // 都变(调用方没包 useCallback 的话), 用 ref 存最新值, 挂载 effect 就不用
+  // 把它们放进依赖数组(放进去的话回调一变整个 three.js 场景都要重建, 没必要)。
   const onRecenterModeChangeRef = useRef(onRecenterModeChange);
   onRecenterModeChangeRef.current = onRecenterModeChange;
+  const onChangeWaypointsRef = useRef(onChangeWaypoints);
+  onChangeWaypointsRef.current = onChangeWaypoints;
+  // 点击加点时要按"上一个途经点 -> 新点"算朝向(跟 TopView.handleClick 完全
+  // 一致的策略), 需要拿到当前最新的 waypoints——它是 props, 挂载 effect 不会
+  // 因为它变化重跑, 用 ref 存最新值。
+  const waypointsRef = useRef(waypoints);
+  waypointsRef.current = waypoints;
+  // routeEditMode 是纯 prop(不像 recenterMode 是挂载 effect 里的内部开关),
+  // 点击处理逻辑跟 recenterMode 一起在挂载 effect 里注册, 需要用 ref 拿到
+  // 最新值(挂载 effect 本身不因这个 prop 变化重跑)。
+  const routeEditModeRef = useRef(routeEditMode);
+  routeEditModeRef.current = routeEditMode;
+  // 挂载 effect 里创建的 canvas dom, 给下面那个单独的"同步光标样式"effect 用
+  // (routeEditMode 变化时要更新光标, 但这个变化不该触发整个场景重建)。
+  const domElementRef = useRef<HTMLElement | null>(null);
+  // recenterMode 是挂载 effect 内部的闭包变量, 通过这个 ref 镜像出来, 好让
+  // 下面那个光标同步 effect 知道"要不要保留 recenter 那份 crosshair"。
+  const recenterModeRef = useRef(false);
   // 裁剪平面 normal=(0,0,-1): distanceToPoint = constant - z, >=0 保留(z<=constant)、
   // <0 裁掉, 直接就是世界系里 z = heightLimit 这个水平面(点云本身不会转, 不需要
   // 像以前"6 个按钮转点云"那套设计一样每次旋转都重新投影)。
@@ -163,6 +209,14 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // 渲染循环里要读这两个值, 用 ref 拿最新值, 避免它们变化就重建整个场景
   const followingRef = useRef(following);
   followingRef.current = following;
+  // onFollowingChange 用法跟 onRecenterModeChangeRef 一样: 存最新回调引用,
+  // 不放进下面这个 effect 的依赖数组(调用方没包 useCallback 的话每次渲染都
+  // 是新函数引用, 放依赖里会导致这个 effect 每次渲染都触发)。
+  const onFollowingChangeRef = useRef(onFollowingChange);
+  onFollowingChangeRef.current = onFollowingChange;
+  useEffect(() => {
+    onFollowingChangeRef.current?.(following);
+  }, [following]);
   const robotPosRef = useRef<{ x: number; y: number } | null>(null);
   robotPosRef.current = status?.robot_pose
     ? { x: status.robot_pose.x, y: status.robot_pose.y }
@@ -232,6 +286,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.localClippingEnabled = true;
     container.appendChild(renderer.domElement);
+    domElementRef.current = renderer.domElement;
 
     // 上不让转到正上方(极点会退化打转), 下不让转到地平线以下(钻到地板底下看没意义)。
     const MIN_POLAR = 0.08;
@@ -286,11 +341,19 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // "点选新中心点"模式的开关状态, 纯闭包变量就够了(跟 controls/camera 绑在
     // 同一套场景上, 不需要跨 effect 重跑保留)。实际的点击拾取逻辑在下面
     // (需要先拿到 loadedTiles 才能把分片也纳入可点选范围), 这里先放
-    // setRecenterMode, resetView 需要用它来"顺便取消"。
+    // setRecenterMode, resetView 需要用它来"顺便取消"。光标要同时考虑
+    // routeEditMode(纯 prop, 通过 routeEditModeRef 读最新值)——这两个模式的
+    // 互斥由调用方(地图预览页)保证, 这里只是"两个只要有一个开着就要显示
+    // crosshair", 不做互斥判断。
     let recenterMode = false;
+    function syncCursor() {
+      renderer.domElement.style.cursor = (recenterMode || routeEditModeRef.current) ? "crosshair" : "";
+    }
+    syncCursor(); // 挂载时 routeEditMode 这个 prop 可能已经是 true(比如切完 2D 又切回 3D)
     function setRecenterMode(active: boolean) {
       recenterMode = active;
-      renderer.domElement.style.cursor = active ? "crosshair" : "";
+      recenterModeRef.current = active;
+      syncCursor();
       onRecenterModeChangeRef.current?.(active);
     }
     resetViewRef.current = () => {
@@ -510,7 +573,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     const raycaster = new THREE.Raycaster();
     raycaster.params.Points = { threshold: 0 };
     const pointerNdc = new THREE.Vector2();
-    let pointerDownPos: { x: number; y: number } | null = null;
+    let pointerDownPos: { x: number; y: number; button: number } | null = null;
     const CLICK_MOVE_THRESHOLD_PX = 5;
 
     toggleRecenterRef.current = () => {
@@ -518,18 +581,63 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     };
 
     function handlePointerDown(e: PointerEvent) {
-      pointerDownPos = { x: e.clientX, y: e.clientY };
+      pointerDownPos = { x: e.clientX, y: e.clientY, button: e.button };
+    }
+
+    // "设置路线": routeEditMode(prop)开着的时候, 左键点点云上一点加一个途经点
+    // (朝向按"上一个途经点 -> 新点"算, 跟 TopView.handleClick 完全一致的策略),
+    // 右键点已有途经点的标记(小球/编号, 见上面 markersGroupRef 那个 effect 打
+    // 的 userData.waypointIndex)删掉它——都是把全量新数组报给
+    // onChangeWaypoints, 不在这里维护状态。跟"点选新中心点"不一样的是不会点
+    // 一下就自动退出模式, 要连续加好几个点才符合"画路线"的直觉, 退出靠调用方
+    // 把 routeEditMode 这个 prop 改回 false(地图预览页对应"设置完成"按钮)。
+    function handleRouteEditClick(e: PointerEvent, ndcX: number, ndcY: number) {
+      pointerNdc.set(ndcX, ndcY);
+      raycaster.setFromCamera(pointerNdc, camera);
+
+      if (e.button === 0) {
+        const camDist = camera.position.distanceTo(controls.target);
+        const rect = renderer.domElement.getBoundingClientRect();
+        const worldPerPixel = (2 * camDist * Math.tan((FOV / 2) * Math.PI / 180)) / rect.height;
+        raycaster.params.Points!.threshold = worldPerPixel * 12;
+        const pickable: THREE.Points[] = [];
+        if (points) pickable.push(points);
+        loadedTiles.forEach((tp) => pickable.push(tp));
+        const hits = raycaster.intersectObjects(pickable, false);
+        if (hits.length === 0) return;
+        const { x, y } = hits[0].point;
+        const list = waypointsRef.current;
+        const prev = list[list.length - 1];
+        const yaw = prev ? Math.atan2(y - prev.y, x - prev.x) : 0;
+        onChangeWaypointsRef.current?.([...list, { x, y, yaw }]);
+      } else if (e.button === 2) {
+        const group = markersGroupRef.current;
+        if (!group) return;
+        const hits = raycaster.intersectObjects(group.children, false);
+        const idx = hits.length > 0 ? (hits[0].object.userData.waypointIndex as number | undefined) : undefined;
+        if (idx == null) return;
+        onChangeWaypointsRef.current?.(waypointsRef.current.filter((_, i) => i !== idx));
+      }
+      needsRenderRef.current = true;
     }
 
     function handlePointerUp(e: PointerEvent) {
       const down = pointerDownPos;
       pointerDownPos = null;
-      if (!recenterMode || !down) return;
+      if (!down) return;
       if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > CLICK_MOVE_THRESHOLD_PX) return;
 
       const rect = renderer.domElement.getBoundingClientRect();
-      pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      if (routeEditModeRef.current) {
+        handleRouteEditClick(e, ndcX, ndcY);
+        return;
+      }
+      if (!recenterMode) return;
+
+      pointerNdc.set(ndcX, ndcY);
 
       // 拾取容差要按当前缩放距离换算成世界单位, 不能给固定值: 光线投射的
       // threshold 是世界坐标半径, 不会像点的渲染尺寸(POINT_PIXEL_SIZE, 屏幕
@@ -631,6 +739,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       });
       renderer.dispose();
       container.removeChild(renderer.domElement);
+      domElementRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meta, mapName, pointcloudMeta]);
@@ -641,6 +750,16 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     heightPlaneRef.current.constant = heightLimit == null ? Infinity : heightLimit;
     needsRenderRef.current = true;
   }, [heightLimit]);
+
+  // routeEditMode 是纯 prop, 变化时不需要(也不应该)重建整个场景, 只更新一下
+  // 光标样式——跟 recenterMode 那份共享同一条"谁开着就显示 crosshair"的判断
+  // (见挂载 effect 里的 syncCursor), 这里补的是"recenterMode 没变但 routeEditMode
+  // 变了"这种情况, 挂载 effect 内部不会自动重跑去更新光标。
+  useEffect(() => {
+    const el = domElementRef.current;
+    if (!el) return;
+    el.style.cursor = (recenterModeRef.current || routeEditMode) ? "crosshair" : "";
+  }, [routeEditMode]);
 
   // 途经点标记 (地面高度附近的小球), waypoints 变化时更新
   useEffect(() => {
@@ -666,12 +785,16 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       // 位置还是对得上, 不代表真实地面。
       const ground = waypointZ[idx] ?? status?.robot_pose?.z ?? 0;
       mesh.position.set(wp.x, wp.y, ground + 0.1);
+      // "设置路线"模式下右键删点要靠这个反查是哪个途经点, 见下面 handlePointerUp
+      // 里 routeEditMode 分支——标记整体是每次全量重建的, 不需要额外维护映射表。
+      mesh.userData.waypointIndex = idx;
       group.add(mesh);
 
       // 编号浮在小球正上方(+Z): 默认视角是俯视, 不管水平方向怎么转, "上方"
       // 都读得出来是"上方", 不会像水平偏移那样随相机角度改变相对位置。
       const label = createWaypointLabelSprite(String(idx + 1));
       label.position.set(wp.x, wp.y, ground + 0.1 + 0.3);
+      label.userData.waypointIndex = idx;
       group.add(label);
     });
   }, [waypoints, waypointZ, status, meta.world_bounds.z_min]);
@@ -922,7 +1045,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
-      {enableFollow && (
+      {enableFollow && showFollowButton && (
         <button
           type="button"
           onClick={() => setFollowing((v) => !v)}

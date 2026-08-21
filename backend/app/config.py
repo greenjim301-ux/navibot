@@ -146,9 +146,6 @@ HANDBOT_SLAM_LOC_CONFIG_FILE = os.environ.get(
     "/home/cat/handbot_slam/catkin_ws_grslam/src/grslam/params/3DSLAM_mid360_loc.yaml",
 )
 
-# 已保存路线 (用户画好命名保存的途经点序列)
-ROUTES_FILE = os.environ.get("NAVIBOT_ROUTES_FILE", os.path.join(REPO_ROOT, "data", "routes.json"))
-
 PIPELINE_SCRIPT = os.environ.get(
     "NAVIBOT_PIPELINE_SCRIPT", os.path.join(_REPO_ROOT, "map_pipeline", "generate_map_assets.py"),
 )

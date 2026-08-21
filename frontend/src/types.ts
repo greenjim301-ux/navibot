@@ -71,14 +71,6 @@ export interface SelfInflationMarker {
   a: number;
 }
 
-export interface SavedRoute {
-  id: string;
-  name: string;
-  map_name: string;
-  waypoints: Waypoint[];
-  created_at: number;
-}
-
 export type MapStatus = "not_processed" | "processing" | "ready" | "error";
 
 export interface MapInfo {
@@ -90,6 +82,8 @@ export interface MapInfo {
   error_message: string | null;
   topview_meta: TopviewMeta | null;
   pointcloud_meta: PointcloudMeta | null;
+  /** 3d_map/dense_cloud_map.pcd 的原始文件大小(字节), 跟是否已预处理无关 */
+  source_pcd_bytes: number | null;
   updated_at: number;
 }
 

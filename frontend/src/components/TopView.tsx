@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Stage, Layer, Image as KonvaImage, Circle, Line, Text, RegularPolygon, Group } from "react-konva";
 import useImage from "use-image";
 import type Konva from "konva";
@@ -17,6 +17,26 @@ interface Props {
   maxWidth?: number;
   /** 画布可视高度上限, 内容超出的部分靠拖拽/缩放查看, 不传则不限制高度 */
   maxHeight?: number;
+  /** 初始(以及点"重置"后)的缩放比例, 1 = 内容按 maxWidth 正好铺满画布宽度
+   *  (状态栏显示"100%")。不传则跟以前一样用 DEFAULT_ZOOM(0.7, 留点边距)。 */
+  defaultZoom?: number;
+  /** 是否画组件自带的缩放/旋转按钮(右上角)和状态文字(左下角)。默认 true,
+   *  跟以前行为一样。传 false 时这些不画, 但 ref 暴露的 zoomIn/zoomOut/
+   *  rotateBy/reset 依然可用——全屏预览页想把这些按钮挪到页面底部居中, 不要
+   *  组件自带这一份跟外面重复。 */
+  showControls?: boolean;
+  /** 缩放/旋转变化时回调(缩放按钮/滚轮/旋转按钮/reset 都会触发), 给外部自己
+   *  画的工具条同步显示用, 用法跟 PointCloudView 的 onRecenterModeChange 一样。 */
+  onViewChange?: (view: { zoomPercent: number; rotationDeg: number }) => void;
+}
+
+export interface TopViewHandle {
+  zoomIn(): void;
+  zoomOut(): void;
+  rotateCCW(): void;
+  rotateCW(): void;
+  /** 恢复初始视图: 缩放复位到 defaultZoom, 旋转复位到 0, 内容重新居中。 */
+  reset(): void;
 }
 
 const DEFAULT_MAX_STAGE_WIDTH = 900;
@@ -67,10 +87,11 @@ function centerOnOrigin(meta: Topview2D): Topview2D {
   };
 }
 
-export function TopView({
+export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
-  maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight,
-}: Props) {
+  maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight, defaultZoom = DEFAULT_ZOOM,
+  showControls = true, onViewChange,
+}, ref) {
   const [topviewImg] = useImage(mapAssetUrl(mapName, "topview.png"), "anonymous");
   const stageRef = useRef<Konva.Stage>(null);
   const contentGroupRef = useRef<Konva.Group>(null);
@@ -89,22 +110,31 @@ export function TopView({
   const viewportWidth = contentWidth;
   const viewportHeight = maxHeight ? Math.min(maxHeight, contentHeight) : contentHeight;
 
-  const [zoom, setZoom] = useState(DEFAULT_ZOOM);
+  const [zoom, setZoom] = useState(defaultZoom);
   const [rotation, setRotation] = useState(0);
   // 内容旋转的轴心: 整张地图内容(未缩放前的显示尺寸)的正中心
   const contentCenter = { x: contentWidth / 2, y: contentHeight / 2 };
 
+  // onViewChange 是外部传的回调, 引用可能每次渲染都变(调用方没包 useCallback
+  // 的话), 用 ref 存最新值——跟 PointCloudView 的 onRecenterModeChangeRef 是
+  // 同一个理由。
+  const onViewChangeRef = useRef(onViewChange);
+  onViewChangeRef.current = onViewChange;
+  useEffect(() => {
+    onViewChangeRef.current?.({ zoomPercent: Math.round(zoom * 100), rotationDeg: rotation });
+  }, [zoom, rotation]);
+
   function centerView() {
     const stage = stageRef.current;
     if (!stage) return;
-    stage.scale({ x: DEFAULT_ZOOM, y: DEFAULT_ZOOM });
+    stage.scale({ x: defaultZoom, y: defaultZoom });
     // 居中要按缩放后的实际占位算, 否则缩放不是 1 时会偏
     stage.position({
-      x: (viewportWidth - contentWidth * DEFAULT_ZOOM) / 2,
-      y: (viewportHeight - contentHeight * DEFAULT_ZOOM) / 2,
+      x: (viewportWidth - contentWidth * defaultZoom) / 2,
+      y: (viewportHeight - contentHeight * defaultZoom) / 2,
     });
     stage.batchDraw();
-    setZoom(DEFAULT_ZOOM);
+    setZoom(defaultZoom);
     setRotation(0);
   }
 
@@ -149,6 +179,14 @@ export function TopView({
     if (!stage) return;
     zoomAt(stage.scaleX() * factor, { x: viewportWidth / 2, y: viewportHeight / 2 });
   }
+
+  useImperativeHandle(ref, () => ({
+    zoomIn: () => zoomButton(ZOOM_STEP),
+    zoomOut: () => zoomButton(1 / ZOOM_STEP),
+    rotateCCW: () => rotateBy(-ROTATE_STEP_DEG),
+    rotateCW: () => rotateBy(ROTATE_STEP_DEG),
+    reset: () => centerView(),
+  }));
 
   // 原始俯视图图片在"以原点为中心"的大画布里的绘制偏移
   const imgOffset = useMemo(
@@ -210,7 +248,11 @@ export function TopView({
         }}
         onMouseLeave={() => setHover(null)}
         onContextMenu={(e) => e.evt.preventDefault()}
-        style={{ cursor: editable ? "crosshair" : "default", background: "#fafafa" }}
+        // #cdcdcd 是 ROS map_server pgm 里"未知"栅格的灰度值(见
+        // generate_map_assets.py export_topview_png 的注释: negate=0 时黑占据/
+        // 白空闲/灰未知), 图里大片留白区域就是这个颜色——画布背景跟它对齐,
+        // 图片边缘/画布没铺满的地方才不会露出一圈色差。
+        style={{ cursor: editable ? "crosshair" : "default", background: "#cdcdcd" }}
       >
         <Layer>
           <Group
@@ -323,23 +365,27 @@ export function TopView({
         </Layer>
       </Stage>
 
-      <div style={{ position: "absolute", top: 8, right: 8, display: "flex", flexDirection: "column", gap: 4 }}>
-        <button style={btnStyle} onClick={() => zoomButton(ZOOM_STEP)} title="放大">+</button>
-        <button style={btnStyle} onClick={() => zoomButton(1 / ZOOM_STEP)} title="缩小">−</button>
-        <button style={btnStyle} onClick={() => rotateBy(-ROTATE_STEP_DEG)} title="逆时针旋转">↺</button>
-        <button style={btnStyle} onClick={() => rotateBy(ROTATE_STEP_DEG)} title="顺时针旋转">↻</button>
-        <button style={{ ...btnStyle, fontSize: 11 }} onClick={centerView} title="重置视图(缩放/平移/旋转)">
-          重置
-        </button>
-      </div>
-      <div
-        style={{
-          position: "absolute", bottom: 6, left: 8, fontSize: 11, color: "#6b7280",
-          background: "rgba(255,255,255,0.8)", padding: "1px 5px", borderRadius: 3,
-        }}
-      >
-        {Math.round(zoom * 100)}% · {rotation}° · 滚轮缩放 / 拖拽平移{editable ? " / 左键加点 · 右键删点" : ""}
-      </div>
+      {showControls && (
+        <>
+          <div style={{ position: "absolute", top: 8, right: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+            <button style={btnStyle} onClick={() => zoomButton(ZOOM_STEP)} title="放大">+</button>
+            <button style={btnStyle} onClick={() => zoomButton(1 / ZOOM_STEP)} title="缩小">−</button>
+            <button style={btnStyle} onClick={() => rotateBy(-ROTATE_STEP_DEG)} title="逆时针旋转">↺</button>
+            <button style={btnStyle} onClick={() => rotateBy(ROTATE_STEP_DEG)} title="顺时针旋转">↻</button>
+            <button style={{ ...btnStyle, fontSize: 11 }} onClick={centerView} title="重置视图(缩放/平移/旋转)">
+              重置
+            </button>
+          </div>
+          <div
+            style={{
+              position: "absolute", bottom: 6, left: 8, fontSize: 11, color: "#6b7280",
+              background: "rgba(255,255,255,0.8)", padding: "1px 5px", borderRadius: 3,
+            }}
+          >
+            {Math.round(zoom * 100)}% · {rotation}° · 滚轮缩放 / 拖拽平移{editable ? " / 左键加点 · 右键删点" : ""}
+          </div>
+        </>
+      )}
     </div>
   );
-}
+});

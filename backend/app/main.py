@@ -15,11 +15,10 @@ from .models import (
     GroundZRequest, GroundZResponse,
     MapInfo, NavStatus,
     InflationMapRequest,
-    RouteCreateRequest, RouteInfo, RouteRequest,
+    RouteRequest,
     SelfInflationRequest,
     SurfCloudRequest,
 )
-from .route_store import RouteStore
 from . import path_planner
 from .ros_bridge import RosBridge
 from .route_manager import RouteManager
@@ -75,7 +74,6 @@ ws_manager = WebSocketManager()
 route_manager: Optional[RouteManager] = None
 ros_bridge: Optional[RosBridge] = None
 map_registry = MapRegistry()
-route_store = RouteStore()
 
 
 @app.on_event("startup")
@@ -209,39 +207,6 @@ async def delete_map(name: str):
         await run_in_threadpool(map_registry.delete_map, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    # 地图没了, 挂在它下面的路线也就没意义了(途经点坐标只在那张地图里有效)
-    await run_in_threadpool(route_store.delete_routes_for_map, name)
-
-
-@app.get("/api/routes", response_model=List[RouteInfo])
-async def list_routes(map_name: Optional[str] = None):
-    return await run_in_threadpool(route_store.list_routes, map_name)
-
-
-@app.get("/api/routes/{route_id}", response_model=RouteInfo)
-async def get_route(route_id: str):
-    route = await run_in_threadpool(route_store.get_route, route_id)
-    if route is None:
-        raise HTTPException(404, f"路线 '{route_id}' 不存在")
-    return route
-
-
-@app.post("/api/routes", response_model=RouteInfo)
-async def create_route(req: RouteCreateRequest):
-    if await run_in_threadpool(map_registry.get_map_info, req.map_name) is None:
-        raise HTTPException(400, f"地图 '{req.map_name}' 不存在")
-    try:
-        return await run_in_threadpool(
-            route_store.create_route, req.name, req.map_name, req.waypoints
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-@app.delete("/api/routes/{route_id}", status_code=204)
-async def delete_route(route_id: str):
-    if not await run_in_threadpool(route_store.delete_route, route_id):
-        raise HTTPException(404, f"路线 '{route_id}' 不存在")
 
 
 @app.websocket("/ws/nav")

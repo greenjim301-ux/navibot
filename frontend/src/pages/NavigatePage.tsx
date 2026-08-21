@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { MapPin, Play, Eraser, Trash2, TriangleAlert, OctagonX } from "lucide-react";
-import { estop, getRoute, setInflationMap, setSelfInflation, setSurfCloud, submitRoute } from "../api";
+import { estop, setInflationMap, setSelfInflation, setSurfCloud, submitRoute } from "../api";
 import { useNavStatus } from "../useNavStatus";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { TopView } from "../components/TopView";
@@ -45,11 +45,6 @@ const TRAIL_MAX_POINTS = 5000;
 
 export default function NavigatePage() {
   const { name = "" } = useParams();
-  const [searchParams] = useSearchParams();
-  // 带 ?route=<id> 进来 = 用的是已保存的路线, 只能查看不能改
-  const savedRouteId = searchParams.get("route");
-  const [savedRouteName, setSavedRouteName] = useState<string | null>(null);
-  const locked = Boolean(savedRouteId);
 
   const { info, error: metaError, loading } = useMapInfo(name);
 
@@ -134,17 +129,6 @@ export default function NavigatePage() {
   const editable = state !== "running";
   const ready = info?.status === "ready" && Boolean(info.topview_meta);
 
-  // 从路线管理点"导航"进来时, 把那条已保存的路线加载进来
-  useEffect(() => {
-    if (!savedRouteId) return;
-    getRoute(savedRouteId)
-      .then((r) => {
-        setWaypoints(r.waypoints);
-        setSavedRouteName(r.name);
-      })
-      .catch((e) => setActionError(String(e)));
-  }, [savedRouteId]);
-
   // 累积机器狗实际走过的位置。一直记(不限于执行中), 这样跑完之后那条线还留在
   // 图上能回看; 开始下一趟时由 handleStart 清空。
   const pose = status?.robot_pose;
@@ -197,8 +181,8 @@ export default function NavigatePage() {
     <div className="flex h-svh flex-col overflow-hidden">
       <div className="shrink-0 border-b bg-card px-6 pt-4 pb-4">
         <PageHeader
-          backTo={locked ? "/routes" : "/"}
-          backLabel={locked ? "路线管理" : "地图列表"}
+          backTo="/"
+          backLabel="地图列表"
           title={name}
           description={
             <span className="flex items-center gap-2">
@@ -218,7 +202,7 @@ export default function NavigatePage() {
                 </span>
               )}
               <span>
-                · {savedRouteName ? `路线「${savedRouteName}」` : "路线"} {waypoints.length} 点
+                · 路线 {waypoints.length} 点
               </span>
             </span>
           }
@@ -261,27 +245,21 @@ export default function NavigatePage() {
                 <Button
                   size="sm"
                   variant="outline"
-                  // 只读查看不受"执行中不能编辑"的限制, 跑着的时候也该能看路线
-                  disabled={busy || (!locked && !editable)}
+                  disabled={busy || !editable}
                   onClick={openRouteDialog}
                 >
                   <MapPin />
-                  {locked ? "已设置路线" : "设置路线"}
+                  设置路线
                 </Button>
 
                 {/* 不用打开"设置路线"弹窗、点里面那个"清空"+"提交"两步才能清空
-                    路线 —— 直接清掉已生效的 waypoints。锁定的已保存路线(locked)
-                    和执行中(!editable)都不让清, 跟"设置路线"按钮的可编辑判断
-                    保持一致。 */}
+                    路线 —— 直接清掉已生效的 waypoints。执行中(!editable)不让清,
+                    跟"设置路线"按钮的可编辑判断保持一致。 */}
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={busy || locked || !editable || waypoints.length === 0}
-                  title={
-                    locked ? "已保存的路线不能在这里清空"
-                      : !editable ? "导航进行中不能清空路线"
-                      : "清空当前设置的导航点"
-                  }
+                  disabled={busy || !editable || waypoints.length === 0}
+                  title={!editable ? "导航进行中不能清空路线" : "清空当前设置的导航点"}
                   onClick={() => setWaypoints([])}
                 >
                   <Trash2 />
@@ -382,17 +360,14 @@ export default function NavigatePage() {
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogContent className="flex h-[85vh] w-[92vw] flex-col sm:max-w-[1400px]">
             <DialogHeader>
-              <DialogTitle>{locked ? `已设置路线${savedRouteName ? `：${savedRouteName}` : ""}` : "设置路线"}</DialogTitle>
+              <DialogTitle>设置路线</DialogTitle>
               <DialogDescription>
-                {locked
-                  ? "这是从路线管理里选定的已保存路线，只能查看，不能在这里修改。"
-                  : "左键点地图添加导航点，右键点圆点删除。提交后会算出参考路线并画在 3D 预览上。"}
+                左键点地图添加导航点，右键点圆点删除。提交后会算出参考路线并画在 3D 预览上。
               </DialogDescription>
             </DialogHeader>
 
             <p className="shrink-0 text-sm text-muted-foreground">
-              {locked ? "共" : "已选"} <strong className="text-foreground">{draft.length}</strong> 个导航点
-              {locked && "（数字为途经顺序）"}
+              已选 <strong className="text-foreground">{draft.length}</strong> 个导航点
             </p>
 
             <div ref={setTopViewNode} className="min-h-0 flex-1 overflow-hidden rounded-lg border">
@@ -402,7 +377,7 @@ export default function NavigatePage() {
                   meta={info.topview_meta.topview2d}
                   waypoints={draft}
                   onChangeWaypoints={setDraft}
-                  editable={!locked}
+                  editable
                   status={status}
                   maxWidth={topViewSize.width}
                   maxHeight={topViewSize.height}
@@ -415,21 +390,15 @@ export default function NavigatePage() {
             </div>
 
             <DialogFooter>
-              {locked ? (
-                <Button variant="outline" onClick={() => setDialogOpen(false)}>关闭</Button>
-              ) : (
-                <>
-                  <Button variant="ghost" disabled={draft.length === 0 || busy} onClick={() => setDraft([])}>
-                    清空
-                  </Button>
-                  <Button variant="outline" disabled={busy} onClick={() => setDialogOpen(false)}>
-                    取消
-                  </Button>
-                  <Button disabled={busy} onClick={handleSubmitRoute}>
-                    提交
-                  </Button>
-                </>
-              )}
+              <Button variant="ghost" disabled={draft.length === 0 || busy} onClick={() => setDraft([])}>
+                清空
+              </Button>
+              <Button variant="outline" disabled={busy} onClick={() => setDialogOpen(false)}>
+                取消
+              </Button>
+              <Button disabled={busy} onClick={handleSubmitRoute}>
+                提交
+              </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>

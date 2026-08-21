@@ -58,20 +58,6 @@ class NavStatus(BaseModel):
     updated_at: float
 
 
-class RouteCreateRequest(BaseModel):
-    name: str
-    map_name: str
-    waypoints: List[Waypoint] = Field(min_length=1)
-
-
-class RouteInfo(BaseModel):
-    id: str
-    name: str
-    map_name: str
-    waypoints: List[Waypoint]
-    created_at: float
-
-
 class MapStatus(str, Enum):
     NOT_PROCESSED = "not_processed"
     PROCESSING = "processing"
@@ -120,4 +106,7 @@ class MapInfo(BaseModel):
     error_message: Optional[str] = None
     topview_meta: Optional[dict] = None
     pointcloud_meta: Optional[dict] = None
+    source_pcd_bytes: Optional[int] = None
+    """3d_map/dense_cloud_map.pcd 的原始文件大小 (字节), 地图列表卡片展示用——不是
+    预处理后的点数, 是建图直接产出的源文件大小, 跟是否已预处理无关。"""
     updated_at: float = Field(default_factory=time.time)

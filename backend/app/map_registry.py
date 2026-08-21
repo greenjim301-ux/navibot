@@ -78,13 +78,19 @@ class MapRegistry:
         if not _is_valid_map_dir(map_dir):
             return None
         storage_path = str(map_dir)
+        # _is_valid_map_dir 刚确认过这个文件存在, 这里直接取大小——跟是否预处理过
+        # 无关, 是建图直接产出的源文件, 卡片列表展示"点云大小"用这个而不是点数。
+        pcd_bytes = self._source_pcd(name).stat().st_size
 
         with self._lock:
             processing = name in self._processing
             error = self._errors.get(name)
 
         if processing:
-            return MapInfo(name=name, status=MapStatus.PROCESSING, storage_path=storage_path)
+            return MapInfo(
+                name=name, status=MapStatus.PROCESSING, storage_path=storage_path,
+                source_pcd_bytes=pcd_bytes,
+            )
 
         meta_path = self._assets_dir(name) / "topview_meta.json"
         pc_meta_path = self._assets_dir(name) / "pointcloud_meta.json"
@@ -94,13 +100,20 @@ class MapRegistry:
             return MapInfo(
                 name=name, status=MapStatus.READY, storage_path=storage_path,
                 topview_meta=topview_meta, pointcloud_meta=pointcloud_meta,
+                source_pcd_bytes=pcd_bytes,
                 updated_at=meta_path.stat().st_mtime,
             )
 
         if error:
-            return MapInfo(name=name, status=MapStatus.ERROR, storage_path=storage_path, error_message=error)
+            return MapInfo(
+                name=name, status=MapStatus.ERROR, storage_path=storage_path, error_message=error,
+                source_pcd_bytes=pcd_bytes,
+            )
 
-        return MapInfo(name=name, status=MapStatus.NOT_PROCESSED, storage_path=storage_path)
+        return MapInfo(
+            name=name, status=MapStatus.NOT_PROCESSED, storage_path=storage_path,
+            source_pcd_bytes=pcd_bytes,
+        )
 
     def list_maps(self) -> List[MapInfo]:
         infos = (self.get_map_info(name) for name in self.list_map_names())

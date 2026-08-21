@@ -96,13 +96,13 @@ body {
   --chart-5: #d74747;
   --radius: 0.625rem;
 
-  --sidebar: #101b29;
-  --sidebar-foreground: #bdc7d3;
+  --sidebar: #10273c;
+  --sidebar-foreground: #9eb2c3;
   --sidebar-primary: #2376e5;
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #253a51;
+  --sidebar-accent: #1e3c55;
   --sidebar-accent-foreground: #ffffff;
-  --sidebar-border: #1b2a3b;
+  --sidebar-border: #2b455a;
   --sidebar-ring: #2376e5;
 }
 
@@ -132,13 +132,13 @@ body {
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --sidebar: #101b29;
-  --sidebar-foreground: #bdc7d3;
+  --sidebar: #10273c;
+  --sidebar-foreground: #9eb2c3;
   --sidebar-primary: #2376e5;
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #253a51;
+  --sidebar-accent: #1e3c55;
   --sidebar-accent-foreground: #ffffff;
-  --sidebar-border: #1b2a3b;
+  --sidebar-border: #2b455a;
   --sidebar-ring: #2376e5;
 }
 
@@ -152,4 +152,11 @@ body {
   html {
     @apply font-sans;
   }
+}
+
+/* 侧栏背景做成竖向渐变(纯色 --sidebar 只是给取不到渐变的地方兜底), 比
+   flat 的深色更有层次——跟左边栏其它组件(卡片/按钮)用的 CSS 变量还是同一套,
+   只是背景这块单独强化一下。 */
+[data-slot="sidebar-inner"] {
+  background: linear-gradient(180deg, #10273c, #0d1e30);
 }
