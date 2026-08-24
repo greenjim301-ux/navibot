@@ -1,5 +1,5 @@
 import { Link, useLocation } from "react-router-dom";
-import { Map, Bot, SquareTerminal } from "lucide-react";
+import { House, Map, Route, ListChecks, Settings, PlayCircle, Bot, SquareTerminal } from "lucide-react";
 import {
   Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent,
   SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem,
@@ -12,7 +12,12 @@ const MENU_ITEM_CLASS = "h-11 gap-3 px-3 text-[15px] [&_svg]:size-5";
 
 export function AppSidebar() {
   const location = useLocation();
-  const isMapManagement = location.pathname === "/" || location.pathname.startsWith("/maps/");
+  const isHome = location.pathname === "/";
+  const isMapManagement = location.pathname === "/maps" || location.pathname.startsWith("/maps/");
+  const isRoutes = location.pathname.startsWith("/routes");
+  const isResults = location.pathname.startsWith("/results");
+  const isSystem = location.pathname.startsWith("/system");
+  const isPlayback = location.pathname.startsWith("/playback");
   // 连接状态卡片用的数据源就是 /ws/nav 本身(跟 NavigatePage 用的是同一套,
   // 各页各开一条连接, 后端 WebSocketManager 本来就是广播给所有连接的)。
   // connected = 浏览器到后端的 ws 是否通; robot_pose 有值 = 后端启动以来
@@ -58,10 +63,50 @@ export function AppSidebar() {
           <SidebarGroupContent>
             <SidebarMenu className="gap-1.5">
               <SidebarMenuItem>
-                <SidebarMenuButton asChild isActive={isMapManagement} className={MENU_ITEM_CLASS}>
+                <SidebarMenuButton asChild isActive={isHome} className={MENU_ITEM_CLASS}>
                   <Link to="/">
+                    <House />
+                    <span>首页</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={isMapManagement} className={MENU_ITEM_CLASS}>
+                  <Link to="/maps">
                     <Map />
                     <span>地图管理</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={isRoutes} className={MENU_ITEM_CLASS}>
+                  <Link to="/routes">
+                    <Route />
+                    <span>巡检路线</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={isResults} className={MENU_ITEM_CLASS}>
+                  <Link to="/results">
+                    <ListChecks />
+                    <span>巡检结果</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={isSystem} className={MENU_ITEM_CLASS}>
+                  <Link to="/system">
+                    <Settings />
+                    <span>系统管理</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={isPlayback} className={MENU_ITEM_CLASS}>
+                  <Link to="/playback">
+                    <PlayCircle />
+                    <span>数据回放</span>
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

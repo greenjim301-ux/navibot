@@ -181,7 +181,7 @@ export default function NavigatePage() {
     <div className="flex h-svh flex-col overflow-hidden">
       <div className="shrink-0 border-b bg-card px-6 pt-4 pb-4">
         <PageHeader
-          backTo="/"
+          backTo="/maps"
           backLabel="地图列表"
           title={name}
           description={
@@ -312,7 +312,7 @@ export default function NavigatePage() {
         <div className="flex min-h-0 flex-1 items-center justify-center px-6">
           <div className="w-full max-w-lg rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
             这份地图还没有预处理完成 (当前状态: {info.status})，回
-            <Link to="/" className="underline">地图列表</Link>触发预处理。
+            <Link to="/maps" className="underline">地图列表</Link>触发预处理。
           </div>
         </div>
       )}

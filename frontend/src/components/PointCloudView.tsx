@@ -573,6 +573,20 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     const raycaster = new THREE.Raycaster();
     raycaster.params.Points = { threshold: 0 };
     const pointerNdc = new THREE.Vector2();
+
+    // intersectObjects 默认按 distance(沿视线到相机的距离)排序, 取 hits[0] 会
+    // 选中拾取容差圆柱里离相机最近的点——倾斜视角下这经常不是光标视觉上最贴近
+    // 的那个点(比如瞄准地面, 却因为容差圆柱里混进了墙面上更靠近相机的点而被
+    // 选中), 造成"点哪不是哪"的偏差。改成按 distanceToRay(点到光线的世界系
+    // 垂直距离, three.js Points.raycast 每个 hit 都会算)取最小的, 这个量近似
+    // 正比于屏幕像素距离, 才是跟视觉预期一致的"点选中心最近的点"。
+    function nearestToRayHit(hits: THREE.Intersection[]): THREE.Intersection | undefined {
+      return hits.reduce<THREE.Intersection | undefined>((best, h) => {
+        const d = h.distanceToRay ?? h.distance;
+        const bestD = best ? (best.distanceToRay ?? best.distance) : Infinity;
+        return d < bestD ? h : best;
+      }, undefined);
+    }
     let pointerDownPos: { x: number; y: number; button: number } | null = null;
     const CLICK_MOVE_THRESHOLD_PX = 5;
 
@@ -604,8 +618,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         if (points) pickable.push(points);
         loadedTiles.forEach((tp) => pickable.push(tp));
         const hits = raycaster.intersectObjects(pickable, false);
-        if (hits.length === 0) return;
-        const { x, y } = hits[0].point;
+        const hit = nearestToRayHit(hits);
+        if (!hit) return;
+        const { x, y } = hit.point;
         const list = waypointsRef.current;
         const prev = list[list.length - 1];
         const yaw = prev ? Math.atan2(y - prev.y, x - prev.x) : 0;
@@ -654,8 +669,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       if (points) pickable.push(points);
       loadedTiles.forEach((tp) => pickable.push(tp));
       const hits = raycaster.intersectObjects(pickable, false);
-      if (hits.length > 0) {
-        controls.target.copy(hits[0].point);
+      const hit = nearestToRayHit(hits);
+      if (hit) {
+        controls.target.copy(hit.point);
         controls.update();
         needsRenderRef.current = true;
       }

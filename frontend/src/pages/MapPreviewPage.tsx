@@ -135,7 +135,7 @@ export default function MapPreviewPage() {
     // (#cdcdcd, 见 TopView.tsx 的注释)对齐, 不然黑色背景衬着图片会有明显色差。
     <div className={cn("relative h-svh overflow-hidden", viewMode === "2d" ? "bg-[#cdcdcd]" : "bg-black")}>
       <Link
-        to="/"
+        to="/maps"
         className="absolute top-3 left-3 z-10 flex items-center gap-1.5 rounded-md border border-white/20 bg-black/40 px-3 py-1.5 text-sm text-white/80 backdrop-blur transition-colors hover:bg-black/60"
       >
         <ArrowLeft className="size-4" />
