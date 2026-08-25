@@ -45,6 +45,23 @@ import os
 MAP_FRAME = os.environ.get("NAVIBOT_MAP_FRAME", "world")
 
 PRESET_WAYPOINTS_TOPIC = os.environ.get("NAVIBOT_WAYPOINTS_TOPIC", "/preset_waypoints")
+# navi_mode=3 (REFERENCE_PATH) 订阅的全局参考路径话题, 跟 preset_waypoints 是
+# 两条不同的下发链路——3 号模式吃的是稀疏关键点, 自己在 pathCallback 里内部
+# 抽稀+拟合成 min-snap 曲线当参考轨迹, 不是逐点下发的状态机(没有
+# waypoint_arrival_radius 那套途中点判定)。z 也不是"原样机体高度": pathCallback
+# 会在存入前给收到的 z 加上 body_height_(grid_map/body_height), 那是 planner
+# 自己的配置项, 我们发布时不用管。见 global_planner.py 和
+# RosBridge.publish_initial_path。
+INITIAL_PATH_TOPIC = os.environ.get("NAVIBOT_INITIAL_PATH_TOPIC", "/initial_path")
+# 跟 WAYPOINTS_SUB_WAIT_S 同理: /initial_path 不 latch, 发之前等订阅者连上
+INITIAL_PATH_SUB_WAIT_S = float(os.environ.get("NAVIBOT_INITIAL_PATH_WAIT_S", "5.0"))
+# 全局规划器(global_planner.py)膨胀障碍物用的机身半径(m)。取 SCAN-Planner 自己
+# 的 grid_map/double_cylinder_radius=0.25(advanced_param.xml 里配的"双圆柱"自身
+# 膨胀半径)——用同一个数, 全局路径判定的"安全"标准才跟机器狗局部自身膨胀判定
+# 的标准一致, 不会出现全局觉得没问题、局部却嫌贴太近的情况。
+GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_INFLATION_RADIUS_M", "0.25")
+)
 EMERGENCY_STOP_TOPIC = os.environ.get("NAVIBOT_EMERGENCY_STOP_TOPIC", "/planning/emergency_stop")
 ODOM_TOPIC = os.environ.get("NAVIBOT_ODOM_TOPIC", "/hand_lio/odom_vehicle")
 # planner 侧 -> backend, visualization_msgs/Marker, 纯展示用途 (跟

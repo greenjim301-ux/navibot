@@ -1,4 +1,4 @@
-import type { MapInfo, NavStatus, Waypoint } from "./types";
+import type { MapInfo, NavStatus, PlannedRoutePoint, Waypoint, XY } from "./types";
 
 export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "http://localhost:8000";
 export const BACKEND_WS = import.meta.env.VITE_BACKEND_WS ?? "ws://localhost:8000";
@@ -109,4 +109,27 @@ export async function groundZ(
   });
   const data = await asJson<{ z: (number | null)[] }>(res);
   return data.z;
+}
+
+/** 基于 2D 栅格图规划一条全局路径 (A* + line-of-sight 剪枝, 见
+ *  backend/app/global_planner.py), 后端会尝试补好 z 下发给 navi_mode=3
+ *  (REFERENCE_PATH, /initial_path)。规划本身失败(算不出可行路径)才会让这个
+ *  调用抛错——"下发"这一步失败(ROS bridge 没起来、没有 planner 订阅)不影响
+ *  这次调用的成功, 只反映在 published/publishError 上, 见 published 字段的
+ *  说明(backend/app/models.py PlanPathResponse)。 */
+export interface PlanPathResult {
+  points: PlannedRoutePoint[];
+  /** 是否真的发给了 /initial_path; false 时路线已经算出来了, 只是没送到机器狗。 */
+  published: boolean;
+  publishError: string | null;
+}
+
+export async function planPath(mapName: string, start: XY, goal: XY): Promise<PlanPathResult> {
+  const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/plan_path`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ start, goal }),
+  });
+  const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
+  return { points: data.points, published: data.published, publishError: data.publish_error };
 }

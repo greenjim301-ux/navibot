@@ -3,14 +3,14 @@ import { Link, useParams } from "react-router-dom";
 import {
   ArrowLeft, PanelRight, X, Target, RefreshCw, Crosshair,
   ZoomIn, ZoomOut, RotateCcw, RotateCw,
-  MapPin, CircleCheck, Trash2, Play,
+  MapPin, CircleCheck, Trash2, Play, Flag,
 } from "lucide-react";
-import { submitRoute } from "../api";
+import { planPath, submitRoute } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
-import type { Waypoint } from "../types";
+import type { PlannedRoutePoint, Waypoint, XY } from "../types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -81,8 +81,26 @@ export default function MapPreviewPage() {
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
 
+  // 路线规划: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
+  // 独立的另一条链路——起终点在 2D 栅格图上跑 A* 规划(global_planner.py),
+  // 算出来的参考路线补好 z 直接下发给 navi_mode=3(/initial_path), 不经过
+  // RouteManager 的状态机, 所以这里的 planning/plannedRoute 跟上面的
+  // submitting/navRunning 是两套互不干扰的状态。只支持 3D 点云拾取(见下面
+  // PointCloudView 的 startGoalPickMode), 不像"导航控制"那样 2D/3D 都支持——
+  // 2D 栅格图(TopView, Konva)目前没有配套的拾取逻辑, 没必要为了这一个面板
+  // 单独再实现一遍。
+  const [startGoal, setStartGoal] = useState<{ start: XY | null; goal: XY | null }>({
+    start: null, goal: null,
+  });
+  const [startGoalPicking, setStartGoalPicking] = useState(false);
+  const [plannedRoute, setPlannedRoute] = useState<PlannedRoutePoint[] | null>(null);
+  const [planning, setPlanning] = useState(false);
+  const hasStartGoal = Boolean(startGoal.start || startGoal.goal);
+
   // 下发失败的错误提示过一会儿自己消失, 不然会一直挡在屏幕上——每次 navError
-  // 变化(包括又失败一次, 换成新消息)都重新计时。
+  // 变化(包括又失败一次, 换成新消息)都重新计时。路线规划失败也复用这同一条
+  // 错误提示(见下面 handleFinishStartGoalPick), 没必要为一个新面板再单独维护
+  // 一套"错误横幅 + 自动消失定时器"。
   useEffect(() => {
     if (!navError) return;
     const timer = window.setTimeout(() => setNavError(null), 5000);
@@ -90,10 +108,14 @@ export default function MapPreviewPage() {
   }, [navError]);
 
   // 切换到别的地图(路由参数变了, 但页面组件实例不一定重新挂载)时清掉本地
-  // 草稿——途经点坐标只在各自那张地图里有意义, 留着会画到不相关的地图上。
+  // 草稿——途经点/起终点/规划出来的路线坐标只在各自那张地图里有意义, 留着
+  // 会画到不相关的地图上。
   useEffect(() => {
     setWaypoints([]);
     setRouteEditing(false);
+    setStartGoal({ start: null, goal: null });
+    setStartGoalPicking(false);
+    setPlannedRoute(null);
   }, [name]);
 
   // 切到 2D 时 PointCloudView 会整个卸载(见下面渲染部分), "点选新中心点"/
@@ -108,10 +130,49 @@ export default function MapPreviewPage() {
   }, [viewMode]);
 
   function handleStartRouteEdit() {
-    // "点选新中心点"跟"设置路线"在 3D 视图里是同一个左键点击手势, 语义上互斥
-    // (点下去到底是选旋转中心还是加途经点?), 进路线编辑前先把它取消掉。
+    // "点选新中心点"/"设置路线"/"设置起终点"在 3D 视图里是同一个左键点击手势,
+    // 三者语义互斥, 进路线编辑前把另外两个都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
+    if (startGoalPicking) setStartGoalPicking(false);
     setRouteEditing(true);
+  }
+
+  function handleStartStartGoalPick() {
+    // 同上, 进起终点拾取前把"点选新中心点"/"设置路线"都取消掉。
+    if (recentering) pcRef.current?.toggleRecenter();
+    if (routeEditing) setRouteEditing(false);
+    setStartGoalPicking(true);
+  }
+
+  /** "设置完成": 起终点都选好了就调用全局规划(尝试直接下发给 navi_mode=3),
+   *  把返回的参考路线画出来; 没选够两个点就只是单纯退出拾取模式。规划本身
+   *  失败(算不出路径)才会让下面这个 await 抛错——下发失败(ROS bridge 没起来
+   *  等)不会, 那种情况路线照样画出来, 只是弹一条非阻塞的提示(见 published)。 */
+  async function handleFinishStartGoalPick() {
+    if (!startGoal.start || !startGoal.goal) {
+      setStartGoalPicking(false);
+      return;
+    }
+    setPlanning(true);
+    setNavError(null);
+    try {
+      const result = await planPath(name, startGoal.start, startGoal.goal);
+      setPlannedRoute(result.points);
+      setStartGoalPicking(false);
+      if (!result.published) {
+        setNavError(`路线已规划, 但没能下发给机器狗: ${result.publishError ?? "未知原因"}`);
+      }
+    } catch (e) {
+      setNavError(String(e));
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  function handleClearPlannedRoute() {
+    setStartGoal({ start: null, goal: null });
+    setPlannedRoute(null);
+    setStartGoalPicking(false);
   }
 
   async function handleStartNav() {
@@ -206,6 +267,10 @@ export default function MapPreviewPage() {
               onFollowingChange={setFollowing}
               routeEditMode={routeEditing}
               onChangeWaypoints={setWaypoints}
+              startGoalPickMode={startGoalPicking}
+              startGoal={startGoal}
+              onChangeStartGoal={setStartGoal}
+              plannedRoute={plannedRoute}
             />
           ) : topview2d ? (
             <div className="flex size-full items-center justify-center">
@@ -239,6 +304,14 @@ export default function MapPreviewPage() {
           ) : routeEditing ? (
             <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
               设置路线中: 左键新增导航点, 右键删除已有的点
+            </div>
+          ) : startGoalPicking ? (
+            <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
+              {!startGoal.start
+                ? "设置起终点中: 左键点选起点"
+                : !startGoal.goal
+                  ? "设置起终点中: 左键点选终点, 右键撤销起点"
+                  : "起终点已选好, 点「设置完成」开始规划, 右键可撤销终点重选"}
             </div>
           ) : null}
 
@@ -308,10 +381,15 @@ export default function MapPreviewPage() {
                       icon={Target}
                       label={recentering ? "点击点云取消" : "点选旋转中心"}
                       active={recentering}
-                      // 跟"设置路线"在 3D 视图里是同一个左键点击手势, 设置路线中
-                      // 不能再切进这个模式, 得先点"设置完成"。
-                      disabled={viewMode === "2d" || routeEditing}
-                      title={routeEditing ? "设置路线中, 先点「设置完成」" : undefined}
+                      // 跟"设置路线"/"设置起终点"在 3D 视图里是同一个左键点击
+                      // 手势, 那两个模式开着的时候不能再切进这个模式, 得先点
+                      // 各自的"设置完成"。
+                      disabled={viewMode === "2d" || routeEditing || startGoalPicking}
+                      title={
+                        routeEditing ? "设置路线中, 先点「设置完成」"
+                          : startGoalPicking ? "设置起终点中, 先点「设置完成」"
+                            : undefined
+                      }
                       onClick={() => pcRef.current?.toggleRecenter()}
                     />
                     <PanelButton
@@ -337,8 +415,12 @@ export default function MapPreviewPage() {
                       icon={MapPin}
                       label="设置路线"
                       active={routeEditing}
-                      disabled={routeEditing || navRunning}
-                      title={navRunning ? "导航进行中不能设置路线" : undefined}
+                      disabled={routeEditing || navRunning || startGoalPicking}
+                      title={
+                        navRunning ? "导航进行中不能设置路线"
+                          : startGoalPicking ? "设置起终点中, 先点「设置完成」"
+                            : undefined
+                      }
                       onClick={handleStartRouteEdit}
                     />
                     <PanelButton
@@ -359,6 +441,41 @@ export default function MapPreviewPage() {
                       label={navRunning ? "导航中…" : submitting ? "下发中…" : "开始导航"}
                       disabled={waypoints.length === 0 || submitting || navRunning}
                       onClick={handleStartNav}
+                    />
+                  </div>
+                </PanelSection>
+
+                {/* 独立于上面的"导航控制"(navi_mode=2): 起终点在 2D 栅格图上跑
+                    A* 全局规划(global_planner.py), 补好 z 直接下发给
+                    navi_mode=3(/initial_path)——"设置完成"点下去就已经算完并
+                    发出去了, 不是"先预览再手动开始导航"那套两步流程。只支持
+                    3D 拾取, 2D 栅格图下整个面板禁用(见 startGoalPickMode 相关
+                    的 PointCloudView props)。 */}
+                <PanelSection title="路线规划">
+                  <div className={cn("flex flex-col gap-1.5 transition-opacity", viewMode === "2d" && "pointer-events-none opacity-40")}>
+                    <PanelButton
+                      icon={Flag}
+                      label="设置起终点"
+                      active={startGoalPicking}
+                      disabled={startGoalPicking || navRunning || routeEditing}
+                      title={
+                        navRunning ? "导航进行中不能规划路线"
+                          : routeEditing ? "设置路线中, 先点「设置完成」"
+                            : undefined
+                      }
+                      onClick={handleStartStartGoalPick}
+                    />
+                    <PanelButton
+                      icon={CircleCheck}
+                      label={planning ? "规划中…" : "设置完成"}
+                      disabled={!startGoalPicking || planning}
+                      onClick={handleFinishStartGoalPick}
+                    />
+                    <PanelButton
+                      icon={Trash2}
+                      label="清空路线"
+                      disabled={(!hasStartGoal && !plannedRoute) || planning}
+                      onClick={handleClearPlannedRoute}
                     />
                   </div>
                 </PanelSection>

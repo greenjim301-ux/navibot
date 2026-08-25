@@ -15,10 +15,12 @@ from .models import (
     GroundZRequest, GroundZResponse,
     MapInfo, NavStatus,
     InflationMapRequest,
+    PlanPathRequest, PlanPathResponse, PlanPathPoint,
     RouteRequest,
     SelfInflationRequest,
     SurfCloudRequest,
 )
+from . import global_planner
 from . import path_planner
 from .ros_bridge import RosBridge
 from .route_manager import RouteManager
@@ -189,6 +191,59 @@ async def map_ground(name: str, req: GroundZRequest):
 
     zs = await run_in_threadpool(compute)
     return GroundZResponse(z=zs)
+
+
+@app.post("/api/maps/{name}/plan_path", response_model=PlanPathResponse)
+async def plan_path(name: str, req: PlanPathRequest):
+    """基于 2D 栅格图规划一条全局路径(global_planner.plan_path), 补好 z 后
+    尝试下发给 navi_mode=3 (REFERENCE_PATH, /initial_path)。
+
+    跟 /api/route (navi_mode=2, preset_waypoints) 是完全不同的下发链路——不
+    经过 RouteManager 的状态机(navi_mode=3 没有逐点到达判定, 见
+    global_planner.py 模块 docstring)。规划本身失败(起点/终点太靠近障碍物、
+    两点之间没有可行路径)算 400, 是真正的失败; 但"下发"这一步不影响这个
+    接口的成功与否——ROS bridge 没起来、没有 planner 订阅 /initial_path 都
+    只在响应里标成 published=False + publish_error, 不让整个请求跟着报错。
+    这样前端拿到规划结果就能先把路线画出来, 不用因为机器狗那边没连上就连
+    "规划得对不对"都看不到; 想知道有没有真的发下去, 看 published 字段。
+    """
+    def compute() -> List[dict]:
+        raw_points = global_planner.plan_path(name, (req.start.x, req.start.y), (req.goal.x, req.goal.y))
+        delta = route_manager.get_altitude_calibration(name)
+        out = []
+        for x, y in raw_points:
+            ground = path_planner.ground_elevation(name, x, y)
+            if ground is None or delta is None:
+                logger.warning(
+                    "plan_path: (%.2f, %.2f) 附近没有建图轨迹或算不出位姿标定 Δ, z 按 0 兜底", x, y,
+                )
+                z = 0.0
+            else:
+                z = ground + delta
+            out.append({"x": x, "y": y, "z": z})
+        return out
+
+    try:
+        points = await run_in_threadpool(compute)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    publish_error: Optional[str] = None
+    try:
+        await run_in_threadpool(ros_bridge.publish_initial_path, points)
+    except Exception as e:
+        # 故意接 Exception 而不是只接 publish_initial_path 自己会抛的
+        # RuntimeError: ros_bridge 都可能因为还没连上 ROS 而是 None(见模块级
+        # 变量声明), 这时候是 AttributeError, 不是 RuntimeError——这里就是要
+        # "不管下发那步炸成什么样都不能带崩这个接口的成功返回", 所以兜个底。
+        publish_error = str(e)
+        logger.warning("plan_path: 规划成功, 但下发 /initial_path 失败(不影响本次返回): %s", e)
+
+    return PlanPathResponse(
+        points=[PlanPathPoint(**p) for p in points],
+        published=publish_error is None,
+        publish_error=publish_error,
+    )
 
 
 @app.get("/api/maps", response_model=List[MapInfo])

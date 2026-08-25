@@ -28,6 +28,36 @@ class RouteRequest(BaseModel):
     map_name: Optional[str] = None
 
 
+class XY(BaseModel):
+    x: float
+    y: float
+
+
+class PlanPathRequest(BaseModel):
+    start: XY
+    goal: XY
+
+
+class PlanPathPoint(BaseModel):
+    x: float
+    y: float
+    z: float
+
+
+class PlanPathResponse(BaseModel):
+    """global_planner.plan_path 规划出来的关键拐点(已经叠加 ground_elevation
+    + Δ 补好 z, 不减 body_height_——见 global_planner.py), 跟实际下发给
+    /initial_path 的内容一致, 给前端预览/确认用。
+
+    points 只要规划本身成功就一定有值, 不受下发影响: published 才是"有没有
+    真的发给 /initial_path"——ROS bridge 没起来/没有 navi_mode=3 订阅这类下发
+    失败不会让整个请求报错(见 main.py 的 plan_path), published=False 时
+    publish_error 是失败原因, 给前端做一条非阻塞的提示用。"""
+    points: List[PlanPathPoint]
+    published: bool
+    publish_error: Optional[str] = None
+
+
 class TaskState(str, Enum):
     IDLE = "idle"
     RUNNING = "running"

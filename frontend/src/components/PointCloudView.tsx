@@ -8,8 +8,8 @@ import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { mapAssetUrl } from "../api";
 import { useGroundZ } from "../hooks/useGroundZ";
 import type {
-  NavStatus, OptimalTrajPoint, PointcloudMeta, SelfInflationMarker, TopviewMeta, TrailPoint,
-  Waypoint,
+  NavStatus, OptimalTrajPoint, PlannedRoutePoint, PointcloudMeta, SelfInflationMarker, TopviewMeta,
+  TrailPoint, Waypoint, XY,
 } from "../types";
 
 interface Props {
@@ -71,6 +71,19 @@ interface Props {
    *  语义跟 TopView 的 onChangeWaypoints 完全一致: 每次给全量新数组, 这里
    *  不维护内部状态, 由页面自己存。 */
   onChangeWaypoints?: (wps: Waypoint[]) => void;
+  /** "设置起终点"模式(路线规划面板专用): 开启后左键点点云上一点, 第一次点
+   *  设起点、第二次点设终点(两个都设好之后左键再点不生效); 右键在画面任意
+   *  位置点一下撤销最近设置的那个点(先撤终点, 再撤起点)——起终点只有两个,
+   *  不需要像 routeEditMode 那样要求右键精确点在标记上才能删。跟 routeEditMode
+   *  是否同时互斥由调用方保证, 这里不做强制。 */
+  startGoalPickMode?: boolean;
+  /** 当前的起点/终点(世界坐标), 纯 prop, 组件不维护状态, 语义跟
+   *  waypoints/onChangeWaypoints 一致。 */
+  startGoal?: { start: XY | null; goal: XY | null };
+  onChangeStartGoal?: (next: { start: XY | null; goal: XY | null }) => void;
+  /** global_planner.plan_path 规划出来的参考路线(世界坐标 + 已补好的 z), 只
+   *  负责画一条线, 不参与任何拾取逻辑——由页面在拿到 /plan_path 的响应后传入。 */
+  plannedRoute?: PlannedRoutePoint[] | null;
 }
 
 export interface PointCloudViewHandle {
@@ -139,6 +152,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   showFollowButton = true, onFollowingChange,
   heightLimit, controlMode = "orbit", onRecenterModeChange,
   routeEditMode = false, onChangeWaypoints,
+  startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null,
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   // toggleRecenter/resetView 的实际实现绑定着某一套 camera/controls, 每次挂载
@@ -168,6 +182,15 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // 最新值(挂载 effect 本身不因这个 prop 变化重跑)。
   const routeEditModeRef = useRef(routeEditMode);
   routeEditModeRef.current = routeEditMode;
+  // startGoalPickMode 一套跟 routeEditMode 完全同理(纯 prop + ref 读最新值,
+  // 挂载 effect 里注册的点击处理需要拿到当前起终点才能判断"这一下是设起点
+  // 还是设终点")。
+  const startGoalPickModeRef = useRef(startGoalPickMode);
+  startGoalPickModeRef.current = startGoalPickMode;
+  const startGoalRef = useRef(startGoal);
+  startGoalRef.current = startGoal;
+  const onChangeStartGoalRef = useRef(onChangeStartGoal);
+  onChangeStartGoalRef.current = onChangeStartGoal;
   // 挂载 effect 里创建的 canvas dom, 给下面那个单独的"同步光标样式"effect 用
   // (routeEditMode 变化时要更新光标, 但这个变化不该触发整个场景重建)。
   const domElementRef = useRef<HTMLElement | null>(null);
@@ -179,6 +202,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // 像以前"6 个按钮转点云"那套设计一样每次旋转都重新投影)。
   const heightPlaneRef = useRef<THREE.Plane>(new THREE.Plane(new THREE.Vector3(0, 0, -1), Infinity));
   const markersGroupRef = useRef<THREE.Group | null>(null);
+  const startGoalGroupRef = useRef<THREE.Group | null>(null);
+  const plannedRouteGroupRef = useRef<THREE.Group | null>(null);
+  const plannedRouteMaterialRef = useRef<LineMaterial | null>(null);
   const robotMeshRef = useRef<THREE.Mesh | null>(null);
   const pathGroupRef = useRef<THREE.Group | null>(null);
   const pathMarkersRef = useRef<THREE.Group | null>(null);
@@ -204,6 +230,12 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // 途经点要画在各自的实际地面高度上。楼梯地图里楼上楼下的点差一米多, 都按
   // 同一个高度画会全挤在同一个平面里, 看不出哪个点在楼上。
   const waypointZ = useGroundZ(mapName, waypoints);
+  // 起点/终点同样要画在各自的实际地面高度上, 复用同一个 hook——这里只传 0~2
+  // 个点, useGroundZ 内部按坐标拼 key 判断要不要重新请求, 空数组时直接跳过。
+  const startGoalPoints: XY[] = [];
+  if (startGoal?.start) startGoalPoints.push(startGoal.start);
+  if (startGoal?.goal) startGoalPoints.push(startGoal.goal);
+  const startGoalZ = useGroundZ(mapName, startGoalPoints);
 
   const [following, setFollowing] = useState(enableFollow);
   // 渲染循环里要读这两个值, 用 ref 拿最新值, 避免它们变化就重建整个场景
@@ -347,7 +379,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // crosshair", 不做互斥判断。
     let recenterMode = false;
     function syncCursor() {
-      renderer.domElement.style.cursor = (recenterMode || routeEditModeRef.current) ? "crosshair" : "";
+      renderer.domElement.style.cursor =
+        (recenterMode || routeEditModeRef.current || startGoalPickModeRef.current) ? "crosshair" : "";
     }
     syncCursor(); // 挂载时 routeEditMode 这个 prop 可能已经是 true(比如切完 2D 又切回 3D)
     function setRecenterMode(active: boolean) {
@@ -374,6 +407,23 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     const markersGroup = new THREE.Group();
     scene.add(markersGroup);
     markersGroupRef.current = markersGroup;
+
+    const startGoalGroup = new THREE.Group();
+    scene.add(startGoalGroup);
+    startGoalGroupRef.current = startGoalGroup;
+
+    // 路线规划出来的参考路线, 跟轨迹(trailMaterial, 绿色)/局部轨迹(optimalMaterial,
+    // 速度渐变)区分开, 用青色——跟"设置路线"模式的提示条(border-cyan-400)是
+    // 同一个强调色, 观感上能对上"这是路线规划相关的东西"。
+    const plannedRouteMaterial = new LineMaterial({
+      color: 0x22d3ee, linewidth: 2.5, transparent: true, opacity: 0.95, depthTest: false,
+    });
+    plannedRouteMaterial.resolution.set(width, height);
+    plannedRouteMaterialRef.current = plannedRouteMaterial;
+
+    const plannedRouteGroup = new THREE.Group();
+    scene.add(plannedRouteGroup);
+    plannedRouteGroupRef.current = plannedRouteGroup;
 
     const robotMesh = new THREE.Mesh(
       new THREE.ConeGeometry(0.18, 0.4, 12),
@@ -636,6 +686,47 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       needsRenderRef.current = true;
     }
 
+    // "设置起终点": startGoalPickMode(prop)开着的时候, 左键点点云上一点——还
+    // 没设起点就设起点, 起点设好了但终点没设就设终点, 两个都设好了再点不生效
+    // (跟 routeEditMode 不一样, 不是想加几个点就加几个点)。右键在画面任意
+    // 位置点一下撤销最近设置的那个点(先撤终点, 再撤起点), 不需要精确点在
+    // 起点/终点的标记上——只有两个点, 用不着像 routeEditMode 删途经点那样
+    // 靠 raycast 命中标记来确定"删哪个"。
+    function handleStartGoalClick(e: PointerEvent, ndcX: number, ndcY: number) {
+      const current = startGoalRef.current ?? { start: null, goal: null };
+
+      if (e.button === 2) {
+        if (current.goal) {
+          onChangeStartGoalRef.current?.({ start: current.start, goal: null });
+        } else if (current.start) {
+          onChangeStartGoalRef.current?.({ start: null, goal: null });
+        }
+        needsRenderRef.current = true;
+        return;
+      }
+      if (e.button !== 0 || (current.start && current.goal)) return;
+
+      pointerNdc.set(ndcX, ndcY);
+      raycaster.setFromCamera(pointerNdc, camera);
+      const camDist = camera.position.distanceTo(controls.target);
+      const rect = renderer.domElement.getBoundingClientRect();
+      const worldPerPixel = (2 * camDist * Math.tan((FOV / 2) * Math.PI / 180)) / rect.height;
+      raycaster.params.Points!.threshold = worldPerPixel * 12;
+      const pickable: THREE.Points[] = [];
+      if (points) pickable.push(points);
+      loadedTiles.forEach((tp) => pickable.push(tp));
+      const hits = raycaster.intersectObjects(pickable, false);
+      const hit = nearestToRayHit(hits);
+      if (!hit) return;
+      const { x, y } = hit.point;
+      if (!current.start) {
+        onChangeStartGoalRef.current?.({ start: { x, y }, goal: null });
+      } else {
+        onChangeStartGoalRef.current?.({ start: current.start, goal: { x, y } });
+      }
+      needsRenderRef.current = true;
+    }
+
     function handlePointerUp(e: PointerEvent) {
       const down = pointerDownPos;
       pointerDownPos = null;
@@ -646,6 +737,10 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
+      if (startGoalPickModeRef.current) {
+        handleStartGoalClick(e, ndcX, ndcY);
+        return;
+      }
       if (routeEditModeRef.current) {
         handleRouteEditClick(e, ndcX, ndcY);
         return;
@@ -716,6 +811,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       renderer.setSize(w, h);
       trailMaterial.resolution.set(w, h);
       optimalMaterial.resolution.set(w, h);
+      plannedRouteMaterial.resolution.set(w, h);
     }
     window.addEventListener("resize", handleResize);
 
@@ -738,6 +834,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       trailMaterial.dispose();
       optimalGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       optimalMaterial.dispose();
+      plannedRouteGroup.children.forEach((c) => (c as Line2).geometry.dispose());
+      plannedRouteMaterial.dispose();
       selfInflationGroup.children.forEach((c) => {
         const m = c as THREE.Mesh;
         m.geometry.dispose();
@@ -774,8 +872,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   useEffect(() => {
     const el = domElementRef.current;
     if (!el) return;
-    el.style.cursor = (recenterModeRef.current || routeEditMode) ? "crosshair" : "";
-  }, [routeEditMode]);
+    el.style.cursor = (recenterModeRef.current || routeEditMode || startGoalPickMode) ? "crosshair" : "";
+  }, [routeEditMode, startGoalPickMode]);
 
   // 途经点标记 (地面高度附近的小球), waypoints 变化时更新
   useEffect(() => {
@@ -814,6 +912,58 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       group.add(label);
     });
   }, [waypoints, waypointZ, status, meta.world_bounds.z_min]);
+
+  // 起点/终点标记 (跟途经点标记同一套画法, 颜色/文字区分开: 绿色"起", 红色"终")
+  useEffect(() => {
+    const group = startGoalGroupRef.current;
+    if (!group) return;
+    needsRenderRef.current = true;
+    group.clear();
+
+    const entries: { label: string; pt: XY; color: number }[] = [];
+    if (startGoal?.start) entries.push({ label: "起", pt: startGoal.start, color: 0x18a66e });
+    if (startGoal?.goal) entries.push({ label: "终", pt: startGoal.goal, color: 0xd74747 });
+
+    entries.forEach((entry, idx) => {
+      // 同样退回机器狗当前位姿的 z / 0 兜底, 理由跟途经点标记完全一致(见上面
+      // 那个 effect 的注释)。
+      const ground = startGoalZ[idx] ?? status?.robot_pose?.z ?? 0;
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.1, 16, 16),
+        new THREE.MeshBasicMaterial({ color: entry.color }),
+      );
+      mesh.position.set(entry.pt.x, entry.pt.y, ground + 0.1);
+      group.add(mesh);
+
+      const label = createWaypointLabelSprite(entry.label);
+      label.position.set(entry.pt.x, entry.pt.y, ground + 0.1 + 0.3);
+      group.add(label);
+    });
+  }, [startGoal, startGoalZ, status, meta.world_bounds.z_min]);
+
+  // 全局规划出来的参考路线(global_planner.plan_path 的返回值, 已经带 z), 单
+  // 段 Line2 直接连起来——跟 trail/optimalTraj 不一样, 这条不需要区分"规划
+  // 成功/只能直连"这种状态, 后端要么给一条完整可行的路径, 要么直接报错。
+  useEffect(() => {
+    const group = plannedRouteGroupRef.current;
+    const material = plannedRouteMaterialRef.current;
+    if (!group || !material) return;
+    needsRenderRef.current = true;
+
+    group.children.forEach((c) => (c as Line2).geometry.dispose());
+    group.clear();
+
+    if (!plannedRoute || plannedRoute.length < 2) return;
+
+    const flat: number[] = [];
+    plannedRoute.forEach((p) => flat.push(p.x, p.y, p.z + 0.1));
+    const geometry = new LineGeometry();
+    geometry.setPositions(flat);
+    const line = new Line2(geometry, material);
+    line.computeLineDistances();
+    line.renderOrder = 10;
+    group.add(line);
+  }, [plannedRoute]);
 
   // 机器狗实时位姿标记
   useEffect(() => {

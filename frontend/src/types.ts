@@ -45,6 +45,17 @@ export interface TrailPoint {
   z: number;
 }
 
+export interface XY {
+  x: number;
+  y: number;
+}
+
+/** global_planner.plan_path 规划出来的关键拐点(已经叠加 ground_elevation + Δ
+ *  补好 z), 见 backend/app/models.py 的 PlanPathResponse。 */
+export interface PlannedRoutePoint extends XY {
+  z: number;
+}
+
 /** /scan_planner_node/optimal_list 的一个采样点: planner 当前正在跑的局部轨迹,
  *  rgb 是 rviz 里那条速度渐变色线的原始颜色 (0~1), 后端原样转发, 不是我们算的。 */
 export interface OptimalTrajPoint {
