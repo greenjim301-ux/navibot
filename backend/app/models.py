@@ -88,11 +88,14 @@ class GroundZRequest(BaseModel):
 
 
 class GroundZResponse(BaseModel):
-    """每个点附近建图轨迹的高度 (地面高程近似), null = 该点附近没有轨迹经过。
+    """每个点附近建图轨迹的高度 (地面高程近似, 已叠加机器狗当前位姿标定出的 Δ,
+    跟 submit_route 实际下发的高度用的是同一套算法), null = 该点附近没有轨迹
+    经过。
 
     给 3D 预览用: 途经点标记要画在各自的实际高度上, 否则楼上楼下的点会挤在
-    同一个平面里。前端自己算不了 —— 建图轨迹 (keyframe_info_3d.txt) 只有后端能查,
-    见 path_planner.py。
+    同一个平面里, 也会和用原始 odom.z 画的机器狗 marker 对不上。前端自己算
+    不了 —— 建图轨迹 (keyframe_info_3d.txt) 和当前位姿只有后端能查, 见
+    path_planner.py 和 route_manager.py。
     """
     z: List[Optional[float]] = []
 

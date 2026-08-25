@@ -171,10 +171,23 @@ async def set_surf_cloud(req: SurfCloudRequest):
 
 @app.post("/api/maps/{name}/ground", response_model=GroundZResponse)
 async def map_ground(name: str, req: GroundZRequest):
-    """批量查地面高程。3D 预览把途经点画在各自实际高度上要用。"""
-    zs = await run_in_threadpool(
-        lambda: [path_planner.ground_elevation(name, p.x, p.y) for p in req.points]
-    )
+    """批量查地面高程。3D 预览把途经点画在各自实际高度上要用。
+
+    跟 submit_route 一样叠加 route_manager 里那个 Δ 标定偏移(见
+    RouteManager.get_altitude_calibration), 让预览高度和实际下发执行的高度
+    对得上, 也和 3D 预览里机器狗自身的 marker(用原始 odom.z 画)对得上。
+    机器狗当前位置附近没有建图轨迹经过(算不出 Δ)时退回未标定的轨迹高度,
+    和之前的行为一致。
+    """
+    def compute() -> list:
+        delta = route_manager.get_altitude_calibration(name)
+        zs = []
+        for p in req.points:
+            ground = path_planner.ground_elevation(name, p.x, p.y)
+            zs.append(ground if ground is None or delta is None else ground + delta)
+        return zs
+
+    zs = await run_in_threadpool(compute)
     return GroundZResponse(z=zs)
 
 

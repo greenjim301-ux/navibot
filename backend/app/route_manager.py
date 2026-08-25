@@ -116,6 +116,16 @@ class RouteManager:
             return self._surf_cloud_payload_locked()
 
     # ---- 指令 ----
+    def get_altitude_calibration(self, map_name: Optional[str]) -> Optional[float]:
+        """给 /api/maps/{name}/ground 用: 跟 submit_route 下发时用的是同一个 Δ
+        (见 _odom_delta), 让 3D 预览里途经点的高度和实际下发执行的高度一致——
+        否则机器狗当前位姿(用原始 odom.z 画)和途经点(用建图轨迹原始高度画)
+        之间的固定偏移会让预览看起来悬空/沉入地面, 见 path_planner.py 的推导。
+        """
+        with self._lock:
+            pose = self._robot_pose
+        return self._odom_delta(map_name, pose)
+
     def _odom_delta(self, map_name: Optional[str], pose: Optional[Pose]) -> Optional[float]:
         """机器狗当前 odom.z 与它脚下建图轨迹高度的差值(标定偏移量)。
 
