@@ -46,7 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from scipy.ndimage import binary_erosion, maximum_filter, uniform_filter
+from scipy.ndimage import binary_dilation, binary_erosion, label, maximum_filter, uniform_filter
+from scipy.spatial import cKDTree
 
 N8 = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -454,3 +455,229 @@ def build_elevation(
             "band_m": [round(band_lo, 3), round(band_hi, 3)],
         },
     )
+
+
+def estimate_sensor_height(
+    points: np.ndarray,
+    trajectory: np.ndarray,
+    seed_lo: float = 0.25,
+    seed_hi: float = 1.0,
+    radius: float = 0.3,
+    sample_stride: int = 5,
+) -> float | None:
+    """估传感器离地高度 delta(轨迹 z 减脚下地面 z 的中位数), 给
+    estimate_trajectory_ground 把轨迹高度换算成地面高度用。
+
+    对轨迹抽样(每 sample_stride 个点取一个, 省时间——几十万点的轨迹没必要
+    每个都算), 每个采样点在半径 radius 内、往下 [seed_hi, seed_lo] 这个窗口里
+    找点云, 有足够点就取中位数当"脚下地面", 算出该点 z 减地面 z 的差, 取所有
+    采样点这个差值的中位数。
+
+    找不到任何一个采样点脚下有地面(比如轨迹整个悬空, 数据有问题)时返回 None,
+    调用方应该跳过这份地图的占据栅格生成, 不能用 NaN 兜底继续往下算。
+    """
+    deltas = []
+    for x, y, zt in trajectory[::sample_stride]:
+        d = np.hypot(points[:, 0] - x, points[:, 1] - y)
+        band = d < radius
+        band &= (points[:, 2] > zt - seed_hi) & (points[:, 2] < zt - seed_lo)
+        if band.sum() >= 3:
+            deltas.append(zt - float(np.median(points[band, 2])))
+    if not deltas:
+        return None
+    return float(np.median(deltas))
+
+
+def estimate_trajectory_ground(
+    trajectory: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    delta: float,
+    max_radius: float,
+    k: int = 8,
+) -> np.ndarray:
+    """从建图轨迹本身插值出整张地面高程参考图, 不要求这一格真的扫到了地面点。
+
+    扫不到地面是常态, 不是例外——地面是全场雷达采样最差的面(0.8m 盲区 + 掠射角,
+    见文件顶部说明), 死等点云证据只会让大片明明可通行的区域(比如空旷大厅中间,
+    轨迹没直接走过去但绕着走了一整圈)一直是 unknown(实测: large 这份图硬要求
+    每格自己扫到地面点, 800m² 大厅中间抽查一格, 半径 1m 内 35 个点全在天花板
+    高度, 地面一个点都没有)。轨迹本身就是最直接的地面证据——狗站在那的时候,
+    脚下必然是地面, 不需要雷达另外确认一遍。
+
+    做法: 轨迹重采样成密集点列(resample_polyline), 每格用最近的 k 个轨迹点
+    做反距离加权(IDW)插值算出"这格大概率的地面高度"。只在 max_radius 内插值——
+    离轨迹太远的地方插出来的高度没有依据, 保持 NaN(未知)比瞎猜安全; 这个半径
+    也顺带划了"单层地图局部高低差"能兜多远的界, 真正有坡道的地方轨迹高度自己
+    会跟着变, 插值自然跟着走, 不需要额外识别"楼梯/楼层"。
+
+    max_radius 不能给太大: 这是按直线距离(不绕墙)算的圆, 给大了会从走廊直接
+    "穿墙"插值到隔壁完全没探索过的房间/室外, 把墙外空地也判成 free(实测 house
+    这份图给 8m 的时候, 大片跑到房子轮廓外面的区域被判成一整片圆形的 free)。
+    真正"轨迹没直接到、但被墙圈起来的空旷区域"(比如大厅中间)不靠加大这个半径
+    去够, 交给 fill_enclosed_unknown 按连通性去填——那个不会穿墙, 只会填真正
+    封闭的区域, 这里的半径给小一点(几米量级)更安全。
+
+    返回形状 (height, width) 的地面高程数组, NaN = 离轨迹超过 max_radius。
+    """
+    x_min, x_max, y_min, y_max = bounds
+    width = int(np.ceil((x_max - x_min) / resolution))
+    height = int(np.ceil((y_max - y_min) / resolution))
+
+    traj = resample_polyline(trajectory, resolution / 2)
+    ground_z = traj[:, 2] - delta
+
+    tree = cKDTree(traj[:, :2])
+    cols, rows = np.meshgrid(np.arange(width), np.arange(height))
+    cell_xy = np.stack([
+        (x_min + (cols + 0.5) * resolution).ravel(),
+        (y_max - (rows + 0.5) * resolution).ravel(),
+    ], axis=1)
+
+    kk = min(k, len(traj))
+    dist, idx = tree.query(cell_xy, k=kk)
+    if kk == 1:
+        dist, idx = dist[:, None], idx[:, None]
+
+    w = np.where(dist <= max_radius, 1.0 / np.maximum(dist, 1e-6), 0.0)
+    wsum = w.sum(axis=1)
+    z = (w * ground_z[idx]).sum(axis=1) / np.maximum(wsum, 1e-9)
+    z[wsum <= 0] = np.nan
+    return z.reshape(height, width).astype(np.float32)
+
+
+def detect_structure(
+    points: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    z_lo: float,
+    z_hi: float,
+    z_bin: float,
+    min_support: int,
+    min_span_bins: int,
+) -> np.ndarray:
+    """跟地面高度完全无关地识别"纵向有实体撑着"的格子(墙/柱子/大件家具...),
+    产出全局规划器用的 occupied 掩膜。
+
+    之前判障碍靠"这格离地面 [obstacle_lo, obstacle_hi] 这段有没有点", 依赖
+    "这格有没有地面参考"——但地面参考是从轨迹插值来的(estimate_trajectory_
+    ground), 离轨迹稍远(墙、柱子这类地方轨迹本来就不会贴过去)就没有地面参考,
+    墙反而判不出来。这里换成完全不依赖地面参考的判据: 按 z_bin 切层统计
+    [z_lo, z_hi] 范围内的点数, 要求至少 min_span_bins 个不同切层各自都有
+    min_support 个点支撑才算"有实体"——贯穿地板到天花板的墙到处都有支撑,
+    能轻松过关; 只集中在一两层的孤立悬空杂物(远处扫到的碎片、反光噪点)过
+    不了这一关, 天然被滤掉, 不需要额外猜一个"多高算太高"的阈值。
+
+    [z_lo, z_hi] 建议按轨迹高度居中开一个几米宽的窗口(轨迹中位数 z 上下各
+    几米)——单层地图里真正的结构都在这个范围内, 天花板/屋顶横梁这类远高于
+    正常层高的东西天然被排除在窗口外。
+
+    返回布尔数组, 形状 (height, width), True=occupied。
+    """
+    x_min, x_max, y_min, y_max = bounds
+    width = int(np.ceil((x_max - x_min) / resolution))
+    height = int(np.ceil((y_max - y_min) / resolution))
+    nz = max(1, int(np.ceil((z_hi - z_lo) / z_bin)))
+
+    inb = (
+        (points[:, 0] >= x_min) & (points[:, 0] < x_max)
+        & (points[:, 1] >= y_min) & (points[:, 1] < y_max)
+        & (points[:, 2] >= z_lo) & (points[:, 2] < z_hi)
+    )
+    q = points[inb]
+    col = np.clip(((q[:, 0] - x_min) / resolution).astype(np.int32), 0, width - 1)
+    row = np.clip(((y_max - q[:, 1]) / resolution).astype(np.int32), 0, height - 1)
+    zbi = np.clip(((q[:, 2] - z_lo) / z_bin).astype(np.int32), 0, nz - 1)
+
+    hist = np.zeros((height, width, nz), np.int32)
+    np.add.at(hist, (row, col, zbi), 1)
+    populated_bins = (hist >= min_support).sum(axis=2)
+    return populated_bins >= min_span_bins
+
+
+def classify_occupancy(ground: np.ndarray, structure: np.ndarray) -> np.ndarray:
+    """合并地面参考(estimate_trajectory_ground)和结构检测(detect_structure),
+    产出全局规划器用的占据栅格。
+
+    ground 决定 free/unknown 的边界(有地面参考才谈得上"确认可通行"), structure
+    决定 occupied——两者是独立算出来的, occupied 不要求这一格同时有地面参考,
+    墙/柱子这类地方轨迹本来就不会贴过去、没有地面参考, 但一样能靠点云本身的
+    纵向结构判出来。occupied 优先于 free: 哪怕轨迹插值出的地面参考说这格
+    "可通行", 只要点云证据显示这里有实体撑着, 还是判 occupied。
+
+    返回 map_server 灰度约定的栅格: 254=free / 0=occupied / 205=unknown, 形状
+    跟 ground 一致。
+    """
+    grid = np.where(np.isfinite(ground), np.uint8(254), np.uint8(205))
+    grid[structure] = 0
+    return grid
+
+
+def fill_enclosed_unknown(grid: np.ndarray, wall_dilate_px: int = 3) -> np.ndarray:
+    """把被围死在墙里、够不着地图外沿的 unknown 格子填成 free。
+
+    大跨度地图(实测 large 这份图)里, 房间中间离墙/离轨迹够远的地方, 地面是
+    全场采样最差的面(见 elevation.py 顶部说明), 常常一个地面点都扫不到——
+    实测抽查过一个 800m² 大厅中间的格子, 半径 1m 内有 35 个点, 全在 2.2~2.6m
+    (屋顶), 地面高度上一个点都没有。这类格子按点云证据只能是 unknown, 但它
+    明明四面都被已经认出来的墙圈住, 硬说"不知道能不能走"不合理——真要有个没
+    扫到的障碍物, 也是 SCAN-Planner 的局部重规划(对着实时 grid_map_ 跑, 见
+    global_planner.py 模块说明)负责躲开, 全局这条路本来就只是给个大致走向,
+    不需要每一格都有地面实锤。
+
+    做法: 把 occupied 当墙, 从地图最外圈边框出发, 沿 free/unknown(不穿墙)
+    做连通域标记——凡是这样都摸不到边框的连通块, 就是被墙圈死的封闭区域,
+    里面的 unknown 格子改判 free。真正"没探索到的地方"(比如整张图边缘那一圈
+    根本没建图的区域)本来就连着地图边框, 不会被误填。
+
+    判连通性之前把 occupied 先膨胀 wall_dilate_px 格再当墙用(只影响这里怎么
+    切连通域, 不改 grid 本身的 occupied 格子)——实测(large 这张图)真实墙面
+    有零星的单像素扫描空洞, 直接拿原始 occupied 当墙, 骨架上一个像素的缺口
+    就能让"房间中间"跟"地图最外圈的未探索区域"连通, 整个填洞判断直接失效
+    (实测: 826293 个格子连成一整块摸到边框, 一个都没填成)。膨胀 3 格(0.3m)
+    能补上这种针眼大小的缺口, 又不会把真正的门(通常 >=0.7m 宽)也堵死——
+    门洞膨胀后两边依然连着。
+
+    直接原地改 grid 并返回。
+    """
+    walls = grid == 0
+    if wall_dilate_px > 0:
+        walls = binary_dilation(walls, iterations=wall_dilate_px)
+    labeled, _ = label(~walls, structure=np.ones((3, 3), dtype=int))
+    border_ids = np.unique(np.concatenate(
+        [labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]]
+    ))
+    border_ids = border_ids[border_ids != 0]
+    enclosed = (labeled != 0) & ~np.isin(labeled, border_ids)
+    grid[enclosed & (grid == 205)] = 254
+    return grid
+
+
+def clear_trajectory(
+    grid: np.ndarray,
+    trajectory: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    radius: float,
+) -> np.ndarray:
+    """狗真的走过的地方(轨迹本身 + 膨胀半径 radius 之内)强制标 free, 压过点云
+    密度判据的结论——轨迹是最强的"这里能走"证据, 点云侧的误判(比如自己身体/
+    腿部反光造成的假阳性障碍)不该覆盖它。
+
+    radius 建议直接传 backend/app/config.py 的 GLOBAL_PLANNER_INFLATION_RADIUS_M
+    ——全局规划器规划路径时本来就假设"轨迹周围这个半径内没有障碍物"(拿它膨胀
+    障碍再规划), 这里只是让 2D 图跟这个假设保持一致, 不是另外发明一个容忍范围。
+
+    直接原地改 grid 并返回。
+    """
+    x_min, x_max, y_min, y_max = bounds
+    height, width = grid.shape
+    traj = resample_polyline(trajectory, resolution / 2)
+    radius_px = max(1, int(round(radius / resolution)))
+    col = np.clip(((traj[:, 0] - x_min) / resolution).astype(np.int32), 0, width - 1)
+    row = np.clip(((y_max - traj[:, 1]) / resolution).astype(np.int32), 0, height - 1)
+    for r, c in zip(row, col):
+        r0, r1 = max(0, r - radius_px), min(height, r + radius_px + 1)
+        c0, c1 = max(0, c - radius_px), min(width, c + radius_px + 1)
+        grid[r0:r1, c0:c1] = 254
+    return grid

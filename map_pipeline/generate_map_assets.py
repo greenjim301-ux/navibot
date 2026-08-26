@@ -3,9 +3,16 @@
 离线地图资产生成脚本。
 
 输入: <storage_path>/ 下的
-  3d_map/dense_cloud_map.pcd   稠密重建点云
-  2d_map/map_2d.pgm + .yaml    map_server 格式的 2D 占据栅格图 (没有就跳过,
-                                不是每份地图都有)
+  3d_map/dense_cloud_map.pcd     稠密重建点云
+  3d_map/keyframe_info_3d.txt    建图轨迹关键帧位姿, 直接插值出地面高度参考
+                                  (见 elevation.estimate_sensor_height /
+                                  estimate_trajectory_ground)
+  2d_map/map_2d.pgm + .yaml      handbot slam 自带的 2D 占据栅格图。默认会被
+                                  本脚本从点云重新生成的版本覆盖掉(见
+                                  --gen-2d-map)——slam 自带的图是按固定扫描
+                                  高度切片判占据, 漏掉切片高度之外的障碍;
+                                  没有 keyframe_info_3d.txt 生成不了就沿用
+                                  原文件, 都没有就跳过
 输出 (web_assets/map/<room>/ 下):
   topview_meta.json       地图基础几何信息: world_bounds(含 z_min/z_max, 从点云
                            算, 3D 预览用) + topview2d(2D 栅格图的分辨率/像素尺寸/
@@ -45,6 +52,8 @@ import numpy as np
 import open3d as o3d
 from PIL import Image
 
+import elevation
+
 # Pillow 默认给大图片加了个"解压炸弹"保护(超过约 1.8 亿像素就拒绝打开), 防的是
 # 处理不可信的上传文件。这里的 2D 栅格图是离线管线自己从本机 SLAM 输出读的
 # 可信文件, "big" 这种大范围室外图轻松超过这个像素数(444M 像素), 关掉这个
@@ -78,6 +87,15 @@ TILE_POINT_BUDGET = 150_000
 # 跟 --max-preview-points(没分片的小地图的"要不要降采样"阈值, 那些地图没有
 # 分片兜底, 精度不能省)是两回事, 分开控制。
 TILED_OVERVIEW_TARGET_POINTS = 1_500_000
+
+# 2D 占据栅格图分辨率按地图跨度自动选, 不用命令行手动指定(--map2d-resolution
+# 显式传值时优先用那个值, 这两个默认值只在没传的时候生效): 跨度超过
+# MAP2D_RESOLUTION_EXTENT_THRESHOLD_M(跟大地图分片走的是同一个"大跨度"直觉,
+# 但阈值单独定, 跟 TILE_EXTENT_THRESHOLD_M 不是一回事)的用 0.1m/格, 没超的用
+# 0.05m/格——小地图(房间尺度)细一点分辨率能看清家具/门框, 大地图(仓库/室外)
+# 格子数会指数级涨(width*height*nz 那个 3D 直方图, 见 detect_structure), 细
+# 分辨率在这种图上既慢又占内存, 且大跨度图本来精度需求也没那么高。
+MAP2D_RESOLUTION_EXTENT_THRESHOLD_M = 100.0
 
 
 class _BooleanOptionalAction(argparse.Action):
@@ -200,6 +218,25 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path, long_edg
             "y_min": origin_y, "y_max": origin_y + orig_h * resolution,
         },
     }
+
+
+def write_map_server_grid(grid: np.ndarray, out_pgm: Path, out_yaml: Path,
+                           resolution: float, origin_x: float, origin_y: float) -> None:
+    """按 ROS map_server 的 pgm+yaml 约定写占据栅格图 (grid 是 elevation.
+    classify_occupancy 产出的 254/0/205 灰度数组), 跟 backend/app/global_planner.py
+    的 _read_pgm/_parse_yaml、以及本文件 export_topview_png 的 _parse_map2d_yaml
+    读法完全对应。origin 是图像左下角像素(数组最后一行)对应的世界坐标, 跟
+    grid 本身 "第 0 行 = world y_max" 的行约定(elevation.py 里 build_elevation/
+    estimate_trajectory_ground 用的是同一套)配套, 不需要翻转。"""
+    Image.fromarray(grid, mode="L").save(out_pgm)
+    out_yaml.write_text(
+        f"image: {out_pgm.name}\n"
+        f"resolution: {resolution}\n"
+        f"origin: [{origin_x}, {origin_y}, 0.0]\n"
+        f"negate: 0\n"
+        f"occupied_thresh: 0.65\n"
+        f"free_thresh: 0.196\n"
+    )
 
 
 def height_to_color(z: np.ndarray, vmin: float | None = None, vmax: float | None = None) -> np.ndarray:
@@ -367,13 +404,39 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default="mapdata/livingroom/dense_cloud_map.pcd")
     ap.add_argument("--outdir", default="web_assets/map")
-    ap.add_argument("--max-preview-points", type=int, default=3_000_000,
+    ap.add_argument("--max-preview-points", type=int, default=6_000_000,
                      help="3D 预览点数阈值: 不超过就原样导出, 超过则用固定体素大小降"
                           "采样到接近这个点数(voxel_downsample_to_target, 不是随机丢点)")
     ap.add_argument("--preview-hide-ceiling", action=_BooleanOptionalAction, default=False,
                      help="3D 预览是否裁掉天花板附近的点 (默认不裁)")
     ap.add_argument("--preview-ceiling-margin", type=float, default=0.35,
                      help="裁剪天花板时从点云最高点往下留的余量 (m), 越大裁得越多")
+    ap.add_argument("--gen-2d-map", action=_BooleanOptionalAction, default=True,
+                     help="从点云 + keyframe_info_3d.txt 生成占据栅格图, 覆盖掉 2d_map/"
+                          "map_2d.pgm(+.yaml)——handbot slam 自带的那张图是按固定扫描"
+                          "高度切片判占据, 会漏掉切片高度之外的障碍。关掉这个开关就跳过"
+                          "生成, 沿用已有文件(默认开)")
+    ap.add_argument("--map2d-resolution", type=float, default=None,
+                     help="生成占据栅格图的格子大小 (m/格), 同时也是 estimate_trajectory_ground "
+                          "的地面高程格子大小。不传则按地图跨度自动选: 超过 "
+                          f"{MAP2D_RESOLUTION_EXTENT_THRESHOLD_M:.0f}m 用 0.1, 没超用 0.05 "
+                          "(见 MAP2D_RESOLUTION_EXTENT_THRESHOLD_M)")
+    ap.add_argument("--map2d-trajectory-max-radius", type=float, default=3.0,
+                     help="estimate_trajectory_ground 从轨迹插值地面高度时的最大半径(m)——"
+                          "按直线距离算的圆, 离轨迹超过这个距离的格子插不出地面, 保持"
+                          "unknown。给太大会直接'穿墙'插值到隔壁没探索过的区域(实测给 8m "
+                          "时大片房子轮廓外的区域被判成一整片圆形的 free), 给几米量级更安全"
+                          "——真正轨迹没直接到、但被墙圈起来的空旷区域靠 fill_enclosed_"
+                          "unknown 按连通性去填, 不靠加大这个半径")
+    ap.add_argument("--map2d-structure-min-support", type=int, default=3,
+                     help="detect_structure 判'这一层有支撑'的单层原始点数阈值")
+    ap.add_argument("--map2d-structure-min-span-bins", type=int, default=5,
+                     help="detect_structure 判'这格有纵向实体撑着'(墙/柱子, 而不是孤立悬空"
+                          "杂物)所需的最少支撑层数, 乘以 z_bin(0.1m)就是要求的最小纵向跨度")
+    ap.add_argument("--map2d-trajectory-clear-radius", type=float, default=0.25,
+                     help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
+                          "误判——默认 0.25 跟 backend/app/config.py 的"
+                          "GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致, 不要单独改")
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -402,24 +465,98 @@ def main():
           f"  跨度={max_extent_xy:.1f}m")
     _log_step_done(t_step)
 
-    print("[2/5] 生成 2D 俯视栅格图 (设置路线用)...")
+    if args.map2d_resolution is not None:
+        map2d_resolution = args.map2d_resolution
+    else:
+        map2d_resolution = 0.10 if max_extent_xy > MAP2D_RESOLUTION_EXTENT_THRESHOLD_M else 0.05
+        print(f"      2D 占据栅格图分辨率按跨度自动选: {map2d_resolution}m/格 "
+              f"(跨度{'>' if max_extent_xy > MAP2D_RESOLUTION_EXTENT_THRESHOLD_M else '<='}"
+              f"{MAP2D_RESOLUTION_EXTENT_THRESHOLD_M:.0f}m)")
+
+    print("[2/5] 生成 2D 占据栅格图 (全局规划 + 设置路线 用)...")
     t_step = time.perf_counter()
     # 跟 3d_map 同级的 2d_map/ 目录, 是 map-data-dir/<name>/ 的固定目录结构
     # (见 backend/app/config.py 的 MAP_DATA_DIR 注释), 这里直接从
     # --input(3d_map/dense_cloud_map.pcd)反推兄弟目录, 不用额外加命令行参数。
-    # 不是每份地图都有这个源图(比如只导了点云没导 2D 栅格图的旧地图), 没有
-    # 就跳过, topview_meta.json 里不写 topview2d 字段, 前端得处理"没有"这种
-    # 情况, 不能假设它总存在。
     map2d_dir = in_path.parent.parent / "2d_map"
     pgm_path, yaml_path = map2d_dir / "map_2d.pgm", map2d_dir / "map_2d.yaml"
+
+    if args.gen_2d_map:
+        trajectory = elevation.load_trajectory(in_path.parent)
+        if trajectory is None:
+            print(f"      {in_path.parent} 下没有 keyframe_info_3d.txt(或 keyframe_pos_3d.pcd), "
+                  f"没法从点云生成占据栅格图, 跳过——沿用已有文件(如果有)")
+        else:
+            # 地面高程不从点云的地面证据来, 从轨迹插值来(estimate_trajectory_
+            # ground)——扫不到地面是常态, 不是例外(地面是全场雷达采样最差的
+            # 面), 死等点云证据(不管是 build_elevation 那套生长扩散, 还是后来
+            # 试过的"逐格局部窗口找地面")都会在大跨度/空旷区域留下大片本可通行
+            # 却因为没扫到地面而判成 unknown 的地方(实测 large 这份图 800m² 大
+            # 厅中间抽查一格, 半径 1m 内 35 个点全在天花板高度, 地面一个点都
+            # 没有)。轨迹本身就是最直接的地面证据——狗站在那的时候, 脚下必然
+            # 是地面, 不需要雷达另外确认。
+            delta = elevation.estimate_sensor_height(raw_points, trajectory)
+            if delta is None:
+                print("      轨迹脚下找不到任何地面, 没法生成占据栅格图, 跳过——"
+                      "沿用已有文件(如果有)")
+            else:
+                # 地面参考半径给小一点(几米量级)——这是按直线距离算的圆, 给大了
+                # 会直接"穿墙"插值到隔壁没探索过的房间/室外(实测 house 给 8m 时,
+                # 大片房子轮廓外面的区域被判成一整片圆形的 free)。真正"轨迹没
+                # 直接到但被墙圈起来的空旷区域"靠 fill_enclosed_unknown 按连通性
+                # 去填, 不靠加大这个半径。
+                ground = elevation.estimate_trajectory_ground(
+                    trajectory, (x_min, x_max, y_min, y_max), map2d_resolution, delta,
+                    max_radius=args.map2d_trajectory_max_radius,
+                )
+                # 障碍检测跟地面参考彻底分开算(detect_structure), 不依赖这一格
+                # 有没有地面参考——墙、柱子这类地方轨迹本来就不会贴过去, 用地面
+                # 参考去卡"这段有没有点"的话反而判不出墙(见 elevation.py 里
+                # detect_structure 的说明)。z 窗口以轨迹高度为中心开几米, 单层
+                # 地图的墙/柱子都在这个范围, 天花板/屋顶横梁天然被排除在外。
+                traj_z_med = float(np.median(trajectory[:, 2]))
+                structure = elevation.detect_structure(
+                    raw_points, (x_min, x_max, y_min, y_max), map2d_resolution,
+                    z_lo=traj_z_med - 2.0, z_hi=traj_z_med + 2.0, z_bin=0.1,
+                    min_support=args.map2d_structure_min_support,
+                    min_span_bins=args.map2d_structure_min_span_bins,
+                )
+                grid = elevation.classify_occupancy(ground, structure)
+                # 被墙圈死、够不着地图外沿的 unknown 格子(比如大厅中间轨迹没
+                # 直接到、但四面都是刚判出来的墙的地方)改判 free——见
+                # fill_enclosed_unknown 说明。
+                grid = elevation.fill_enclosed_unknown(grid)
+                # 狗真的走过的地方不可能有障碍, 用这个压过点云侧的误判(见
+                # clear_trajectory 说明)。0.25 跟 backend/app/config.py 的
+                # GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致——全局规划器规划
+                # 路径时本来就假设轨迹周围这个半径内没有障碍, 2D 图跟这个假设
+                # 对不上的话, 路径规划出来会贴着"障碍"走或者干脆绕不过去。
+                grid = elevation.clear_trajectory(
+                    grid, trajectory, (x_min, x_max, y_min, y_max),
+                    map2d_resolution, radius=args.map2d_trajectory_clear_radius,
+                )
+                map2d_dir.mkdir(parents=True, exist_ok=True)
+                write_map_server_grid(grid, pgm_path, yaml_path, map2d_resolution, x_min, y_min)
+                n_ground = int(np.isfinite(ground).sum())
+                n_free, n_occ, n_unk = int((grid == 254).sum()), int((grid == 0).sum()), int((grid == 205).sum())
+                print(f"      delta={delta:.3f}  插值出地面参考的格子={n_ground}"
+                      f"({n_ground * map2d_resolution ** 2:.1f}m²)")
+                print(f"      生成 {pgm_path}: {grid.shape[1]}x{grid.shape[0]}px, {map2d_resolution}m/px, "
+                      f"free={n_free} occupied={n_occ} unknown={n_unk}")
+    else:
+        print("      --no-gen-2d-map, 跳过生成, 沿用已有文件(如果有)")
+
+    # 不是每份地图都有 2D 栅格图(比如只导了点云、生成也失败/关掉了的旧地图),
+    # 没有就跳过, topview_meta.json 里不写 topview2d 字段, 前端得处理"没有"这种
+    # 情况, 不能假设它总存在。
     topview2d = None
     if pgm_path.is_file() and yaml_path.is_file():
         topview2d = export_topview_png(pgm_path, yaml_path, out_dir / "topview.png", TOPVIEW_LONG_EDGE_CAP)
         print(f"      {pgm_path} -> topview.png: {topview2d['width']}x{topview2d['height']}px, "
               f"分辨率 {topview2d['resolution_m_per_px']:.4f}m/px")
     else:
-        print(f"      {pgm_path} 不存在, 跳过(这份地图没有 2D 栅格图源, "
-              f"前端\"设置路线\"功能对这份地图不可用)")
+        print(f"      {pgm_path} 不存在, 跳过(这份地图没有 2D 栅格图, "
+              f"前端\"设置路线\"/全局规划功能对这份地图不可用)")
     _log_step_done(t_step)
 
     print("[3/5] 点云降采样(整图预览用)...")
