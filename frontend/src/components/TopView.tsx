@@ -3,7 +3,7 @@ import { Stage, Layer, Image as KonvaImage, Circle, Line, Text, RegularPolygon, 
 import useImage from "use-image";
 import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import type { NavStatus, Topview2D, Waypoint } from "../types";
+import type { NavStatus, PlannedRoutePoint, Topview2D, Waypoint, XY } from "../types";
 import { mapAssetUrl } from "../api";
 import { pixelToWorld, worldToPixel } from "../types";
 
@@ -13,6 +13,16 @@ interface Props {
   waypoints: Waypoint[];
   onChangeWaypoints: (wps: Waypoint[]) => void;
   editable: boolean;
+  /** "设置起终点"(路线预览)模式, 跟 editable(设置路线) 互斥, 用法/手势跟
+   *  PointCloudView 的同名 prop 完全一致: 左键先设起点再设终点, 两个都设好了
+   *  再点不生效; 右键撤销最近设置的那个点(先撤终点, 再撤起点), 不需要点在
+   *  标记上。 */
+  startGoalPickMode?: boolean;
+  startGoal?: { start: XY | null; goal: XY | null };
+  onChangeStartGoal?: (v: { start: XY | null; goal: XY | null }) => void;
+  /** 路线预览算出来的参考路线, 只读展示, 画法/颜色跟 PointCloudView 保持一致
+   *  (青色, 见下面 ROUTE preview 相关常量)。 */
+  plannedRoute?: PlannedRoutePoint[] | null;
   status: NavStatus | null;
   maxWidth?: number;
   /** 画布可视高度上限, 内容超出的部分靠拖拽/缩放查看, 不传则不限制高度 */
@@ -66,6 +76,16 @@ const WAYPOINT_LABEL_OFFSET_PX = { x: 9, y: -8 };
 const WAYPOINT_LABEL_FONT_PX = 13;
 const ROUTE_LINE_STROKE_PX = 2;
 const ROUTE_LINE_DASH_PX: [number, number] = [6, 4];
+// 起点/终点标记跟途经点同一套画法(圆点+编号位置的文字), 颜色/文字区分开:
+// 绿色"起", 红色"终"——跟 PointCloudView 的起终点标记同一套配色。
+const START_GOAL_RADIUS_PX = 7;
+const START_GOAL_STROKE_PX = 1.5;
+const START_GOAL_LABEL_FONT_PX = 13;
+const START_COLOR = "#18a66e";
+const GOAL_COLOR = "#d74747";
+// 路线预览算出来的参考路线, 跟"设置路线"草稿线(#2376e5)区分开, 用青色——
+// 跟 PointCloudView 的 plannedRouteMaterial 同一个强调色。
+const PLANNED_ROUTE_COLOR = "#22d3ee";
 const ROBOT_RADIUS_PX = 10;
 const ROBOT_STROKE_PX = 1.5;
 const HOVER_RADIUS_PX = 4;
@@ -89,6 +109,7 @@ function centerOnOrigin(meta: Topview2D): Topview2D {
 
 export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
+  startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null,
   maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight, defaultZoom = DEFAULT_ZOOM,
   showControls = true, onViewChange,
 }, ref) {
@@ -198,7 +219,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
 
   function handleClick(e: KonvaEventObject<MouseEvent>) {
-    if (!editable) return;
+    if (!editable && !startGoalPickMode) return;
     if (!e.target.getStage()) return;
     // 在内容 Group 上取相对指针位置, 会自动把当前的缩放/拖拽/旋转都换算掉,
     // 拿到跟旋转前完全一样的内容坐标系坐标, 换算逻辑不用因为加了旋转而改变。
@@ -208,9 +229,34 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
     const row = pointer.y / baseScale;
     const { x, y } = pixelToWorld(centeredMeta, col, row);
 
+    if (startGoalPickMode) {
+      const current = startGoal ?? { start: null, goal: null };
+      if (current.start && current.goal) return;
+      if (!current.start) {
+        onChangeStartGoal?.({ start: { x, y }, goal: null });
+      } else {
+        onChangeStartGoal?.({ start: current.start, goal: { x, y } });
+      }
+      return;
+    }
+
     const prev = waypoints[waypoints.length - 1];
     const yaw = prev ? Math.atan2(y - prev.y, x - prev.x) : 0;
     onChangeWaypoints([...waypoints, { x, y, yaw }]);
+  }
+
+  // 起终点拾取的右键撤销: 跟 PointCloudView.handleStartGoalClick 同一个手势,
+  // 在画布任意位置点右键都行, 不需要精确点在起点/终点的标记上——只有两个点,
+  // 用不着像途经点删除那样靠"点在标记上"来确定删哪个。
+  function handleContextMenu(e: KonvaEventObject<PointerEvent>) {
+    e.evt.preventDefault();
+    if (!startGoalPickMode) return;
+    const current = startGoal ?? { start: null, goal: null };
+    if (current.goal) {
+      onChangeStartGoal?.({ start: current.start, goal: null });
+    } else if (current.start) {
+      onChangeStartGoal?.({ start: null, goal: null });
+    }
   }
 
   function removeWaypoint(idx: number) {
@@ -247,12 +293,12 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
           setHover(p ? { x: p.x, y: p.y } : null);
         }}
         onMouseLeave={() => setHover(null)}
-        onContextMenu={(e) => e.evt.preventDefault()}
+        onContextMenu={handleContextMenu}
         // #cdcdcd 是 ROS map_server pgm 里"未知"栅格的灰度值(见
         // generate_map_assets.py export_topview_png 的注释: negate=0 时黑占据/
         // 白空闲/灰未知), 图里大片留白区域就是这个颜色——画布背景跟它对齐,
         // 图片边缘/画布没铺满的地方才不会露出一圈色差。
-        style={{ cursor: editable ? "crosshair" : "default", background: "#cdcdcd" }}
+        style={{ cursor: editable || startGoalPickMode ? "crosshair" : "default", background: "#cdcdcd" }}
       >
         <Layer>
           <Group
@@ -345,6 +391,50 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               );
             })}
 
+            {/* 路线预览算出来的参考路线, 只读展示, 不接收点击 */}
+            {plannedRoute && plannedRoute.length >= 2 && (
+              <Line
+                points={plannedRoute.flatMap((p) => {
+                  const rp = worldToPixel(centeredMeta, p.x, p.y);
+                  return [rp.col * baseScale, rp.row * baseScale];
+                })}
+                stroke={PLANNED_ROUTE_COLOR}
+                strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
+                listening={false}
+              />
+            )}
+
+            {/* 起点/终点标记, 跟途经点标记同一套画法, 右键撤销靠 handleContextMenu
+                (画布任意位置都行, 不需要精确点在标记上), 这里不用单独接右键。 */}
+            {([
+              startGoal?.start ? { key: "start", label: "起", pt: startGoal.start, color: START_COLOR } : null,
+              startGoal?.goal ? { key: "goal", label: "终", pt: startGoal.goal, color: GOAL_COLOR } : null,
+            ].filter(Boolean) as { key: string; label: string; pt: XY; color: string }[]).map((entry) => {
+              const p = worldToPixel(centeredMeta, entry.pt.x, entry.pt.y);
+              const px = p.col * baseScale;
+              const py = p.row * baseScale;
+              return (
+                <Group key={entry.key} listening={false}>
+                  <Circle
+                    x={px}
+                    y={py}
+                    radius={START_GOAL_RADIUS_PX / zoom}
+                    fill={entry.color}
+                    stroke="#fff"
+                    strokeWidth={START_GOAL_STROKE_PX / zoom}
+                  />
+                  <Text
+                    x={px + WAYPOINT_LABEL_OFFSET_PX.x / zoom}
+                    y={py + WAYPOINT_LABEL_OFFSET_PX.y / zoom}
+                    text={entry.label}
+                    fontSize={START_GOAL_LABEL_FONT_PX / zoom}
+                    fill="#111"
+                    rotation={-rotation}
+                  />
+                </Group>
+              );
+            })}
+
             {robotPx && (
               <RegularPolygon
                 x={robotPx.col * baseScale}
@@ -358,7 +448,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               />
             )}
 
-            {editable && hover && (
+            {(editable || startGoalPickMode) && hover && (
               <Circle x={hover.x} y={hover.y} radius={HOVER_RADIUS_PX / zoom} fill="rgba(37,99,235,0.4)" listening={false} />
             )}
           </Group>
@@ -382,7 +472,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               background: "rgba(255,255,255,0.8)", padding: "1px 5px", borderRadius: 3,
             }}
           >
-            {Math.round(zoom * 100)}% · {rotation}° · 滚轮缩放 / 拖拽平移{editable ? " / 左键加点 · 右键删点" : ""}
+            {Math.round(zoom * 100)}% · {rotation}° · 滚轮缩放 / 拖拽平移{editable ? " / 左键加点 · 右键删点" : startGoalPickMode ? " / 左键设起终点 · 右键撤销" : ""}
           </div>
         </>
       )}

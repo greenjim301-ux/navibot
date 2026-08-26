@@ -642,6 +642,20 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         return d < bestD ? h : best;
       }, undefined);
     }
+    // 点云有空洞(没扫到/被遮挡的地方)时, 光标下可能一个点都碰不到, 点选就完全
+    // 没反应。兜底跟一个水平面(假定地面高度取 world_bounds.z_min, 约等于地板)
+    // 求交, 用交点的 x/y——顶视角下这个假设带来的视差(跟真实地面的 x/y 偏差)
+    // 很小, 倾斜视角下会有一点, 但比"点哪都点不上"好得多。z 无所谓准不准, 摆点/
+    // 画路线/居中之后各自还会按 x/y 查真实地面高度(见 useGroundZ)。
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -meta.world_bounds.z_min);
+    function pickXYZ(pickable: THREE.Points[]): { x: number; y: number; z: number } | undefined {
+      const hits = raycaster.intersectObjects(pickable, false);
+      const hit = nearestToRayHit(hits);
+      if (hit) return { x: hit.point.x, y: hit.point.y, z: hit.point.z };
+      const fallback = new THREE.Vector3();
+      return raycaster.ray.intersectPlane(groundPlane, fallback)
+        ? { x: fallback.x, y: fallback.y, z: fallback.z } : undefined;
+    }
     let pointerDownPos: { x: number; y: number; button: number } | null = null;
     const CLICK_MOVE_THRESHOLD_PX = 5;
 
@@ -672,10 +686,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         const pickable: THREE.Points[] = [];
         if (points) pickable.push(points);
         loadedTiles.forEach((tp) => pickable.push(tp));
-        const hits = raycaster.intersectObjects(pickable, false);
-        const hit = nearestToRayHit(hits);
-        if (!hit) return;
-        const { x, y } = hit.point;
+        const picked = pickXYZ(pickable);
+        if (!picked) return;
+        const { x, y } = picked;
         const list = waypointsRef.current;
         const prev = list[list.length - 1];
         const yaw = prev ? Math.atan2(y - prev.y, x - prev.x) : 0;
@@ -720,10 +733,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       const pickable: THREE.Points[] = [];
       if (points) pickable.push(points);
       loadedTiles.forEach((tp) => pickable.push(tp));
-      const hits = raycaster.intersectObjects(pickable, false);
-      const hit = nearestToRayHit(hits);
-      if (!hit) return;
-      const { x, y } = hit.point;
+      const picked = pickXYZ(pickable);
+      if (!picked) return;
+      const { x, y } = picked;
       if (!current.start) {
         onChangeStartGoalRef.current?.({ start: { x, y }, goal: null });
       } else {
@@ -768,10 +780,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       const pickable: THREE.Points[] = [];
       if (points) pickable.push(points);
       loadedTiles.forEach((tp) => pickable.push(tp));
-      const hits = raycaster.intersectObjects(pickable, false);
-      const hit = nearestToRayHit(hits);
-      if (hit) {
-        controls.target.copy(hit.point);
+      const picked = pickXYZ(pickable);
+      if (picked) {
+        controls.target.set(picked.x, picked.y, picked.z);
         controls.update();
         needsRenderRef.current = true;
       }

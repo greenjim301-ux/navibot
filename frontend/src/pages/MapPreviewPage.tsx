@@ -86,9 +86,8 @@ export default function MapPreviewPage() {
   // 算出来的参考路线补好 z 画出来看, 调用 planPath 时 publish 传 false, 不会
   // 下发给 navi_mode=3(/initial_path), 也不经过 RouteManager 的状态机, 所以
   // 这里的 planning/plannedRoute 跟上面的 submitting/navRunning 是两套互不
-  // 干扰的状态。只支持 3D 点云拾取(见下面 PointCloudView 的
-  // startGoalPickMode), 不像"导航控制"那样 2D/3D 都支持——2D 栅格图(TopView,
-  // Konva)目前没有配套的拾取逻辑, 没必要为了这一个面板单独再实现一遍。
+  // 干扰的状态。3D 点云(PointCloudView)/2D 栅格(TopView)都支持拾取, 跟
+  // viewMode 无关, 语义/手势两边完全一致(参考"导航控制"的 waypoints)。
   const [startGoal, setStartGoal] = useState<{ start: XY | null; goal: XY | null }>({
     start: null, goal: null,
   });
@@ -279,6 +278,10 @@ export default function MapPreviewPage() {
                 waypoints={waypoints}
                 onChangeWaypoints={setWaypoints}
                 editable={routeEditing}
+                startGoalPickMode={startGoalPicking}
+                startGoal={startGoal}
+                onChangeStartGoal={setStartGoal}
+                plannedRoute={plannedRoute}
                 status={liveStatus}
                 maxWidth={viewportSize.width}
                 maxHeight={viewportSize.height}
@@ -447,10 +450,10 @@ export default function MapPreviewPage() {
                     A* 全局规划(global_planner.py), 补好 z 算出参考路线画出来
                     看——调用 planPath 时 publish 传 false, 只看规划结果, 不会
                     真的下发给 navi_mode=3(/initial_path), 也不会让机器狗动。
-                    只支持 3D 拾取, 2D 栅格图下整个面板禁用(见 startGoalPickMode
-                    相关的 PointCloudView props)。 */}
+                    3D/2D 都支持拾取(见 startGoalPickMode 相关的 PointCloudView/
+                    TopView props)。 */}
                 <PanelSection title="路线预览">
-                  <div className={cn("flex flex-col gap-1.5 transition-opacity", viewMode === "2d" && "pointer-events-none opacity-40")}>
+                  <div className="flex flex-col gap-1.5">
                     <PanelButton
                       icon={Flag}
                       label="设置起终点"
