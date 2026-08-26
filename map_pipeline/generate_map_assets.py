@@ -428,6 +428,10 @@ def main():
                           "时大片房子轮廓外的区域被判成一整片圆形的 free), 给几米量级更安全"
                           "——真正轨迹没直接到、但被墙圈起来的空旷区域靠 fill_enclosed_"
                           "unknown 按连通性去填, 不靠加大这个半径")
+    ap.add_argument("--map2d-structure-margin-lo", type=float, default=1.0,
+                     help="detect_structure 的 z 窗口下界 = 轨迹高度 1% 分位数 - 这个值(m)")
+    ap.add_argument("--map2d-structure-margin-hi", type=float, default=1.0,
+                     help="detect_structure 的 z 窗口上界 = 轨迹高度 99% 分位数 + 这个值(m)")
     ap.add_argument("--map2d-structure-min-support", type=int, default=3,
                      help="detect_structure 判'这一层有支撑'的单层原始点数阈值")
     ap.add_argument("--map2d-structure-min-span-bins", type=int, default=5,
@@ -512,12 +516,19 @@ def main():
                 # 障碍检测跟地面参考彻底分开算(detect_structure), 不依赖这一格
                 # 有没有地面参考——墙、柱子这类地方轨迹本来就不会贴过去, 用地面
                 # 参考去卡"这段有没有点"的话反而判不出墙(见 elevation.py 里
-                # detect_structure 的说明)。z 窗口以轨迹高度为中心开几米, 单层
-                # 地图的墙/柱子都在这个范围, 天花板/屋顶横梁天然被排除在外。
-                traj_z_med = float(np.median(trajectory[:, 2]))
+                # detect_structure 的说明)。z 窗口按轨迹本身的高度范围开, 不是
+                # 固定死一个边距: 用 [1,99] 百分位(不用裸 min/max, 防单个异常
+                # 位姿把窗口带偏)当轨迹实际活动的高度区间, 再各自加一段边距——
+                # 这样窗口会跟着轨迹真实的高低起伏自动收缩/放大(比如 large 这
+                # 份图轨迹本身有 0.75m 高差, 固定边距不会跟着变), 天花板/屋顶
+                # 横梁这类远高于正常层高的东西天然被排除在外。
+                traj_z_lo = float(np.percentile(trajectory[:, 2], 1))
+                traj_z_hi = float(np.percentile(trajectory[:, 2], 99))
                 structure = elevation.detect_structure(
                     raw_points, (x_min, x_max, y_min, y_max), map2d_resolution,
-                    z_lo=traj_z_med - 2.0, z_hi=traj_z_med + 2.0, z_bin=0.1,
+                    z_lo=traj_z_lo - args.map2d_structure_margin_lo,
+                    z_hi=traj_z_hi + args.map2d_structure_margin_hi,
+                    z_bin=0.1,
                     min_support=args.map2d_structure_min_support,
                     min_span_bins=args.map2d_structure_min_span_bins,
                 )
