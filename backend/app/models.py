@@ -36,6 +36,11 @@ class XY(BaseModel):
 class PlanPathRequest(BaseModel):
     start: XY
     goal: XY
+    publish: bool = True
+    """是否把规划结果下发给 /initial_path (navi_mode=3)。默认 True 保持原行为；
+    前端"路线预览"这类只是想看看规划结果、不想真的让机器狗动的场景应该传
+    False——传 False 时 main.py 的 plan_path 直接跳过下发这一步, 响应里
+    published 恒为 False 且 publish_error 恒为 None(不是失败, 是没打算发)。"""
 
 
 class PlanPathPoint(BaseModel):

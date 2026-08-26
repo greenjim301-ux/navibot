@@ -81,14 +81,14 @@ export default function MapPreviewPage() {
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
 
-  // 路线规划: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
+  // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
   // 独立的另一条链路——起终点在 2D 栅格图上跑 A* 规划(global_planner.py),
-  // 算出来的参考路线补好 z 直接下发给 navi_mode=3(/initial_path), 不经过
-  // RouteManager 的状态机, 所以这里的 planning/plannedRoute 跟上面的
-  // submitting/navRunning 是两套互不干扰的状态。只支持 3D 点云拾取(见下面
-  // PointCloudView 的 startGoalPickMode), 不像"导航控制"那样 2D/3D 都支持——
-  // 2D 栅格图(TopView, Konva)目前没有配套的拾取逻辑, 没必要为了这一个面板
-  // 单独再实现一遍。
+  // 算出来的参考路线补好 z 画出来看, 调用 planPath 时 publish 传 false, 不会
+  // 下发给 navi_mode=3(/initial_path), 也不经过 RouteManager 的状态机, 所以
+  // 这里的 planning/plannedRoute 跟上面的 submitting/navRunning 是两套互不
+  // 干扰的状态。只支持 3D 点云拾取(见下面 PointCloudView 的
+  // startGoalPickMode), 不像"导航控制"那样 2D/3D 都支持——2D 栅格图(TopView,
+  // Konva)目前没有配套的拾取逻辑, 没必要为了这一个面板单独再实现一遍。
   const [startGoal, setStartGoal] = useState<{ start: XY | null; goal: XY | null }>({
     start: null, goal: null,
   });
@@ -144,10 +144,11 @@ export default function MapPreviewPage() {
     setStartGoalPicking(true);
   }
 
-  /** "设置完成": 起终点都选好了就调用全局规划(尝试直接下发给 navi_mode=3),
-   *  把返回的参考路线画出来; 没选够两个点就只是单纯退出拾取模式。规划本身
-   *  失败(算不出路径)才会让下面这个 await 抛错——下发失败(ROS bridge 没起来
-   *  等)不会, 那种情况路线照样画出来, 只是弹一条非阻塞的提示(见 published)。 */
+  /** "设置完成": 起终点都选好了就调用全局规划, 把返回的参考路线画出来看;
+   *  没选够两个点就只是单纯退出拾取模式。publish 传 false——这是"路线预览",
+   *  只想看看规划结果, 不需要、也不应该真的下发给机器狗(见 planPath 调用)。
+   *  规划本身失败(算不出路径)才会让下面这个 await 抛错; published 恒为
+   *  false(没打算发), publishError 也恒为 None, 不会弹下发失败提示。 */
   async function handleFinishStartGoalPick() {
     if (!startGoal.start || !startGoal.goal) {
       setStartGoalPicking(false);
@@ -156,12 +157,9 @@ export default function MapPreviewPage() {
     setPlanning(true);
     setNavError(null);
     try {
-      const result = await planPath(name, startGoal.start, startGoal.goal);
+      const result = await planPath(name, startGoal.start, startGoal.goal, false);
       setPlannedRoute(result.points);
       setStartGoalPicking(false);
-      if (!result.published) {
-        setNavError(`路线已规划, 但没能下发给机器狗: ${result.publishError ?? "未知原因"}`);
-      }
     } catch (e) {
       setNavError(String(e));
     } finally {
@@ -446,12 +444,12 @@ export default function MapPreviewPage() {
                 </PanelSection>
 
                 {/* 独立于上面的"导航控制"(navi_mode=2): 起终点在 2D 栅格图上跑
-                    A* 全局规划(global_planner.py), 补好 z 直接下发给
-                    navi_mode=3(/initial_path)——"设置完成"点下去就已经算完并
-                    发出去了, 不是"先预览再手动开始导航"那套两步流程。只支持
-                    3D 拾取, 2D 栅格图下整个面板禁用(见 startGoalPickMode 相关
-                    的 PointCloudView props)。 */}
-                <PanelSection title="路线规划">
+                    A* 全局规划(global_planner.py), 补好 z 算出参考路线画出来
+                    看——调用 planPath 时 publish 传 false, 只看规划结果, 不会
+                    真的下发给 navi_mode=3(/initial_path), 也不会让机器狗动。
+                    只支持 3D 拾取, 2D 栅格图下整个面板禁用(见 startGoalPickMode
+                    相关的 PointCloudView props)。 */}
+                <PanelSection title="路线预览">
                   <div className={cn("flex flex-col gap-1.5 transition-opacity", viewMode === "2d" && "pointer-events-none opacity-40")}>
                     <PanelButton
                       icon={Flag}

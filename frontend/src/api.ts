@@ -124,11 +124,16 @@ export interface PlanPathResult {
   publishError: string | null;
 }
 
-export async function planPath(mapName: string, start: XY, goal: XY): Promise<PlanPathResult> {
+export async function planPath(
+  mapName: string,
+  start: XY,
+  goal: XY,
+  publish: boolean = true,
+): Promise<PlanPathResult> {
   const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/plan_path`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ start, goal }),
+    body: JSON.stringify({ start, goal, publish }),
   });
   const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
   return { points: data.points, published: data.published, publishError: data.publish_error };
