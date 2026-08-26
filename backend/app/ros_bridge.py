@@ -5,6 +5,7 @@
 先看那里。
 """
 import logging
+import struct
 import threading
 import time
 from typing import Callable, List, Optional
@@ -12,7 +13,6 @@ from typing import Callable, List, Optional
 import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
-from scan_planner.msg import PlanFinished
 from sensor_msgs import point_cloud2
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Empty
@@ -86,8 +86,12 @@ class RosBridge:
             if self._on_optimal_traj is not None:
                 rospy.Subscriber(config.OPTIMAL_TRAJ_TOPIC, Marker, self._handle_optimal_traj, queue_size=5)
             if self._on_planning_finished is not None:
+                # rospy.AnyMsg, 不是 scan_planner.msg.PlanFinished: 不想让 backend
+                # 的导入依赖另一个 ROS 包建没建、Python 消息绑定生没生成——见
+                # _handle_planning_finished 的说明, 这条消息很简单, 手动解析原始
+                # 字节就够, 没必要为了一个 uint8 字段引入这个包依赖。
                 rospy.Subscriber(
-                    config.PLANNING_FINISHED_TOPIC, PlanFinished, self._handle_planning_finished, queue_size=5,
+                    config.PLANNING_FINISHED_TOPIC, rospy.AnyMsg, self._handle_planning_finished, queue_size=5,
                 )
             logger.info(
                 "ROS bridge started: waypoints=%s initial_path=%s estop=%s odom=%s optimal_traj=%s "
@@ -139,12 +143,38 @@ class RosBridge:
         assert self._on_optimal_traj is not None
         self._on_optimal_traj(points)
 
-    def _handle_planning_finished(self, msg: PlanFinished) -> None:
+    def _handle_planning_finished(self, msg: rospy.AnyMsg) -> None:
         """/planning/finished: 整轮任务只发一次(REACHED 或 EMERGENCY_STOP), 见
-        config.py PLANNING_FINISHED_TOPIC 的说明。只转发 status, 不管 msg.navi_mode
-        ——route_manager 不需要它(见 RouteManager.on_planning_finished 的说明)。"""
+        config.py PLANNING_FINISHED_TOPIC 的说明。
+
+        订阅类型是 rospy.AnyMsg 而不是 scan_planner.msg.PlanFinished ——不想让
+        backend import 那个包(它是 SCAN-Planner 自己的 ROS 包, 跟 navibot 不是
+        同一个 catkin 工作区的产物, 这个包建没建、Python 消息绑定生没生成不该
+        影响 backend 能不能启动)。PlanFinished.msg 的字段很简单
+
+            Header header  (uint32 seq; time stamp(2x uint32); string frame_id)
+            uint8 status
+            int32 navi_mode
+
+        ROS 消息序列化就是按声明顺序原样拼小端字节流, 手动 unpack 出 status 就够,
+        navi_mode 用不上(见 RouteManager.on_planning_finished 的说明), 但还是
+        解出来验证总字节数对不对——万一以后这个 msg 改了字段布局, 至少能从长度
+        对不上发现, 不会静默解出一个错的 status。
+        """
         assert self._on_planning_finished is not None
-        self._on_planning_finished(msg.status)
+        raw = msg._buff
+        try:
+            offset = 4 + 4 + 4  # seq + stamp.secs + stamp.nsecs
+            (frame_id_len,) = struct.unpack_from("<I", raw, offset)
+            offset += 4 + frame_id_len
+            status, navi_mode = struct.unpack_from("<Bi", raw, offset)
+            offset += 1 + 4
+            if offset != len(raw):
+                raise ValueError(f"解析完还剩 {len(raw) - offset} 字节没用上, 消息格式跟预期的不一样")
+        except (struct.error, ValueError) as e:
+            logger.warning("解析 /planning/finished 失败(消息格式变了?), 忽略这条: %s", e)
+            return
+        self._on_planning_finished(status)
 
     def _handle_self_inflation(self, msg: Marker) -> None:
         """/scan_planner_node/self_inflation 一次回调发两个 CYLINDER (id=0 前,

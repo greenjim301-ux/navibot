@@ -70,6 +70,15 @@ INITIAL_PATH_SUB_WAIT_S = float(os.environ.get("NAVIBOT_INITIAL_PATH_WAIT_S", "5
 GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_INFLATION_RADIUS_M", "0.25")
 )
+# 2D 栅格图里灰度 205("未知", map_pipeline/elevation.py 的 mark_known_region
+# 标的——离建图轨迹超过一定距离的 free 格子)不算不可通行(那是 occupied_thresh
+# 的事, 见 global_planner._blocked_mask), 只是全局规划走这类格子的单步代价要
+# 乘这个数——没实地验证过的地方优先绕开, 但绕不开时还是能穿过去, 不会因为
+# "没验证过"就规划不出路。1.0 等于不加价(未知跟已知一视同仁), 数越大越倾向
+# 绕远路也要走验证过的地方。
+GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER", "3.0")
+)
 EMERGENCY_STOP_TOPIC = os.environ.get("NAVIBOT_EMERGENCY_STOP_TOPIC", "/planning/emergency_stop")
 # planner 侧 -> backend, scan_planner/PlanFinished (ROS 包名是 scan_planner, 源码
 # 目录是 plan_manage)。整轮任务只发一次: status=REACHED(到达最终目标)或

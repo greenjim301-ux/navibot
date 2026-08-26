@@ -12,9 +12,12 @@ z 直接用 path_planner.ground_elevation + route_manager 的位姿标定 Δ (�
 /preset_waypoints、/api/maps/{name}/ground 用的是同一套), 不减 body_height_ ——
 那是 SCAN-Planner 自己的配置项(grid_map/body_height), 不用我们操心。
 
-流程: 读 pgm+yaml -> 按 free_thresh 判定"确认自由"的栅格(占据/未知都保守当
-不可通行) -> 按机身半径膨胀障碍 -> 在膨胀后的自由栅格上跑 8 连通 A* -> 贪心
-line-of-sight 剪枝把锯齿收敛成关键拐点 -> 换算回世界坐标。
+流程: 读 pgm+yaml -> 按 occupied_thresh 判定"确认占据"的栅格(只有明确占据才
+不可通行, "未知"——map_pipeline/elevation.py 的 mark_known_region 标的、离
+建图轨迹太远的 free 格子——不挡, 只是走一步的代价乘
+GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER, 优先绕开走验证过的地方, 绕不开还是
+能穿过去) -> 按机身半径膨胀障碍 -> 在膨胀后的自由栅格上跑带权 8 连通 A* ->
+贪心 line-of-sight 剪枝把锯齿收敛成关键拐点 -> 换算回世界坐标。
 
 不用 scipy/pillow: 这两个是 map_pipeline/ 离线预处理专用的重依赖, backend 本身
 不依赖(见 requirements.txt), 这里的 pgm 解析和膨胀都是不到 50 行的 numpy/纯
@@ -104,13 +107,32 @@ def _parse_yaml(path: Path) -> dict:
     return result
 
 
-def _blocked_mask(pgm: np.ndarray, negate: int, free_thresh: float) -> np.ndarray:
-    """规划意义上的"不可通行": 按 ROS map_server 的灰度->占据概率换算(负片
-    negate=1 时反过来), prob >= free_thresh 就不算"确认自由", 包括真正的障碍
-    和没探索过的"未知"区域——未知的地方不能假设能走, 保守当障碍处理。"""
+def _prob(pgm: np.ndarray, negate: int) -> np.ndarray:
+    """ROS map_server 的灰度->占据概率换算(负片 negate=1 时反过来)。"""
     gray = pgm.astype(np.float64)
-    prob = gray / 255.0 if negate else (255.0 - gray) / 255.0
-    return prob >= free_thresh
+    return gray / 255.0 if negate else (255.0 - gray) / 255.0
+
+
+def _blocked_mask(prob: np.ndarray, occupied_thresh: float) -> np.ndarray:
+    """规划意义上的"不可通行": 只有明确判成占据(prob >= occupied_thresh)才挡。
+
+    "未知"(prob 落在 free_thresh 和 occupied_thresh 中间, map_pipeline 的
+    mark_known_region 专门标给"离建图轨迹太远、没实地验证过, 但也没查出障碍"
+    的格子)不挡——不能走的地方是"查出来有障碍", 不是"没验证过"; 未知区域只是
+    走一步的代价更高, 见 _cost_weight, 不是不可通行。"""
+    return prob >= occupied_thresh
+
+
+def _cost_weight(prob: np.ndarray, free_thresh: float, occupied_thresh: float,
+                  unknown_multiplier: float) -> np.ndarray:
+    """A* 单步代价的权重: "未知"格子(free_thresh < prob < occupied_thresh, 既
+    不是明确自由也不是明确占据的中间地带)走一步的代价乘 unknown_multiplier,
+    其余(明确自由)格子权重 1.0——全局规划优先绕开走验证过的地方, 但绕不开时
+    还是能穿过去(占据格子的权重值算出来是多少无所谓, 它们已经被 _blocked_mask
+    挡在 free 之外, A* 根本不会走到, 不需要特殊处理)。"""
+    weight = np.ones(prob.shape, dtype=np.float64)
+    weight[(prob > free_thresh) & (prob < occupied_thresh)] = unknown_multiplier
+    return weight
 
 
 def _dilate_bool(mask: np.ndarray, radius_px: int) -> np.ndarray:
@@ -127,8 +149,12 @@ def _dilate_bool(mask: np.ndarray, radius_px: int) -> np.ndarray:
 
 def _world_to_pixel(x: float, y: float, height: int, resolution: float,
                      origin_x: float, origin_y: float) -> RC:
+    """跟 _pixel_to_world 严格互逆(对着 _pixel_to_world 反解出来的, 别再手改
+    row 那行的 "-1")——之前多减了 1, 每一行都会偏低一格, 到 row=0(地图最上面
+    一整行)时算出 row=-1, "超出地图范围"直接把最上面一整行的起终点都拒了,
+    实测在 house 这份图上触发过。"""
     col = int(math.floor((x - origin_x) / resolution))
-    row = int(math.floor(height - 1 - (y - origin_y) / resolution))
+    row = int(math.floor(height - (y - origin_y) / resolution))
     return row, col
 
 
@@ -144,9 +170,15 @@ def _octile(a: RC, b: RC) -> float:
     return (dr + dc) + (math.sqrt(2) - 2) * min(dr, dc)
 
 
-def _astar(free: np.ndarray, start: RC, goal: RC) -> Optional[List[RC]]:
+def _astar(free: np.ndarray, cost_weight: np.ndarray, start: RC, goal: RC) -> Optional[List[RC]]:
     """8 连通 A*, 禁止穿对角夹缝(两个直连相邻格子都是障碍时不允许斜着穿过去,
-    不然现实里会蹭到墙角)。"""
+    不然现实里会蹭到墙角)。
+
+    单步代价是几何距离(1.0/根号2)乘目标格子的 cost_weight——"未知"格子权重
+    > 1(见 _cost_weight), 一视同仁的格子权重都是 1.0。_octile 启发式按权重
+    恒为 1 算(未知格子的真实代价只会更高不会更低), 所以启发式永远不高估
+    实际代价, A* 的最优性不受影响, 只是遇到大片未知区域时搜索空间会张得更大
+    一些(启发式没那么"准"了)。"""
     height, width = free.shape
     open_heap: List[Tuple[float, float, RC]] = [(_octile(start, goal), 0.0, start)]
     came_from: dict = {}
@@ -167,13 +199,13 @@ def _astar(free: np.ndarray, start: RC, goal: RC) -> Optional[List[RC]]:
             return path
 
         r, c = cur
-        for dr, dc, cost in _NEIGHBORS:
+        for dr, dc, step_dist in _NEIGHBORS:
             nr, nc = r + dr, c + dc
             if not (0 <= nr < height and 0 <= nc < width) or not free[nr, nc]:
                 continue
             if dr != 0 and dc != 0 and (not free[r, nc] or not free[nr, c]):
                 continue
-            ng = g + cost
+            ng = g + step_dist * cost_weight[nr, nc]
             if ng < g_score.get((nr, nc), math.inf):
                 g_score[(nr, nc)] = ng
                 came_from[(nr, nc)] = cur
@@ -253,9 +285,14 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY) -> List[XY]:
 
     pgm = _read_pgm(pgm_path)
     height, width = pgm.shape
-    blocked = _blocked_mask(pgm, meta["negate"], meta["free_thresh"])
+    prob = _prob(pgm, meta["negate"])
+    blocked = _blocked_mask(prob, meta["occupied_thresh"])
     radius_px = max(1, math.ceil(config.GLOBAL_PLANNER_INFLATION_RADIUS_M / resolution))
     free = ~_dilate_bool(blocked, radius_px)
+    cost_weight = _cost_weight(
+        prob, meta["free_thresh"], meta["occupied_thresh"],
+        config.GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER,
+    )
 
     start_rc = _world_to_pixel(start_xy[0], start_xy[1], height, resolution, origin_x, origin_y)
     goal_rc = _world_to_pixel(goal_xy[0], goal_xy[1], height, resolution, origin_x, origin_y)
@@ -268,7 +305,7 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY) -> List[XY]:
                 f"{label}离障碍物太近(膨胀半径 {config.GLOBAL_PLANNER_INFLATION_RADIUS_M:.2f}m), 换个点"
             )
 
-    raw = _astar(free, start_rc, goal_rc)
+    raw = _astar(free, cost_weight, start_rc, goal_rc)
     if raw is None:
         raise ValueError("起点和终点之间找不到可行路径")
 

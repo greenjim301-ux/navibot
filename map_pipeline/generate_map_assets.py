@@ -4,9 +4,8 @@
 
 输入: <storage_path>/ 下的
   3d_map/dense_cloud_map.pcd     稠密重建点云
-  3d_map/keyframe_info_3d.txt    建图轨迹关键帧位姿, 直接插值出地面高度参考
-                                  (见 elevation.estimate_sensor_height /
-                                  estimate_trajectory_ground)
+  3d_map/keyframe_info_3d.txt    建图轨迹关键帧位姿, 用来定 detect_structure 的
+                                  z 窗口(见 elevation.detect_structure)
   2d_map/map_2d.pgm + .yaml      handbot slam 自带的 2D 占据栅格图。默认会被
                                   本脚本从点云重新生成的版本覆盖掉(见
                                   --gen-2d-map)——slam 自带的图是按固定扫描
@@ -223,11 +222,12 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path, long_edg
 def write_map_server_grid(grid: np.ndarray, out_pgm: Path, out_yaml: Path,
                            resolution: float, origin_x: float, origin_y: float) -> None:
     """按 ROS map_server 的 pgm+yaml 约定写占据栅格图 (grid 是 elevation.
-    classify_occupancy 产出的 254/0/205 灰度数组), 跟 backend/app/global_planner.py
+    classify_occupancy 产出、再经 mark_known_region 加工过的 254/0/205 灰度
+    数组), 跟 backend/app/global_planner.py
     的 _read_pgm/_parse_yaml、以及本文件 export_topview_png 的 _parse_map2d_yaml
     读法完全对应。origin 是图像左下角像素(数组最后一行)对应的世界坐标, 跟
     grid 本身 "第 0 行 = world y_max" 的行约定(elevation.py 里 build_elevation/
-    estimate_trajectory_ground 用的是同一套)配套, 不需要翻转。"""
+    detect_structure 用的是同一套)配套, 不需要翻转。"""
     Image.fromarray(grid, mode="L").save(out_pgm)
     out_yaml.write_text(
         f"image: {out_pgm.name}\n"
@@ -327,23 +327,15 @@ def voxel_downsample_to_target(pcd: o3d.geometry.PointCloud, target_points: int,
 
 
 def export_pointcloud_bin(pcd: o3d.geometry.PointCloud, out_path: Path,
-                           z_cutoff: float | None = None,
                            z_range: tuple[float, float] | None = None):
-    """z_cutoff: 3D 预览用, 只保留 z < z_cutoff 的点 (用来把天花板裁掉), None 则不裁剪。
-
-    点数控制(降采样到预览规模)在更早的阶段就做完了(见 main()), 这里只管按
-    z_cutoff 过滤 + 写文件。
+    """点数控制(降采样到预览规模)在更早的阶段就做完了(见 main()), 这里只管写
+    文件——天花板裁剪不在这一步做, 前端界面自己按点云的 z_min/z_max 拉滑杆裁。
 
     z_range: 传给 height_to_color 的 (vmin, vmax)。不传就用这次导出的点自己的
     局部 min/max(整图预览场景下两者是一回事)。分片场景下必须传整图统一的
     range —— 否则每个分片各自按自己的高度范围配色, 同一个绝对高度在不同分片里
     会被染成不同颜色, 分片之间会出现突兀的颜色接缝。
     """
-    if z_cutoff is not None:
-        points = np.asarray(pcd.points)
-        idx = np.nonzero(points[:, 2] < z_cutoff)[0]
-        pcd = pcd.select_by_index(idx)
-
     pts = np.asarray(pcd.points).astype(np.float32)
     vmin, vmax = z_range if z_range is not None else (None, None)
     colors = height_to_color(pts[:, 2], vmin=vmin, vmax=vmax)
@@ -407,33 +399,25 @@ def main():
     ap.add_argument("--max-preview-points", type=int, default=6_000_000,
                      help="3D 预览点数阈值: 不超过就原样导出, 超过则用固定体素大小降"
                           "采样到接近这个点数(voxel_downsample_to_target, 不是随机丢点)")
-    ap.add_argument("--preview-hide-ceiling", action=_BooleanOptionalAction, default=False,
-                     help="3D 预览是否裁掉天花板附近的点 (默认不裁)")
-    ap.add_argument("--preview-ceiling-margin", type=float, default=0.35,
-                     help="裁剪天花板时从点云最高点往下留的余量 (m), 越大裁得越多")
     ap.add_argument("--gen-2d-map", action=_BooleanOptionalAction, default=True,
                      help="从点云 + keyframe_info_3d.txt 生成占据栅格图, 覆盖掉 2d_map/"
                           "map_2d.pgm(+.yaml)——handbot slam 自带的那张图是按固定扫描"
                           "高度切片判占据, 会漏掉切片高度之外的障碍。关掉这个开关就跳过"
                           "生成, 沿用已有文件(默认开)")
     ap.add_argument("--map2d-resolution", type=float, default=None,
-                     help="生成占据栅格图的格子大小 (m/格), 同时也是 estimate_trajectory_ground "
-                          "的地面高程格子大小。不传则按地图跨度自动选: 超过 "
+                     help="生成占据栅格图的格子大小 (m/格), 同时也是 detect_structure 的"
+                          "格子大小。不传则按地图跨度自动选: 超过 "
                           f"{MAP2D_RESOLUTION_EXTENT_THRESHOLD_M:.0f}m 用 0.1, 没超用 0.05 "
                           "(见 MAP2D_RESOLUTION_EXTENT_THRESHOLD_M)")
-    ap.add_argument("--map2d-trajectory-max-radius", type=float, default=3.0,
-                     help="estimate_trajectory_ground 从轨迹插值地面高度时的最大半径(m)——"
-                          "按直线距离算的圆, 离轨迹超过这个距离的格子插不出地面, 保持"
-                          "unknown。给太大会直接'穿墙'插值到隔壁没探索过的区域(实测给 8m "
-                          "时大片房子轮廓外的区域被判成一整片圆形的 free), 给几米量级更安全"
-                          "——真正轨迹没直接到、但被墙圈起来的空旷区域靠 fill_enclosed_"
-                          "unknown 按连通性去填, 不靠加大这个半径")
     ap.add_argument("--map2d-structure-margin-lo", type=float, default=1.0,
                      help="detect_structure 的 z 窗口下界 = 轨迹高度 1% 分位数 - 这个值(m)")
     ap.add_argument("--map2d-structure-margin-hi", type=float, default=1.0,
                      help="detect_structure 的 z 窗口上界 = 轨迹高度 99% 分位数 + 这个值(m)")
-    ap.add_argument("--map2d-structure-min-support", type=int, default=3,
-                     help="detect_structure 判'这一层有支撑'的单层原始点数阈值")
+    ap.add_argument("--map2d-structure-min-support-frac", type=float, default=0.4,
+                     help="detect_structure 判'这一层有支撑'的点数阈值, 不是写死的绝对数"
+                          "——从这张图 z 窗口内非空(格子,切层)组合的点数中位数(这张图的"
+                          "'典型密度')乘这个比例现算, 不同地图密度差一个数量级也不用"
+                          "重新调这个参数")
     ap.add_argument("--map2d-structure-min-span-bins", type=int, default=5,
                      help="detect_structure 判'这格有纵向实体撑着'(墙/柱子, 而不是孤立悬空"
                           "杂物)所需的最少支撑层数, 乘以 z_bin(0.1m)就是要求的最小纵向跨度")
@@ -441,6 +425,12 @@ def main():
                      help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
                           "误判——默认 0.25 跟 backend/app/config.py 的"
                           "GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致, 不要单独改")
+    ap.add_argument("--map2d-known-radius", type=float, default=3.0,
+                     help="离轨迹这个距离(m)以内的 free 格子算'已知'区域, 以外的降级成"
+                          "map_server 的'未知'灰度(205)——不是不可通行, 全局规划器"
+                          "(global_planner.py)只有明确占据才会挡, 未知区域只是规划代价更高,"
+                          "见 mark_known_region 说明。跟 --map2d-trajectory-clear-radius"
+                          "不是同一件事, 不要混用")
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -491,69 +481,49 @@ def main():
             print(f"      {in_path.parent} 下没有 keyframe_info_3d.txt(或 keyframe_pos_3d.pcd), "
                   f"没法从点云生成占据栅格图, 跳过——沿用已有文件(如果有)")
         else:
-            # 地面高程不从点云的地面证据来, 从轨迹插值来(estimate_trajectory_
-            # ground)——扫不到地面是常态, 不是例外(地面是全场雷达采样最差的
-            # 面), 死等点云证据(不管是 build_elevation 那套生长扩散, 还是后来
-            # 试过的"逐格局部窗口找地面")都会在大跨度/空旷区域留下大片本可通行
-            # 却因为没扫到地面而判成 unknown 的地方(实测 large 这份图 800m² 大
-            # 厅中间抽查一格, 半径 1m 内 35 个点全在天花板高度, 地面一个点都
-            # 没有)。轨迹本身就是最直接的地面证据——狗站在那的时候, 脚下必然
-            # 是地面, 不需要雷达另外确认。
-            delta = elevation.estimate_sensor_height(raw_points, trajectory)
-            if delta is None:
-                print("      轨迹脚下找不到任何地面, 没法生成占据栅格图, 跳过——"
-                      "沿用已有文件(如果有)")
-            else:
-                # 地面参考半径给小一点(几米量级)——这是按直线距离算的圆, 给大了
-                # 会直接"穿墙"插值到隔壁没探索过的房间/室外(实测 house 给 8m 时,
-                # 大片房子轮廓外面的区域被判成一整片圆形的 free)。真正"轨迹没
-                # 直接到但被墙圈起来的空旷区域"靠 fill_enclosed_unknown 按连通性
-                # 去填, 不靠加大这个半径。
-                ground = elevation.estimate_trajectory_ground(
-                    trajectory, (x_min, x_max, y_min, y_max), map2d_resolution, delta,
-                    max_radius=args.map2d_trajectory_max_radius,
-                )
-                # 障碍检测跟地面参考彻底分开算(detect_structure), 不依赖这一格
-                # 有没有地面参考——墙、柱子这类地方轨迹本来就不会贴过去, 用地面
-                # 参考去卡"这段有没有点"的话反而判不出墙(见 elevation.py 里
-                # detect_structure 的说明)。z 窗口按轨迹本身的高度范围开, 不是
-                # 固定死一个边距: 用 [1,99] 百分位(不用裸 min/max, 防单个异常
-                # 位姿把窗口带偏)当轨迹实际活动的高度区间, 再各自加一段边距——
-                # 这样窗口会跟着轨迹真实的高低起伏自动收缩/放大(比如 large 这
-                # 份图轨迹本身有 0.75m 高差, 固定边距不会跟着变), 天花板/屋顶
-                # 横梁这类远高于正常层高的东西天然被排除在外。
-                traj_z_lo = float(np.percentile(trajectory[:, 2], 1))
-                traj_z_hi = float(np.percentile(trajectory[:, 2], 99))
-                structure = elevation.detect_structure(
-                    raw_points, (x_min, x_max, y_min, y_max), map2d_resolution,
-                    z_lo=traj_z_lo - args.map2d_structure_margin_lo,
-                    z_hi=traj_z_hi + args.map2d_structure_margin_hi,
-                    z_bin=0.1,
-                    min_support=args.map2d_structure_min_support,
-                    min_span_bins=args.map2d_structure_min_span_bins,
-                )
-                grid = elevation.classify_occupancy(ground, structure)
-                # 被墙圈死、够不着地图外沿的 unknown 格子(比如大厅中间轨迹没
-                # 直接到、但四面都是刚判出来的墙的地方)改判 free——见
-                # fill_enclosed_unknown 说明。
-                grid = elevation.fill_enclosed_unknown(grid)
-                # 狗真的走过的地方不可能有障碍, 用这个压过点云侧的误判(见
-                # clear_trajectory 说明)。0.25 跟 backend/app/config.py 的
-                # GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致——全局规划器规划
-                # 路径时本来就假设轨迹周围这个半径内没有障碍, 2D 图跟这个假设
-                # 对不上的话, 路径规划出来会贴着"障碍"走或者干脆绕不过去。
-                grid = elevation.clear_trajectory(
-                    grid, trajectory, (x_min, x_max, y_min, y_max),
-                    map2d_resolution, radius=args.map2d_trajectory_clear_radius,
-                )
-                map2d_dir.mkdir(parents=True, exist_ok=True)
-                write_map_server_grid(grid, pgm_path, yaml_path, map2d_resolution, x_min, y_min)
-                n_ground = int(np.isfinite(ground).sum())
-                n_free, n_occ, n_unk = int((grid == 254).sum()), int((grid == 0).sum()), int((grid == 205).sum())
-                print(f"      delta={delta:.3f}  插值出地面参考的格子={n_ground}"
-                      f"({n_ground * map2d_resolution ** 2:.1f}m²)")
-                print(f"      生成 {pgm_path}: {grid.shape[1]}x{grid.shape[0]}px, {map2d_resolution}m/px, "
-                      f"free={n_free} occupied={n_occ} unknown={n_unk}")
+            # 占据栅格图默认 free, 只有 detect_structure 查出"纵向有实体撑着"
+            # (墙/柱子)的格子才是 occupied, 不产生 unknown 状态(见
+            # elevation.classify_occupancy 的说明)——没查出障碍就当能走, 真正的
+            # 避障交给 SCAN-Planner 的局部重规划, 全局这条路本来就只给个大致
+            # 走向。z 窗口按轨迹本身的高度范围开, 不是固定死一个边距: 用 [1,99]
+            # 百分位(不用裸 min/max, 防单个异常位姿把窗口带偏)当轨迹实际活动的
+            # 高度区间, 再各自加一段边距——这样窗口会跟着轨迹真实的高低起伏自动
+            # 收缩/放大(比如 large 这份图轨迹本身有 0.75m 高差, 固定边距不会跟
+            # 着变), 天花板/屋顶横梁这类远高于正常层高的东西天然被排除在外。
+            traj_z_lo = float(np.percentile(trajectory[:, 2], 1))
+            traj_z_hi = float(np.percentile(trajectory[:, 2], 99))
+            structure, min_support = elevation.detect_structure(
+                raw_points, (x_min, x_max, y_min, y_max), map2d_resolution,
+                z_lo=traj_z_lo - args.map2d_structure_margin_lo,
+                z_hi=traj_z_hi + args.map2d_structure_margin_hi,
+                z_bin=0.1,
+                min_support_frac=args.map2d_structure_min_support_frac,
+                min_span_bins=args.map2d_structure_min_span_bins,
+            )
+            print(f"      detect_structure: 从点云密度现算出 min_support={min_support}")
+            grid = elevation.classify_occupancy(structure)
+            # 狗真的走过的地方不可能有障碍, 用这个压过点云侧的误判(见
+            # clear_trajectory 说明)。0.25 跟 backend/app/config.py 的
+            # GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致——全局规划器规划
+            # 路径时本来就假设轨迹周围这个半径内没有障碍, 2D 图跟这个假设
+            # 对不上的话, 路径规划出来会贴着"障碍"走或者干脆绕不过去。
+            grid = elevation.clear_trajectory(
+                grid, trajectory, (x_min, x_max, y_min, y_max),
+                map2d_resolution, radius=args.map2d_trajectory_clear_radius,
+            )
+            # 离轨迹超过 map2d_known_radius 的 free 格子降级成"未知"(205)——
+            # 不影响能不能走, 只是让全局规划器(靠 occupied_thresh 判占据、靠
+            # unknown_multiplier 给未知区域加规划代价, 见 backend/app/
+            # global_planner.py)优先走验证过的地方。occupied 格子不受影响。
+            grid = elevation.mark_known_region(
+                grid, trajectory, (x_min, x_max, y_min, y_max),
+                map2d_resolution, radius=args.map2d_known_radius,
+            )
+            map2d_dir.mkdir(parents=True, exist_ok=True)
+            write_map_server_grid(grid, pgm_path, yaml_path, map2d_resolution, x_min, y_min)
+            n_free, n_occ, n_unk = int((grid == 254).sum()), int((grid == 0).sum()), int((grid == 205).sum())
+            print(f"      生成 {pgm_path}: {grid.shape[1]}x{grid.shape[0]}px, {map2d_resolution}m/px, "
+                  f"free={n_free} occupied={n_occ} unknown={n_unk}")
     else:
         print("      --no-gen-2d-map, 跳过生成, 沿用已有文件(如果有)")
 
@@ -605,15 +575,11 @@ def main():
     (out_dir / "topview_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
 
     # 高度限制现在完全按点云自身的 z 值判断(前端界面把滑杆范围钉在 [z_min, z_max]
-    # 之间), 这里的天花板裁剪只是从最高点往下留一点余量的简单裁剪, 不再依赖检测
-    # 出来的 ceiling_z。整图预览和下面的分片(如果有)用同一条裁剪线、同一个
-    # z_range 配色, 两层看到的"天花板藏没藏/颜色"要一致, 不能各算各的。
-    z_cutoff = (z_max - args.preview_ceiling_margin) if args.preview_hide_ceiling else None
-    if z_cutoff is not None:
-        print(f"      3D 预览裁掉天花板: 保留 z < {z_cutoff:.3f}")
+    # 之间), 这里不做任何天花板裁剪。整图预览和下面的分片(如果有)用同一个
+    # z_range 配色——否则同一个绝对高度在整图预览和分片里会被染成不同颜色,
+    # 缩放切换时出现突兀的颜色接缝。
     z_range = (z_min, z_max)
-    n_out, pts_out = export_pointcloud_bin(pcd_overview, out_dir / "pointcloud.bin",
-                                            z_cutoff=z_cutoff, z_range=z_range)
+    n_out, pts_out = export_pointcloud_bin(pcd_overview, out_dir / "pointcloud.bin", z_range=z_range)
     print(f"      导出点数: {n_out}")
     _log_step_done(t_step)
 
@@ -624,12 +590,7 @@ def main():
         print(f"      地图跨度 {max_extent_xy:.1f}m > {TILE_EXTENT_THRESHOLD_M:.0f}m, 生成分片"
               f"(整图预览只是骨架层, 分片用原始分辨率的点云按 "
               f"{TILE_SIZE_M:.0f}m 网格单独降采样, 每格最多 {TILE_POINT_BUDGET} 点)")
-        tile_source = pcd_raw
-        if z_cutoff is not None:
-            tile_source_z = np.asarray(tile_source.points)[:, 2]
-            idx = np.nonzero(tile_source_z < z_cutoff)[0]
-            tile_source = tile_source.select_by_index(idx)
-        tile_list = export_tiles(tile_source, out_dir, x_min, y_min,
+        tile_list = export_tiles(pcd_raw, out_dir, x_min, y_min,
                                   TILE_SIZE_M, TILE_POINT_BUDGET, z_range)
         tiles_meta = {
             "tile_size": TILE_SIZE_M,
@@ -650,8 +611,6 @@ def main():
         # 降采样用的体素边长(米), 没触发降采样(点数本来就 <= overview_target)
         # 时是 None, 记下来方便事后核对"这份预览到底是按多细的体素抽的"。
         "voxel_size_m": voxel_size,
-        "ceiling_hidden": args.preview_hide_ceiling,
-        "z_cutoff": z_cutoff,
         "format": "PCW1: magic(4) + uint32 count + float32[count*3] xyz + uint8[count*3] rgb",
         "world_bounds": {
             "x_min": float(pts_out[:, 0].min()), "x_max": float(pts_out[:, 0].max()),
