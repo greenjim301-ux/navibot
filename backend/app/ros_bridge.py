@@ -12,6 +12,7 @@ from typing import Callable, List, Optional
 import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
+from scan_planner.msg import PlanFinished
 from sensor_msgs import point_cloud2
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Empty
@@ -32,6 +33,9 @@ SelfInflationCallback = Callable[[dict], None]
 InflationMapCallback = Callable[[List[float]], None]
 # 雷达实时点云 (/surf_cloud_in_map), 同样拍平成 [x0,y0,z0, ...], 每帧整体替换
 SurfCloudCallback = Callable[[List[float]], None]
+# scan_planner/PlanFinished 的 status 字段(REACHED=0/EMERGENCY_STOP=1), navi_mode
+# 字段不转发——route_manager 不需要它, 见该回调的说明
+PlanningFinishedCallback = Callable[[int], None]
 
 
 class RosBridge:
@@ -42,12 +46,14 @@ class RosBridge:
         on_self_inflation: Optional[SelfInflationCallback] = None,
         on_inflation_map: Optional[InflationMapCallback] = None,
         on_surf_cloud: Optional[SurfCloudCallback] = None,
+        on_planning_finished: Optional[PlanningFinishedCallback] = None,
     ) -> None:
         self._on_pose = on_pose
         self._on_optimal_traj = on_optimal_traj
         self._on_self_inflation = on_self_inflation
         self._on_inflation_map = on_inflation_map
         self._on_surf_cloud = on_surf_cloud
+        self._on_planning_finished = on_planning_finished
         self._wp_pub: Optional[rospy.Publisher] = None
         self._initial_path_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
@@ -55,6 +61,15 @@ class RosBridge:
         self._inflation_map_sub: Optional[rospy.Subscriber] = None
         self._surf_cloud_sub: Optional[rospy.Subscriber] = None
         self._started = False
+        # 这四个纯展示话题的限流(*_BROADCAST_HZ)在这一层做, 不在 route_manager——
+        # 挡在解码之前, 没通过限流的消息直接丢, 不用白花 CPU 解码一份马上要扔掉的
+        # 数据(inflation_map/surf_cloud 尤其明显, 解码 PointCloud2 是这几个回调里
+        # 唯一不便宜的部分)。route_manager 收到的调用本身就已经是限流后的频率,
+        # 不需要再自己维护一份时间戳。
+        self._last_optimal_traj_emit_at = 0.0
+        self._last_self_inflation_emit_at = 0.0
+        self._last_inflation_map_emit_at = 0.0
+        self._last_surf_cloud_emit_at = 0.0
 
     def start(self) -> None:
         if self._started:
@@ -70,10 +85,15 @@ class RosBridge:
             rospy.Subscriber(config.ODOM_TOPIC, Odometry, self._handle_odom, queue_size=50)
             if self._on_optimal_traj is not None:
                 rospy.Subscriber(config.OPTIMAL_TRAJ_TOPIC, Marker, self._handle_optimal_traj, queue_size=5)
+            if self._on_planning_finished is not None:
+                rospy.Subscriber(
+                    config.PLANNING_FINISHED_TOPIC, PlanFinished, self._handle_planning_finished, queue_size=5,
+                )
             logger.info(
-                "ROS bridge started: waypoints=%s initial_path=%s estop=%s odom=%s optimal_traj=%s frame=%s",
+                "ROS bridge started: waypoints=%s initial_path=%s estop=%s odom=%s optimal_traj=%s "
+                "planning_finished=%s frame=%s",
                 config.PRESET_WAYPOINTS_TOPIC, config.INITIAL_PATH_TOPIC, config.EMERGENCY_STOP_TOPIC,
-                config.ODOM_TOPIC, config.OPTIMAL_TRAJ_TOPIC, config.MAP_FRAME,
+                config.ODOM_TOPIC, config.OPTIMAL_TRAJ_TOPIC, config.PLANNING_FINISHED_TOPIC, config.MAP_FRAME,
             )
             rospy.spin()
 
@@ -96,10 +116,16 @@ class RosBridge:
         LINE_STRIP id=1000), 点和颜色是同一份数据, 只转发 LINE_STRIP 那条就够画线了。
 
         原样转发给前端, 不在这里做任何"这是不是当前路线"之类的判断 —— 跟 rviz
-        一样, 纯展示 planner 当前正在跑的局部轨迹, planner 每次重规划都会重发。
+        一样, 纯展示 planner 当前正在跑的局部轨迹, planner 每次重规划都会重发,
+        没必要照单全收, 按 OPTIMAL_TRAJ_BROADCAST_HZ 限流, 没通过的直接丢, 不用
+        白解码一份马上要扔掉的数据。
         """
         if msg.type != Marker.LINE_STRIP:
             return
+        now = time.time()
+        if now - self._last_optimal_traj_emit_at < 1.0 / config.OPTIMAL_TRAJ_BROADCAST_HZ:
+            return
+        self._last_optimal_traj_emit_at = now
         has_colors = len(msg.colors) == len(msg.points)
         points = [
             {
@@ -113,9 +139,22 @@ class RosBridge:
         assert self._on_optimal_traj is not None
         self._on_optimal_traj(points)
 
+    def _handle_planning_finished(self, msg: PlanFinished) -> None:
+        """/planning/finished: 整轮任务只发一次(REACHED 或 EMERGENCY_STOP), 见
+        config.py PLANNING_FINISHED_TOPIC 的说明。只转发 status, 不管 msg.navi_mode
+        ——route_manager 不需要它(见 RouteManager.on_planning_finished 的说明)。"""
+        assert self._on_planning_finished is not None
+        self._on_planning_finished(msg.status)
+
     def _handle_self_inflation(self, msg: Marker) -> None:
         """/scan_planner_node/self_inflation 一次回调发两个 CYLINDER (id=0 前,
-        id=1 后, "双圆柱"自身膨胀包络), 跟 optimal_traj 一样原样转发, 不做判断。"""
+        id=1 后, "双圆柱"自身膨胀包络), 跟 optimal_traj 一样原样转发, 不做判断,
+        按 SELF_INFLATION_BROADCAST_HZ 限流(两个 id 共用同一个时间戳, 跟原来
+        route_manager 里的限流是同一套逻辑, 只是挪到这里)。"""
+        now = time.time()
+        if now - self._last_self_inflation_emit_at < 1.0 / config.SELF_INFLATION_BROADCAST_HZ:
+            return
+        self._last_self_inflation_emit_at = now
         assert self._on_self_inflation is not None
         self._on_self_inflation({
             "id": msg.id,
@@ -148,7 +187,16 @@ class RosBridge:
         round 到 3 位小数(毫米级, 展示用完全够): 消息里的坐标本来就是 float32,
         直接 float() 提升成 double 会把 float32 的精度噪声原样带进 JSON 文本
         (比如 1.23 变成 1.2299999713897705), 不是真精度, 只是白白撑大 payload
-        和 json.dumps/JSON.parse 两端的开销。"""
+        和 json.dumps/JSON.parse 两端的开销。
+
+        按 INFLATION_MAP_BROADCAST_HZ 限流, 而且是在解码 PointCloud2 之前就
+        挡掉——这一片点云可能有几千到上万个点, 逐点 read_points + round 是这几个
+        回调里唯一真正花 CPU 的地方, 没通过限流的消息不值得白解码一份马上要丢的
+        数据。"""
+        now = time.time()
+        if now - self._last_inflation_map_emit_at < 1.0 / config.INFLATION_MAP_BROADCAST_HZ:
+            return
+        self._last_inflation_map_emit_at = now
         assert self._on_inflation_map is not None
         flat: List[float] = []
         for x, y, z in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
@@ -178,7 +226,14 @@ class RosBridge:
         转到 map 系, 5Hz。原样转发, 只取 x/y/z——每帧整体替换, 不在这里做叠加。
 
         round 到 3 位小数, 理由同 _handle_inflation_map: 消息本来就是 float32,
-        直接提升成 double 只会把精度噪声原样带进 JSON, 白白撑大 payload。"""
+        直接提升成 double 只会把精度噪声原样带进 JSON, 白白撑大 payload。
+
+        按 SURF_CLOUD_BROADCAST_HZ 限流, 同样挡在解码之前, 理由同
+        _handle_inflation_map。"""
+        now = time.time()
+        if now - self._last_surf_cloud_emit_at < 1.0 / config.SURF_CLOUD_BROADCAST_HZ:
+            return
+        self._last_surf_cloud_emit_at = now
         assert self._on_surf_cloud is not None
         flat: List[float] = []
         for x, y, z in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):

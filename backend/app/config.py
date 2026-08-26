@@ -24,16 +24,24 @@ src/planner/plan_manage/src/scan_replan_fsm.cpp 核对过:
       pose.covariance[0] 是定位质量 (0~0.99, >=0.99 表示定位失败), hand_lio 原样
       透传, 前端应该把它显示出来 —— 定位漂了, 所有绝对坐标的导航点都是错的。
 
-到达判定: planner 没有单一的"到达"距离阈值, 而且它**不发布任何"到达/完成"话题**,
-后端只能订阅 odom 自己推进度。对着 scan_replan_fsm.cpp 核对下来是两条不同的判据,
-不能混用:
+到达判定: planner 没有单一的"到达"距离阈值。对着 scan_replan_fsm.cpp 核对下来是
+两条不同的判据, 不能混用:
 
   - 途中点(这一轮还没到最后一个): EXEC_TRAJ 里检查 (end_pt_ - odom_pos_).norm()
     < fsm/waypoint_arrival_radius (advanced_param.xml 配的 0.3, 不是 0.5), 满足
-    就提前切到下一个点, 不等轨迹真正执行完。REACH_EPS_M 对齐的是这一条。
-  - 最后一个点: 没有这条提前退出, 只能等轨迹执行完 (t_cur > duration) 或者
-    reboundReplan() 自己判定 TOO_CLOSE_TO_GOAL, 落点比 0.3m 精确得多。后端看不到
-    这两个信号, 用 REACH_EPS_M 近似, 时机跟真机不完全一致。
+    就提前切到下一个点, 不等轨迹真正执行完。REACH_EPS_M 对齐的是这一条, 只能靠
+    订阅 odom 自己推——planner 不会为每个途中点单独广播一条"到了"。
+  - 最后一个点(整轮任务结束): planner 会在 /planning/finished
+    (PLANNING_FINISHED_TOPIC, scan_planner/PlanFinished) 上发一条 REACHED, 精度
+    比 REACH_EPS_M 近似高得多(t_cur > duration 或 reboundReplan() 判定
+    TOO_CLOSE_TO_GOAL, 落点比 0.3m 精确)。route_manager 收到之后直接确认
+    SUCCEEDED; REACH_EPS_M 的距离近似仍然保留当兜底(万一这条消息丢了/没订阅
+    上), 两边谁先满足谁生效, 是 or 不是 and 的关系。
+  - 同一个话题的 EMERGENCY_STOP 状态对应 planner 自己从急停里退出、需要新目标
+    的那一刻——不管急停是后端调用 EMERGENCY_STOP_TOPIC 触发的, 还是 planner 内部
+    fail-safe 自己触发的, 都会走这条。route_manager 只在自己还处于 RUNNING(不是
+    自己发起的 estop(), 那条路径已经同步置成 STOPPED 了)时才把这个当 FAILED 处理,
+    不用再干等 STUCK_TIMEOUT_S。
   - planNextWaypoint() 里另有一个 kDegenerateDist=0.05m, 只是"这个途经点和机器狗
     当前位置几乎重合, 规划出来的轨迹退化"的保护, 不是"已经到过了"的意思——正常
     间距的途经点基本不会触发。跟 REACH_EPS_M 是两个不同的常量, 对应
@@ -63,6 +71,11 @@ GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_INFLATION_RADIUS_M", "0.25")
 )
 EMERGENCY_STOP_TOPIC = os.environ.get("NAVIBOT_EMERGENCY_STOP_TOPIC", "/planning/emergency_stop")
+# planner 侧 -> backend, scan_planner/PlanFinished (ROS 包名是 scan_planner, 源码
+# 目录是 plan_manage)。整轮任务只发一次: status=REACHED(到达最终目标)或
+# EMERGENCY_STOP(急停流程结束、需要新目标), navi_mode 标出是哪个模式跑完的——见
+# 上面"到达判定"的说明和 route_manager.on_planning_finished。
+PLANNING_FINISHED_TOPIC = os.environ.get("NAVIBOT_PLANNING_FINISHED_TOPIC", "/planning/finished")
 ODOM_TOPIC = os.environ.get("NAVIBOT_ODOM_TOPIC", "/hand_lio/odom_vehicle")
 # planner 侧 -> backend, visualization_msgs/Marker, 纯展示用途 (跟
 # default.rviz 里 "optimal_traj" 那个 Marker 显示项是同一个话题)。每次重规划

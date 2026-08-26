@@ -102,9 +102,13 @@ async def on_startup() -> None:
     def _on_surf_cloud(points):
         route_manager.on_surf_cloud(points)
 
+    def _on_planning_finished(status):
+        route_manager.on_planning_finished(status)
+
     ros_bridge = RosBridge(
         on_pose=_on_pose, on_optimal_traj=_on_optimal_traj, on_self_inflation=_on_self_inflation,
         on_inflation_map=_on_inflation_map, on_surf_cloud=_on_surf_cloud,
+        on_planning_finished=_on_planning_finished,
     )
     route_manager = RouteManager(ros_bridge, ws_manager)
     ros_bridge.start()

@@ -29,18 +29,27 @@ class RouteManager:
 
       1. 下发: 把途经点的 z 算出来 (地面高程 + 实测 odom 离地高度 + 用户微调),
          整条 Path 一次发给 planner。
-      2. 跟踪: planner **不发布任何到达/完成话题**, 只能订阅 odom 自己推进度。
-         途中点用和 planner 一样的判据 (3D 距离 < REACH_EPS_M, 对齐
-         fsm/waypoint_arrival_radius); 最后一个点 planner 没有这条提前退出,
-         只能拿同一个半径近似, 时机跟真机不完全一致。见 config.py 里的详细说明。
+      2. 跟踪: 途中点没有单独的到达话题, 只能订阅 odom 自己推进度——3D 距离
+         < REACH_EPS_M, 对齐 fsm/waypoint_arrival_radius。最后一个点(整轮任务
+         结束)有 /planning/finished(见 on_planning_finished), 比距离近似精确
+         得多, 收到就直接确认, 不用等距离凑上; 距离近似仍然保留当兜底(消息
+         丢了/没订阅上时), 两条谁先满足谁生效。
 
     停止靠 /planning/emergency_stop (见 estop()), 不做暂停/继续 —— 用不上,
     也没有必要维护"冻结轨迹时间"这条额外状态。
 
-    一个刻意的取舍: 这里推的"进度"是**推断**出来的, 不是 planner 告诉我们的。
-    planner 可能因为局部不可达而卡在某个点上, 我们看不出区别 —— 只能看到狗不动
-    了。所以有一个卡住超时兜底, 报 FAILED 而不是一直显示"执行中"。
+    一个刻意的取舍: 途中点的"进度"是**推断**出来的, 不是 planner 逐点告诉我们
+    的。planner 可能因为局部不可达而卡在某个点上, 我们看不出区别 —— 只能看到狗
+    不动了。所以有一个卡住超时兜底, 报 FAILED 而不是一直显示"执行中"; 如果卡住
+    是因为 planner 自己触发了 fail-safe 急停, on_planning_finished 能立刻发现,
+    不用干等这个超时。
     """
+
+    # scan_planner/PlanFinished 的状态常量, 照抄过来(不在这里 import ROS 消息
+    # 类型——route_manager 只处理 ros_bridge 拆好的原始 int, 不摸 ROS 消息对象,
+    # 跟 on_pose/on_optimal_traj 等其它回调是同一个规矩)。
+    FINISHED_REACHED = 0
+    FINISHED_EMERGENCY_STOP = 1
 
     # 距离目标点这么久没有明显靠近就认为卡住了 (planner 侧无反馈, 只能靠超时)
     STUCK_TIMEOUT_S = 60.0
@@ -63,16 +72,12 @@ class RouteManager:
         self._best_dist_at: float = 0.0
         self._optimal_traj: List[dict] = []
         self._last_pose_broadcast_at: float = 0.0
-        self._last_optimal_traj_broadcast_at: float = 0.0
         self._self_inflation_enabled: bool = False
         self._self_inflation: dict = {}  # marker id -> 最新的那个圆柱
-        self._last_self_inflation_broadcast_at: float = 0.0
         self._inflation_map_enabled: bool = False
         self._inflation_map: List[float] = []  # 拍平的 [x0,y0,z0, x1,y1,z1, ...]
-        self._last_inflation_map_broadcast_at: float = 0.0
         self._surf_cloud_enabled: bool = False
         self._surf_cloud: List[float] = []  # 拍平的 [x0,y0,z0, x1,y1,z1, ...], 每帧整体替换
-        self._last_surf_cloud_broadcast_at: float = 0.0
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -315,20 +320,49 @@ class RouteManager:
                 self._last_pose_broadcast_at = now
                 self._broadcast_locked()
 
+    def on_planning_finished(self, status: int) -> None:
+        """/planning/finished 回调(见 ros_bridge._handle_planning_finished 和
+        config.py PLANNING_FINISHED_TOPIC 的说明)。不看消息里的 navi_mode——
+        RUNNING 这个状态本身就只在 route_manager 自己刚下发过 preset_waypoints
+        时才成立, 单机同一时间只会有一个任务在跑, 用不着再额外核对是不是自己
+        这个模式发的。
+
+        只在自己还处于 RUNNING 时才动:
+        - REACHED: planner 确认到达终点, 比 _advance_reached_locked 的距离近似
+          精确得多, 直接确认 SUCCEEDED。就算距离近似已经先一步判定过也没关系,
+          这时候 self._state 已经不是 RUNNING 了, 下面的检查会跳过, 不会重复
+          触发。
+        - EMERGENCY_STOP: planner 自己从急停流程里退出、等新目标——如果是
+          estop() 主动触发的, 那条路径已经同步把状态置成了 STOPPED, 这里的
+          RUNNING 检查天然跳过, 不会把主动停止误判成失败; 能走到这里的都是
+          planner 自己触发的 fail-safe(比如避障反复重规划失败), 直接判
+          FAILED, 不用再干等 STUCK_TIMEOUT_S。
+        """
+        with self._lock:
+            if self._state != TaskState.RUNNING:
+                return
+            if status == self.FINISHED_REACHED:
+                self._state = TaskState.SUCCEEDED
+                self._message = "路线执行完成 (planner 确认到达)"
+                self._current_index = len(self._waypoints)
+            elif status == self.FINISHED_EMERGENCY_STOP:
+                self._state = TaskState.FAILED
+                self._message = "planner 自行触发急停并退出任务 (不是用户主动停止)"
+                logger.warning(self._message)
+            else:
+                return
+            self._broadcast_locked()
+
     def on_optimal_traj(self, points: List[dict]) -> None:
         """转发 /scan_planner_node/optimal_list, 纯展示用途, 不参与任何进度/状态
         判断 —— 3D 预览里画出来的就是 rviz 里那条红黄渐变的局部轨迹线。
 
-        每次重规划都会重发一整条, 频率跟规划频率挂钩而不是 200Hz 的 odom, 但同样
-        没必要原样转发给前端, 按 OPTIMAL_TRAJ_BROADCAST_HZ 限流一下。self._optimal_traj
-        本身不受限流影响, 随时是最新的一条, 只是"广播"这个动作被限流。
+        限流(OPTIMAL_TRAJ_BROADCAST_HZ)在 ros_bridge 那边做了(解码 Marker 之前
+        就先按频率把不需要的消息挡掉, 省得白解码一份马上要丢的数据), 这里收到
+        的调用本身就已经是限流后的频率, 直接存+广播, 不用再自己维护一份时间戳。
         """
         with self._lock:
             self._optimal_traj = points
-            now = time.time()
-            if now - self._last_optimal_traj_broadcast_at < 1.0 / config.OPTIMAL_TRAJ_BROADCAST_HZ:
-                return
-            self._last_optimal_traj_broadcast_at = now
         self._ws.broadcast_threadsafe({"type": "optimal_traj", "data": {"points": points}})
 
     def _self_inflation_payload_locked(self) -> dict:
@@ -336,16 +370,13 @@ class RouteManager:
 
     def on_self_inflation(self, marker: dict) -> None:
         """转发 /scan_planner_node/self_inflation 的一个圆柱 (id=0 前/id=1 后)。
-        200Hz, 只在勾选框打开时才会被订阅(见 ros_bridge.set_self_inflation_enabled),
-        这里再按 SELF_INFLATION_BROADCAST_HZ 限流一次广播动作。"""
+        200Hz, 只在勾选框打开时才会被订阅(见 ros_bridge.set_self_inflation_enabled)。
+        限流(SELF_INFLATION_BROADCAST_HZ)在 ros_bridge 那边做了, 收到的调用本身
+        就已经是限流后的频率, 这里不用再自己维护一份时间戳。"""
         with self._lock:
             if not self._self_inflation_enabled:
                 return
             self._self_inflation[marker["id"]] = marker
-            now = time.time()
-            if now - self._last_self_inflation_broadcast_at < 1.0 / config.SELF_INFLATION_BROADCAST_HZ:
-                return
-            self._last_self_inflation_broadcast_at = now
             payload = self._self_inflation_payload_locked()
         self._ws.broadcast_threadsafe({"type": "self_inflation", "data": payload})
 
@@ -367,16 +398,13 @@ class RouteManager:
     def on_inflation_map(self, points: List[float]) -> None:
         """转发 /grid_map/occupancy_inflate 的一整片点云 (拍平的 [x,y,z, ...]),
         每次整片替换(不是增量)。200Hz 上限的话题, 只在勾选框打开时才会被订阅
-        (见 ros_bridge.set_inflation_map_enabled), 这里再按
-        INFLATION_MAP_BROADCAST_HZ 限流一次广播动作。"""
+        (见 ros_bridge.set_inflation_map_enabled)。限流(INFLATION_MAP_BROADCAST_HZ)
+        在 ros_bridge 那边、解码 PointCloud2 之前就做了(省得白解码一片马上要丢的
+        点云), 这里不用再自己维护一份时间戳。"""
         with self._lock:
             if not self._inflation_map_enabled:
                 return
             self._inflation_map = points
-            now = time.time()
-            if now - self._last_inflation_map_broadcast_at < 1.0 / config.INFLATION_MAP_BROADCAST_HZ:
-                return
-            self._last_inflation_map_broadcast_at = now
             payload = self._inflation_map_payload_locked()
         self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
 
@@ -398,16 +426,13 @@ class RouteManager:
     def on_surf_cloud(self, points: List[float]) -> None:
         """转发 /surf_cloud_in_map 的当前帧点云(拍平的 [x,y,z, ...]), 每次整帧
         替换(不叠加历史帧)。源头本身 5Hz, 只在勾选框打开时才会被订阅(见
-        ros_bridge.set_surf_cloud_enabled), 这里再按 SURF_CLOUD_BROADCAST_HZ
-        限流一次广播动作。"""
+        ros_bridge.set_surf_cloud_enabled)。限流(SURF_CLOUD_BROADCAST_HZ)在
+        ros_bridge 那边、解码 PointCloud2 之前就做了, 这里不用再自己维护一份
+        时间戳。"""
         with self._lock:
             if not self._surf_cloud_enabled:
                 return
             self._surf_cloud = points
-            now = time.time()
-            if now - self._last_surf_cloud_broadcast_at < 1.0 / config.SURF_CLOUD_BROADCAST_HZ:
-                return
-            self._last_surf_cloud_broadcast_at = now
             payload = self._surf_cloud_payload_locked()
         self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
 
