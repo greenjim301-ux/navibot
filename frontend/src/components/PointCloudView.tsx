@@ -630,8 +630,13 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 选中), 造成"点哪不是哪"的偏差。改成按 distanceToRay(点到光线的世界系
     // 垂直距离, three.js Points.raycast 每个 hit 都会算)取最小的, 这个量近似
     // 正比于屏幕像素距离, 才是跟视觉预期一致的"点选中心最近的点"。
+    // 点云的高度限制 (heightLimit) 是靠 material.clippingPlanes 在 GPU 渲染阶段
+    // 裁的, three.js 的 raycaster 并不读 clippingPlanes——不这么过滤的话, 被裁到
+    // 看不见的高处点照样能被选中, 出现"点哪不是哪"。
     function nearestToRayHit(hits: THREE.Intersection[]): THREE.Intersection | undefined {
+      const limit = heightPlaneRef.current.constant;
       return hits.reduce<THREE.Intersection | undefined>((best, h) => {
+        if (h.point.z > limit) return best;
         const d = h.distanceToRay ?? h.distance;
         const bestD = best ? (best.distanceToRay ?? best.distance) : Infinity;
         return d < bestD ? h : best;
