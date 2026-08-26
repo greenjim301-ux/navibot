@@ -77,7 +77,7 @@ GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
 # "没验证过"就规划不出路。1.0 等于不加价(未知跟已知一视同仁), 数越大越倾向
 # 绕远路也要走验证过的地方。
 GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER = float(
-    os.environ.get("NAVIBOT_GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER", "3.0")
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER", "5.0")
 )
 EMERGENCY_STOP_TOPIC = os.environ.get("NAVIBOT_EMERGENCY_STOP_TOPIC", "/planning/emergency_stop")
 # planner 侧 -> backend, scan_planner/PlanFinished (ROS 包名是 scan_planner, 源码

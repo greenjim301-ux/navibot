@@ -425,7 +425,7 @@ def main():
                      help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
                           "误判——默认 0.25 跟 backend/app/config.py 的"
                           "GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致, 不要单独改")
-    ap.add_argument("--map2d-known-radius", type=float, default=3.0,
+    ap.add_argument("--map2d-known-radius", type=float, default=1.0,
                      help="离轨迹这个距离(m)以内的 free 格子算'已知'区域, 以外的降级成"
                           "map_server 的'未知'灰度(205)——不是不可通行, 全局规划器"
                           "(global_planner.py)只有明确占据才会挡, 未知区域只是规划代价更高,"
