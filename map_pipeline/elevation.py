@@ -510,12 +510,33 @@ def detect_structure(
     row = np.clip(((y_max - q[:, 1]) / resolution).astype(np.int32), 0, height - 1)
     zbi = np.clip(((q[:, 2] - z_lo) / z_bin).astype(np.int32), 0, nz - 1)
 
-    hist = np.zeros((height, width, nz), np.int32)
-    np.add.at(hist, (row, col, zbi), 1)
+    # 不再一次性开 (height, width, nz) 的稠密三维数组——城市/园区级地图这一维
+    # 乘出来能到几百 GiB (实测 34308×11612×133 ≈ 197GiB), 直接 OOM。改成按 z
+    # 切层过一遍点云: 先按 zbi 排序把同一层的点聚到一起(排序是 O(n log n),
+    # 比"每层都从头筛一遍全部点"的 O(nz·n) 快得多), 每层只开一张 (height,
+    # width) 的二维计数图统计这层的支撑, 把非空格子的 (行, 列, 计数) 存成稀疏
+    # 三元组——这部分内存跟"点云里实际出现过的 (格子,切层) 组合数"成正比, 不
+    # 会超过点数本身, 远小于稠密数组。第二遍(算 min_support 阈值后再判"哪些
+    # 格子过关")直接复用这份稀疏结果, 不用重新扫一遍原始点云。
+    order = np.argsort(zbi, kind="stable")
+    row_s, col_s, zbi_s = row[order], col[order], zbi[order]
+    bin_starts = np.searchsorted(zbi_s, np.arange(nz + 1))
 
-    nonzero_counts = hist[hist > 0]
-    if nonzero_counts.size == 0:
+    layer_counts = np.zeros((height, width), np.int32)
+    sparse_layers: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for z in range(nz):
+        sl = slice(bin_starts[z], bin_starts[z + 1])
+        if sl.start == sl.stop:
+            continue
+        layer_counts.fill(0)
+        np.add.at(layer_counts, (row_s[sl], col_s[sl]), 1)
+        rr, cc = np.nonzero(layer_counts)
+        sparse_layers.append((rr, cc, layer_counts[rr, cc].copy()))
+
+    if not sparse_layers:
         return np.zeros((height, width), dtype=bool), min_support_floor
+
+    nonzero_counts = np.concatenate([cnts for _, _, cnts in sparse_layers])
     # 75 分位数, 不用中位数——实测(house/large 两份图)非空 (格子,切层) 组合的
     # 中位数在两份密度差好几倍的图上都恰好是 2, 因为大部分非空组合是掠射角/
     # 边缘只扫到一两个点的稀疏命中, 不是真墙那种密集命中, 中位数被这些"稀疏
@@ -525,7 +546,11 @@ def detect_structure(
     typical_density = float(np.percentile(nonzero_counts, 75))
     min_support = max(min_support_floor, int(typical_density * min_support_frac))
 
-    populated_bins = (hist >= min_support).sum(axis=2)
+    populated_bins = np.zeros((height, width), np.int32)
+    for rr, cc, cnts in sparse_layers:
+        supported = cnts >= min_support
+        populated_bins[rr[supported], cc[supported]] += 1
+
     return populated_bins >= min_span_bins, min_support
 
 

@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np
 import open3d as o3d
 from PIL import Image
+from scipy import ndimage
 
 import elevation
 
@@ -59,14 +60,6 @@ import elevation
 # 检查(仅对这条离线管线, 不影响 backend 运行时——那边根本不用 Pillow)。
 Image.MAX_IMAGE_PIXELS = None
 
-# "设置路线" 页面(TopView)展示 2D 占据栅格图用的长边像素上限。定这个值主要是
-# 跨浏览器安全: canvas/image 元素的最大尺寸因浏览器而异, 移动端 Safari 尤其
-# 保守, 4096 是公认哪个主流浏览器都不会画崩的上限。精度上也够用: 这张图只是
-# "看全貌点导航点", 不需要看清每个栅格, 4096px 长边对应的有效分辨率对室内外
-# 地图都远超"看清楚点在哪"的需要, 换来的是文件体积可控(big 地图原始 pgm
-# 424MB, 不缩放直接怼给浏览器既有内存/传输问题, 35332px 的原始宽度本身也已经
-# 超出部分浏览器的 canvas 尺寸上限了)。
-TOPVIEW_LONG_EDGE_CAP = 4096
 
 # 大地图分片参数。只有跨度超过 TILE_EXTENT_THRESHOLD_M 的地图才分片 —— 小地图
 # (室内房间尺度)整图一份预览的精度就够用, 强行分片反而不划算: 室内点云密度
@@ -88,13 +81,28 @@ TILE_POINT_BUDGET = 150_000
 TILED_OVERVIEW_TARGET_POINTS = 1_500_000
 
 # 2D 占据栅格图分辨率按地图跨度自动选, 不用命令行手动指定(--map2d-resolution
-# 显式传值时优先用那个值, 这两个默认值只在没传的时候生效): 跨度超过
-# MAP2D_RESOLUTION_EXTENT_THRESHOLD_M(跟大地图分片走的是同一个"大跨度"直觉,
-# 但阈值单独定, 跟 TILE_EXTENT_THRESHOLD_M 不是一回事)的用 0.1m/格, 没超的用
-# 0.05m/格——小地图(房间尺度)细一点分辨率能看清家具/门框, 大地图(仓库/室外)
-# 格子数会指数级涨(width*height*nz 那个 3D 直方图, 见 detect_structure), 细
-# 分辨率在这种图上既慢又占内存, 且大跨度图本来精度需求也没那么高。
-MAP2D_RESOLUTION_EXTENT_THRESHOLD_M = 100.0
+# 显式传值时优先用那个值, 这张表只在没传的时候生效)——小地图(房间尺度)细一点
+# 分辨率能看清家具/门框, 大地图(仓库/室外/园区)格子数按 width×height 涨(生成
+# 占据栅格图之后 elevation.py 里 detect_structure/build_elevation 等好几步都要
+# 开跟这个尺寸一样大的数组), 分辨率不跟着跨度往下调的话, 跨度几千米的图在这
+# 几步会同时活好几张几百 GiB/GB 级的大数组, 内存直接爆(实测 3.4km 跨度用固定
+# 0.1m/格被 OOM killer 杀掉, 见 map_pipeline/elevation.py detect_structure 的
+# 相关注释)。表按跨度分档粗化, 每一档大致把格子数控制在跟上一档同一量级, 内存
+# 稳定在机器扛得住的范围; 每一格从跨度上界(不含)往下取, 最后一档兜底最大跨度。
+MAP2D_RESOLUTION_BY_EXTENT_M: list[tuple[float, float]] = [
+    (100.0, 0.05),
+    (500.0, 0.10),
+    (1500.0, 0.20),
+    (4000.0, 0.50),
+    (float("inf"), 1.00),
+]
+
+
+def _auto_map2d_resolution(max_extent_xy: float) -> float:
+    for threshold, resolution in MAP2D_RESOLUTION_BY_EXTENT_M:
+        if max_extent_xy <= threshold:
+            return resolution
+    return MAP2D_RESOLUTION_BY_EXTENT_M[-1][1]
 
 
 class _BooleanOptionalAction(argparse.Action):
@@ -141,10 +149,55 @@ def _log_step_done(t0: float) -> None:
     print(f"      用时 {time.perf_counter() - t0:.1f}s")
 
 
-def robust_xy_bounds(points: np.ndarray, pad: float = 0.3, lo=0.5, hi=99.5):
-    x_min, x_max = np.percentile(points[:, 0], [lo, hi])
-    y_min, y_max = np.percentile(points[:, 1], [lo, hi])
-    return float(x_min - pad), float(x_max + pad), float(y_min - pad), float(y_max + pad)
+def robust_xy_bounds(points: np.ndarray, pad: float = 0.3, cell_m: float = 1.0,
+                      min_cluster_cells: int = 10, max_grid_cells: int = 50_000_000):
+    """算点云的 xy 包围盒, 同时把真正的离群飞点(反光/误测导致的、孤零零飘在
+    主体结构外的点)排除在外, 不让它们把包围盒(以及下游的栅格图尺寸/分片网格)
+    撑爆。
+
+    试过两版按分位数切的做法, 都不对: 直接对点取分位数会被点云密度带偏——
+    室外/大跨度地图边缘扫得本来就稀(没有室内那种多趟重叠覆盖), 这些边缘区域
+    按点数占比可能连千分之一都不到, 百分位一刀切连真实区域一起切掉了(实测
+    3.4km 跨度的园区图, 边界比 SLAM 原图少了 ~60m, 左下角一大块被切没)。改成
+    按 cell_m 网格去重、对格子取分位数, 缓解了密度偏差, 但格子总数少的小地图
+    (房间尺度)分位数本身就没意义(0.1% 的格子数不到 1 个), 真正的离群点又漏
+    网了(实测 house/large 两张小图, 换算完包围盒反而比 SLAM 原图大了一圈)。
+
+    现在换成连通域过滤, 不再看"排第几分位", 只看"这片区域连不连片": 把点云按
+    cell_m 网格量化成一张二值图, 8 连通标记连通域, 只保留格子数 >=
+    min_cluster_cells 的连通域。真实结构哪怕稀疏, 在物理空间里也是连成片的,
+    连通域天然就大; 孤立飞点(反光/误测)在网格上只占一两个格子, 连通域天然
+    就小, 直接过滤掉——这个判据只跟"点在空间上连不连片"有关, 跟点云密度、
+    地图总大小都无关, 房间尺度和几公里跨度的图用同一套参数(cell_m,
+    min_cluster_cells)都适用, 不用按地图大小分别调。
+
+    grid_cell_m 按包围盒总格子数动态放粗(max_grid_cells 封顶)只是给下面开
+    occ 数组的内存兜底, 正常尺寸的地图用不到(1m 格子, 到几十公里跨度才会触发
+    放粗), 不影响过滤逻辑本身。
+    """
+    x_min_raw, x_max_raw = float(points[:, 0].min()), float(points[:, 0].max())
+    y_min_raw, y_max_raw = float(points[:, 1].min()), float(points[:, 1].max())
+    extent_x = max(x_max_raw - x_min_raw, cell_m)
+    extent_y = max(y_max_raw - y_min_raw, cell_m)
+    grid_cell_m = max(cell_m, (extent_x * extent_y / max_grid_cells) ** 0.5)
+
+    col = np.floor((points[:, 0] - x_min_raw) / grid_cell_m).astype(np.int64)
+    row = np.floor((points[:, 1] - y_min_raw) / grid_cell_m).astype(np.int64)
+    w, h = int(col.max()) + 1, int(row.max()) + 1
+    occ = np.zeros((h, w), dtype=bool)
+    occ[row, col] = True
+
+    labeled, n_labels = ndimage.label(occ, structure=np.ones((3, 3), np.uint8))
+    sizes = ndimage.sum(occ, labeled, index=np.arange(1, n_labels + 1))
+    big_labels = np.nonzero(sizes >= min_cluster_cells)[0] + 1
+    keep = np.isin(labeled, big_labels) if big_labels.size else occ
+    rr, cc = np.nonzero(keep)
+
+    x_min = x_min_raw + cc.min() * grid_cell_m - pad
+    x_max = x_min_raw + (cc.max() + 1) * grid_cell_m + pad
+    y_min = y_min_raw + rr.min() * grid_cell_m - pad
+    y_max = y_min_raw + (rr.max() + 1) * grid_cell_m + pad
+    return float(x_min), float(x_max), float(y_min), float(y_max)
 
 
 def _parse_map2d_yaml(path: Path) -> dict:
@@ -167,14 +220,42 @@ def _parse_map2d_yaml(path: Path) -> dict:
     return result
 
 
-def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path, long_edge_cap: int) -> dict:
+def raw_map2d_xy_bounds(map2d_dir: Path) -> tuple[float, float, float, float] | None:
+    """读 handbot slam 自己存的 map_2d_raw.pgm(+.yaml)算出物理范围(米), 不是
+    从点云统计猜的。
+
+    2D 栅格图的包围盒本来就该以"SLAM 实际建图/传感器量程覆盖到哪"为准, 而不是
+    事后从点云密度反推——试过按点数分位数切、按占据格子分位数切、按连通域大小
+    过滤, 全都是在用点云的统计特征去猜一个物理边界, 密度不均匀(室外/大跨度
+    地图边缘扫得本来就稀)或者真的有一小块连成片的离群结构时, 猜出来的边界会
+    比 SLAM 原图小一圈(切掉真实区域)或大一圈(囊括了不该有的区域)。map_2d_raw
+    是 handbot slam 自己产出的原图, 边界是它自己认定的建图范围, 不用猜。
+
+    返回的是世界坐标下的物理边界(x_min, x_max, y_min, y_max), 是"米", 不是
+    像素——跟 map_2d_raw 自己的分辨率无关, 后面套用我们自己选定的
+    map2d_resolution(见 MAP2D_RESOLUTION_BY_EXTENT_M)在这个物理范围上重新打
+    格子就行, 两边分辨率不需要一致。没有 map_2d_raw.pgm/yaml(比如纯点云地图,
+    没有对应的 handbot slam 原始输出)时返回 None, 调用方退回点云统计的
+    robust_xy_bounds。"""
+    raw_pgm, raw_yaml = map2d_dir / "map_2d_raw.pgm", map2d_dir / "map_2d_raw.yaml"
+    if not (raw_pgm.is_file() and raw_yaml.is_file()):
+        return None
+    info = _parse_map2d_yaml(raw_yaml)
+    width, height = Image.open(raw_pgm).size
+    x_min, y_min = info["origin_x"], info["origin_y"]
+    x_max = x_min + width * info["resolution"]
+    y_max = y_min + height * info["resolution"]
+    return x_min, x_max, y_min, y_max
+
+
+def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
     """把 map_server 格式的 2D 占据栅格图 (pgm+yaml) 转成前端"设置路线"页面
     展示用的 topview.png。
 
-    只做格式转换(pgm -> PNG, 占据栅格图大片同色区域, 白得的无损压缩率很可观)
-    + 必要时的整体降采样(长边超过 long_edge_cap 才降, 没超直接原样转, 不做
-    无谓的精度损失 —— 跟 3D 预览那边"点数没超阈值就不 voxel_down_sample"是
-    同一个思路)。不做 free/occupied/unknown 的阈值解读或重新配色: negate=0
+    只做格式转换(pgm -> PNG, 占据栅格图大片同色区域, 无损压缩率很可观), 不
+    降采样——像素跟 map_2d.pgm 一一对应, 分辨率就是 map2d_resolution(见
+    MAP2D_RESOLUTION_BY_EXTENT_M), 前端想看清栅格不用再受限于这张图本身的
+    降采样精度。不做 free/occupied/unknown 的阈值解读或重新配色: negate=0
     时 pgm 原始灰度本来就是"黑占据/白空闲/灰未知", 直接展示即可, 这里只是
     看图选点, 不需要真的按 occupied_thresh/free_thresh 二值化。
 
@@ -187,8 +268,7 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path, long_edg
     输出都是 0, ROS 生态也基本不用非零值, 犯不着为没见过的情况先做旋转变换)。
 
     返回写进 topview_meta.json 的 {resolution_m_per_px, width, height,
-    world_bounds}(width/height 是降采样后的实际输出尺寸, world_bounds 是物理
-    范围, 不随降采样变化)。
+    world_bounds}。
     """
     yaml_info = _parse_map2d_yaml(yaml_path)
     resolution = yaml_info["resolution"]
@@ -196,22 +276,12 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path, long_edg
 
     img = Image.open(pgm_path)
     orig_w, orig_h = img.size
-
-    long_edge = max(orig_w, orig_h)
-    if long_edge > long_edge_cap:
-        scale = long_edge_cap / long_edge
-        new_w, new_h = max(1, round(orig_w * scale)), max(1, round(orig_h * scale))
-        img = img.resize((new_w, new_h), Image.Resampling.BOX)
-    else:
-        new_w, new_h = orig_w, orig_h
-
     img.save(out_path)
 
-    effective_resolution = resolution * (orig_w / new_w)
     return {
-        "resolution_m_per_px": effective_resolution,
-        "width": new_w,
-        "height": new_h,
+        "resolution_m_per_px": resolution,
+        "width": orig_w,
+        "height": orig_h,
         "world_bounds": {
             "x_min": origin_x, "x_max": origin_x + orig_w * resolution,
             "y_min": origin_y, "y_max": origin_y + orig_h * resolution,
@@ -406,9 +476,7 @@ def main():
                           "生成, 沿用已有文件(默认开)")
     ap.add_argument("--map2d-resolution", type=float, default=None,
                      help="生成占据栅格图的格子大小 (m/格), 同时也是 detect_structure 的"
-                          "格子大小。不传则按地图跨度自动选: 超过 "
-                          f"{MAP2D_RESOLUTION_EXTENT_THRESHOLD_M:.0f}m 用 0.1, 没超用 0.05 "
-                          "(见 MAP2D_RESOLUTION_EXTENT_THRESHOLD_M)")
+                          "格子大小。不传则按地图跨度自动选(见 MAP2D_RESOLUTION_BY_EXTENT_M)")
     ap.add_argument("--map2d-structure-margin-lo", type=float, default=1.0,
                      help="detect_structure 的 z 窗口下界 = 轨迹高度 1% 分位数 - 这个值(m)")
     ap.add_argument("--map2d-structure-margin-hi", type=float, default=1.0,
@@ -462,10 +530,9 @@ def main():
     if args.map2d_resolution is not None:
         map2d_resolution = args.map2d_resolution
     else:
-        map2d_resolution = 0.10 if max_extent_xy > MAP2D_RESOLUTION_EXTENT_THRESHOLD_M else 0.05
+        map2d_resolution = _auto_map2d_resolution(max_extent_xy)
         print(f"      2D 占据栅格图分辨率按跨度自动选: {map2d_resolution}m/格 "
-              f"(跨度{'>' if max_extent_xy > MAP2D_RESOLUTION_EXTENT_THRESHOLD_M else '<='}"
-              f"{MAP2D_RESOLUTION_EXTENT_THRESHOLD_M:.0f}m)")
+              f"(跨度={max_extent_xy:.1f}m, 见 MAP2D_RESOLUTION_BY_EXTENT_M)")
 
     print("[2/5] 生成 2D 占据栅格图 (全局规划 + 设置路线 用)...")
     t_step = time.perf_counter()
@@ -474,6 +541,19 @@ def main():
     # --input(3d_map/dense_cloud_map.pcd)反推兄弟目录, 不用额外加命令行参数。
     map2d_dir = in_path.parent.parent / "2d_map"
     pgm_path, yaml_path = map2d_dir / "map_2d.pgm", map2d_dir / "map_2d.yaml"
+
+    # 2D 栅格图的包围盒优先复用 map_2d_raw.pgm(handbot slam 自己存的原图,
+    # 不会被这条流水线覆盖——我们只写 map_2d.pgm 这个文件名), 而不是从点云
+    # 统计猜——理由见 raw_map2d_xy_bounds 的说明。3D 预览/分片用的 x_min 等
+    # 变量仍然是点云自己的包围盒, 跟这里的 map2d_x_min 等是两套边界, 不要混用。
+    map2d_raw_bounds = raw_map2d_xy_bounds(map2d_dir)
+    if map2d_raw_bounds is not None:
+        map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max = map2d_raw_bounds
+        print(f"      2D 栅格图边界复用 SLAM 原图 map_2d_raw.pgm: "
+              f"x=[{map2d_x_min:.2f},{map2d_x_max:.2f}] y=[{map2d_y_min:.2f},{map2d_y_max:.2f}]")
+    else:
+        map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max = x_min, x_max, y_min, y_max
+        print("      没有 map_2d_raw.pgm(+.yaml), 2D 栅格图边界退回点云统计 (robust_xy_bounds)")
 
     if args.gen_2d_map:
         trajectory = elevation.load_trajectory(in_path.parent)
@@ -493,7 +573,7 @@ def main():
             traj_z_lo = float(np.percentile(trajectory[:, 2], 1))
             traj_z_hi = float(np.percentile(trajectory[:, 2], 99))
             structure, min_support = elevation.detect_structure(
-                raw_points, (x_min, x_max, y_min, y_max), map2d_resolution,
+                raw_points, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max), map2d_resolution,
                 z_lo=traj_z_lo - args.map2d_structure_margin_lo,
                 z_hi=traj_z_hi + args.map2d_structure_margin_hi,
                 z_bin=0.1,
@@ -508,7 +588,7 @@ def main():
             # 路径时本来就假设轨迹周围这个半径内没有障碍, 2D 图跟这个假设
             # 对不上的话, 路径规划出来会贴着"障碍"走或者干脆绕不过去。
             grid = elevation.clear_trajectory(
-                grid, trajectory, (x_min, x_max, y_min, y_max),
+                grid, trajectory, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max),
                 map2d_resolution, radius=args.map2d_trajectory_clear_radius,
             )
             # 离轨迹超过 map2d_known_radius 的 free 格子降级成"未知"(205)——
@@ -516,11 +596,11 @@ def main():
             # unknown_multiplier 给未知区域加规划代价, 见 backend/app/
             # global_planner.py)优先走验证过的地方。occupied 格子不受影响。
             grid = elevation.mark_known_region(
-                grid, trajectory, (x_min, x_max, y_min, y_max),
+                grid, trajectory, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max),
                 map2d_resolution, radius=args.map2d_known_radius,
             )
             map2d_dir.mkdir(parents=True, exist_ok=True)
-            write_map_server_grid(grid, pgm_path, yaml_path, map2d_resolution, x_min, y_min)
+            write_map_server_grid(grid, pgm_path, yaml_path, map2d_resolution, map2d_x_min, map2d_y_min)
             n_free, n_occ, n_unk = int((grid == 254).sum()), int((grid == 0).sum()), int((grid == 205).sum())
             print(f"      生成 {pgm_path}: {grid.shape[1]}x{grid.shape[0]}px, {map2d_resolution}m/px, "
                   f"free={n_free} occupied={n_occ} unknown={n_unk}")
@@ -532,7 +612,7 @@ def main():
     # 情况, 不能假设它总存在。
     topview2d = None
     if pgm_path.is_file() and yaml_path.is_file():
-        topview2d = export_topview_png(pgm_path, yaml_path, out_dir / "topview.png", TOPVIEW_LONG_EDGE_CAP)
+        topview2d = export_topview_png(pgm_path, yaml_path, out_dir / "topview.png")
         print(f"      {pgm_path} -> topview.png: {topview2d['width']}x{topview2d['height']}px, "
               f"分辨率 {topview2d['resolution_m_per_px']:.4f}m/px")
     else:
