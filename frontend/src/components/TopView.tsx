@@ -5,7 +5,7 @@ import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
 import type { NavStatus, PlannedRoutePoint, Topview2D, Waypoint, XY } from "../types";
 import { mapAssetUrl } from "../api";
-import { pixelToWorld, worldToPixel } from "../types";
+import { centerOnOrigin, pixelToWorld, worldToPixel } from "../types";
 
 interface Props {
   mapName: string;
@@ -89,23 +89,6 @@ const PLANNED_ROUTE_COLOR = "#22d3ee";
 const ROBOT_RADIUS_PX = 10;
 const ROBOT_STROKE_PX = 1.5;
 const HOVER_RADIUS_PX = 4;
-
-/**
- * 把展示画布的世界坐标范围扩展成以原点 (0,0) 对称的区间, 这样原点总是落在
- * 画布正中间, 分辨率跟原始俯视图保持一致, 只是画布边界变了。
- */
-function centerOnOrigin(meta: Topview2D): Topview2D {
-  const { x_min, x_max, y_min, y_max } = meta.world_bounds;
-  const halfX = Math.max(Math.abs(x_min), Math.abs(x_max));
-  const halfY = Math.max(Math.abs(y_min), Math.abs(y_max));
-  const res = meta.resolution_m_per_px;
-  return {
-    ...meta,
-    world_bounds: { x_min: -halfX, x_max: halfX, y_min: -halfY, y_max: halfY },
-    width: Math.ceil((2 * halfX) / res),
-    height: Math.ceil((2 * halfY) / res),
-  };
-}
 
 export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
