@@ -466,7 +466,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default="mapdata/livingroom/dense_cloud_map.pcd")
     ap.add_argument("--outdir", default="web_assets/map")
-    ap.add_argument("--max-preview-points", type=int, default=6_000_000,
+    ap.add_argument("--max-preview-points", type=int, default=3_000_000,
                      help="3D 预览点数阈值: 不超过就原样导出, 超过则用固定体素大小降"
                           "采样到接近这个点数(voxel_downsample_to_target, 不是随机丢点)")
     ap.add_argument("--gen-2d-map", action=_BooleanOptionalAction, default=True,
