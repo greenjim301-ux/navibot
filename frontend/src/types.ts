@@ -164,24 +164,6 @@ export function pixelToWorld(meta: Topview2D, col: number, row: number) {
   };
 }
 
-/**
- * 把展示画布的世界坐标范围扩展成以原点 (0,0) 对称的区间, 这样原点总是落在
- * 画布正中间, 分辨率跟原始俯视图保持一致, 只是画布边界变了。TopView(路线
- * 设置/预览)和地图列表卡片的缩略图都要"原点居中"展示, 抽成公共函数复用。
- */
-export function centerOnOrigin(meta: Topview2D): Topview2D {
-  const { x_min, x_max, y_min, y_max } = meta.world_bounds;
-  const halfX = Math.max(Math.abs(x_min), Math.abs(x_max));
-  const halfY = Math.max(Math.abs(y_min), Math.abs(y_max));
-  const res = meta.resolution_m_per_px;
-  return {
-    ...meta,
-    world_bounds: { x_min: -halfX, x_max: halfX, y_min: -halfY, y_max: halfY },
-    width: Math.ceil((2 * halfX) / res),
-    height: Math.ceil((2 * halfY) / res),
-  };
-}
-
 /** 定位是否已经不可信 (见 RobotPose.cov) */
 export const POSE_COV_BAD = 0.99;
 export function poseUnreliable(pose: RobotPose | null | undefined): boolean {

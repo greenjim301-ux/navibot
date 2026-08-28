@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Trash2, Map as MapIcon, RefreshCw, Plus } from "lucide-react";
 import { deleteMap, listMaps, mapAssetUrl, preprocessMap } from "../api";
-import { centerOnOrigin, worldToPixel, type MapInfo, type Topview2D } from "../types";
+import type { MapInfo } from "../types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -128,39 +128,6 @@ export default function MapListPage() {
   );
 }
 
-/** 卡片缩略图: 把原点 (0,0) 摆在卡片正中间, 而不是直接铺满 topview.png 本身
- *  的裁剪框——地图的建图起点(也是导航坐标原点)不一定在点云包围盒正中间,
- *  直接 object-cover 铺满的话原点经常偏在一边甚至被裁掉。做法是按 TopView.tsx
- *  同一套 centerOnOrigin/worldToPixel 换算, 把 topview.png 摆进一个以原点对称
- *  扩出来的画布, 再用 SVG 的 viewBox + preserveAspectRatio="xMidYMid meet"
- *  (原生"完整显示、居中, 不裁切"语义, 不用量画布实际像素尺寸, 卡片宽度随
- *  响应式布局变化也不用重算)把这块画布嵌进卡片——效果上超出卡片长宽比的
- *  那一头会露出卡片背景(留白), 不会裁到原点。 */
-function TopviewThumbnail({ mapName, topview2d }: { mapName: string; topview2d: Topview2D }) {
-  const centered = centerOnOrigin(topview2d);
-  const imgOffset = worldToPixel(centered, topview2d.world_bounds.x_min, topview2d.world_bounds.y_max);
-  return (
-    <svg
-      viewBox={`0 0 ${centered.width} ${centered.height}`}
-      preserveAspectRatio="xMidYMid meet"
-      className="absolute inset-0 size-full"
-    >
-      <image
-        href={mapAssetUrl(mapName, "topview.png")}
-        // crossOrigin 跟 TopView.tsx 的 useImage(...,"anonymous") 保持一致——
-        // 见 backend/app/main.py add_vary_origin 的注释, 同一张 topview.png
-        // 如果先被不带 CORS 模式的请求缓存过, 之后 Konva 用 CORS 模式请求会
-        // 直接命中那份坏缓存报错。
-        crossOrigin="anonymous"
-        x={imgOffset.col}
-        y={imgOffset.row}
-        width={topview2d.width}
-        height={topview2d.height}
-      />
-    </svg>
-  );
-}
-
 function formatBytes(bytes: number | null): string {
   if (bytes == null) return "—";
   if (bytes < 1024) return `${bytes} B`;
@@ -185,7 +152,6 @@ function MapCard({
   const bounds = ready ? map.topview_meta?.world_bounds : null;
   const width = bounds ? Math.round(bounds.x_max - bounds.x_min) : null;
   const height = bounds ? Math.round(bounds.y_max - bounds.y_min) : null;
-  const topview2d = ready ? map.topview_meta?.topview2d : null;
 
   const statusLine = map.status === "error"
     ? "预处理失败"
@@ -197,16 +163,12 @@ function MapCard({
 
   return (
     <Card className="gap-0 overflow-hidden py-0">
-      <div
-        className={`group relative flex h-56 items-center justify-center overflow-hidden ${
-          ready && topview2d ? "bg-[#cdcdcd]" : "bg-muted"
-        }`}
-      >
-        {ready && topview2d ? (
-          <TopviewThumbnail mapName={map.name} topview2d={topview2d} />
-        ) : ready ? (
-          // 没有 2D 栅格图源(旧地图)时没有 world_bounds/分辨率可用来定位原点,
-          // 退化成跟以前一样直接铺满——这种地图本来就没有 topview.png 可看。
+      <div className="group relative flex h-56 items-center justify-center overflow-hidden bg-muted">
+        {ready ? (
+          // crossOrigin 跟 TopView.tsx 的 useImage(...,"anonymous") 保持一致——
+          // 见 backend/app/main.py add_vary_origin 的注释, 同一张 topview.png
+          // 如果先被不带 CORS 模式的 <img> 缓存过, 之后 Konva 用 CORS 模式请求
+          // 会直接命中那份坏缓存报错。
           <img
             src={mapAssetUrl(map.name, "topview.png")}
             alt={map.name}
