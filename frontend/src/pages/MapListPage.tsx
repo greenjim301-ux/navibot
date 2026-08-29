@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Trash2, Map as MapIcon, RefreshCw, Plus } from "lucide-react";
-import { deleteMap, listMaps, mapAssetUrl, preprocessMap } from "../api";
+import { Trash2, Map as MapIcon, RefreshCw, Plus, Zap, ZapOff } from "lucide-react";
+import { activateMap, deactivateMap, deleteMap, listMaps, mapAssetUrl, preprocessMap } from "../api";
 import type { MapInfo } from "../types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import {
   Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter,
 } from "@/components/ui/card";
@@ -52,6 +53,25 @@ export default function MapListPage() {
     setPendingAction(name);
     try {
       await deleteMap(name);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  /** 全局同时最多一张地图激活, 激活一张会自动取消掉之前那张(后端处理, 见
+   *  backend/app/map_registry.py), 前端刷新一次列表就能看到旧的那张 active
+   *  变回 false, 不用自己在本地维护"之前激活的是谁"。 */
+  async function handleToggleActive(name: string, active: boolean) {
+    setPendingAction(name);
+    try {
+      if (active) {
+        await deactivateMap(name);
+      } else {
+        await activateMap(name);
+      }
       await refresh();
     } catch (e) {
       setError(String(e));
@@ -120,6 +140,7 @@ export default function MapListPage() {
               busy={pendingAction === m.name}
               onPreprocess={() => handlePreprocess(m.name)}
               onDelete={() => handleDelete(m.name)}
+              onToggleActive={() => handleToggleActive(m.name, m.active)}
             />
           ))}
         </div>
@@ -142,9 +163,9 @@ function formatBytes(bytes: number | null): string {
 }
 
 function MapCard({
-  map, busy, onPreprocess, onDelete,
+  map, busy, onPreprocess, onDelete, onToggleActive,
 }: {
-  map: MapInfo; busy: boolean; onPreprocess: () => void; onDelete: () => void;
+  map: MapInfo; busy: boolean; onPreprocess: () => void; onDelete: () => void; onToggleActive: () => void;
 }) {
   const ready = map.status === "ready";
   const processing = map.status === "processing" || busy;
@@ -177,6 +198,13 @@ function MapCard({
           />
         ) : (
           <MapIcon className="size-8 text-muted-foreground/40" />
+        )}
+
+        {map.active && (
+          <Badge className="absolute top-2 left-2 gap-1 bg-cyan-500 text-white">
+            <Zap className="size-3" />
+            已激活
+          </Badge>
         )}
 
         <div className="absolute inset-0 flex items-center justify-center gap-2 bg-black/45 opacity-0 transition-opacity group-hover:opacity-100">
@@ -232,6 +260,16 @@ function MapCard({
       </CardContent>
 
       <CardFooter className="flex-wrap justify-end gap-2">
+        <Button
+          size="sm"
+          variant={map.active ? "outline" : "secondary"}
+          disabled={busy || (!ready && !map.active)}
+          title={!ready && !map.active ? "地图还没有预处理完成, 不能激活" : undefined}
+          onClick={onToggleActive}
+        >
+          {map.active ? <ZapOff /> : <Zap />}
+          {map.active ? "取消激活" : "激活"}
+        </Button>
         <Button size="sm" variant="outline" disabled={processing} onClick={onPreprocess}>
           <RefreshCw className={processing ? "animate-spin" : ""} />
           {processing ? "处理中…" : ready ? "重新预处理" : map.status === "error" ? "重试预处理" : "预处理"}

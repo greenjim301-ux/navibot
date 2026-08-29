@@ -87,6 +87,18 @@ export async function preprocessMap(name: string): Promise<MapInfo> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(name)}/preprocess`, { method: "POST" }));
 }
 
+/** 激活地图: 全局同时最多一张, 激活一张会自动取消掉之前那张(见
+ *  backend/app/map_registry.py 的 activate_map)。只有 status="ready" 的地图
+ *  能激活, 否则后端 400。 */
+export async function activateMap(name: string): Promise<MapInfo> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(name)}/activate`, { method: "POST" }));
+}
+
+/** 取消激活。如果 name 当前并不是激活的那张, 是 no-op。 */
+export async function deactivateMap(name: string): Promise<MapInfo> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(name)}/deactivate`, { method: "POST" }));
+}
+
 export async function deleteMap(name: string): Promise<void> {
   const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(name)}`, { method: "DELETE" });
   if (!res.ok) {

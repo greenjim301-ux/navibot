@@ -96,6 +96,9 @@ export interface MapInfo {
   /** 3d_map/dense_cloud_map.pcd 的原始文件大小(字节), 跟是否已预处理无关 */
   source_pcd_bytes: number | null;
   updated_at: number;
+  /** 全局同时最多一张地图处于激活状态(见 backend/app/map_registry.py)。地图
+   *  预览页只在预览的是激活地图时才显示"图层"/"导航控制"以及机器狗当前位置。 */
+  active: boolean;
 }
 
 /** "设置路线"页面(TopView)展示用的 2D 占据栅格图, 来自地图目录
