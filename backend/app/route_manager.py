@@ -1,9 +1,12 @@
 import logging
 import math
+import struct
 import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional
+
+import numpy as np
 
 from . import config, path_planner
 from .models import NavStatus, Pose, TaskState, Waypoint
@@ -11,6 +14,23 @@ from .ros_bridge import RosBridge
 from .ws_manager import WebSocketManager
 
 logger = logging.getLogger("navibot.route_manager")
+
+# 膨胀地图/雷达点云走二进制 WS 帧, 不再是 JSON——这两个是唯一"单帧成千上万个
+# 浮点数"的高频展示话题, JSON 文本编解码(后端 json.dumps、前端 JSON.parse)本身
+# 就是一笔不小的开销, 换成二进制帧连这步都省了(见 _encode_point_frame,
+# frontend/src/useNavStatus.ts 对应的解码)。
+_POINT_FRAME_TYPE_INFLATION_MAP = 1
+_POINT_FRAME_TYPE_SURF_CLOUD = 2
+
+
+def _encode_point_frame(msg_type: int, enabled: bool, points: np.ndarray) -> bytes:
+    """4 字节头(消息类型、enabled、2 字节保留位) + 拍平的 [x0,y0,z0, ...]
+    float32 数组原始字节。保留位纯粹是为了让 float32 数组从第 4 字节(4 的
+    倍数)开始, 前端能直接 `new Float32Array(buf, 4)` 原地取用, 不用现拷贝
+    一份对齐——见 ws_manager.py 的 broadcast_binary_threadsafe 和
+    PointCloudView.tsx / useNavStatus.ts 里对应的解码。"""
+    header = struct.pack("<BB2x", msg_type, 1 if enabled else 0)
+    return header + points.astype("<f4", copy=False).tobytes()
 
 
 @dataclass
@@ -75,9 +95,9 @@ class RouteManager:
         self._self_inflation_enabled: bool = False
         self._self_inflation: dict = {}  # marker id -> 最新的那个圆柱
         self._inflation_map_enabled: bool = False
-        self._inflation_map: List[float] = []  # 拍平的 [x0,y0,z0, x1,y1,z1, ...]
+        self._inflation_map: np.ndarray = np.empty(0, dtype=np.float32)  # 拍平的 [x0,y0,z0, ...]
         self._surf_cloud_enabled: bool = False
-        self._surf_cloud: List[float] = []  # 拍平的 [x0,y0,z0, x1,y1,z1, ...], 每帧整体替换
+        self._surf_cloud: np.ndarray = np.empty(0, dtype=np.float32)  # 拍平的 [x0,y0,z0, ...], 每帧整体替换
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -110,15 +130,18 @@ class RouteManager:
         with self._lock:
             return self._self_inflation_payload_locked()
 
-    def get_inflation_map_state(self) -> dict:
-        """当前是否订阅了膨胀地图 + 最新一片点云, 给新连上的 ws 客户端补发用。"""
+    def get_inflation_map_state(self) -> bytes:
+        """当前是否订阅了膨胀地图 + 最新一片点云, 编码成跟广播用的同一种二进制
+        帧(见 _encode_point_frame), 给新连上的 ws 客户端补发用——main.py 直接
+        ws.send_bytes() 发出去, 前端解码路径跟收到的实时广播完全一样, 不用
+        为"刚连上时补一份"单独维护一套 JSON 格式。"""
         with self._lock:
-            return self._inflation_map_payload_locked()
+            return self._inflation_map_frame_locked()
 
-    def get_surf_cloud_state(self) -> dict:
-        """当前是否订阅了雷达点云 + 最新一帧, 给新连上的 ws 客户端补发用。"""
+    def get_surf_cloud_state(self) -> bytes:
+        """同上, 雷达点云。"""
         with self._lock:
-            return self._surf_cloud_payload_locked()
+            return self._surf_cloud_frame_locked()
 
     # ---- 指令 ----
     def get_altitude_calibration(self, map_name: Optional[str]) -> Optional[float]:
@@ -392,61 +415,65 @@ class RouteManager:
         self._ws.broadcast_threadsafe({"type": "self_inflation", "data": payload})
         return payload
 
-    def _inflation_map_payload_locked(self) -> dict:
-        return {"enabled": self._inflation_map_enabled, "points": list(self._inflation_map)}
+    def _inflation_map_frame_locked(self) -> bytes:
+        return _encode_point_frame(
+            _POINT_FRAME_TYPE_INFLATION_MAP, self._inflation_map_enabled, self._inflation_map,
+        )
 
-    def on_inflation_map(self, points: List[float]) -> None:
-        """转发 /grid_map/occupancy_inflate 的一整片点云 (拍平的 [x,y,z, ...]),
-        每次整片替换(不是增量)。200Hz 上限的话题, 只在勾选框打开时才会被订阅
-        (见 ros_bridge.set_inflation_map_enabled)。限流(INFLATION_MAP_BROADCAST_HZ)
+    def on_inflation_map(self, points: np.ndarray) -> None:
+        """转发 /grid_map/occupancy_inflate 的一整片点云 (拍平的 float32
+        [x,y,z, ...] 数组, 见 ros_bridge._decode_xyz_flat), 每次整片替换(不是
+        增量)。最快 20Hz 的话题, 只在勾选框打开时才会被订阅(见
+        ros_bridge.set_inflation_map_enabled)。限流(INFLATION_MAP_BROADCAST_HZ)
         在 ros_bridge 那边、解码 PointCloud2 之前就做了(省得白解码一片马上要丢的
         点云), 这里不用再自己维护一份时间戳。"""
         with self._lock:
             if not self._inflation_map_enabled:
                 return
             self._inflation_map = points
-            payload = self._inflation_map_payload_locked()
-        self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
+            frame = self._inflation_map_frame_locked()
+        self._ws.broadcast_binary_threadsafe("inflation_map", frame)
 
     def set_inflation_map_enabled(self, enabled: bool) -> dict:
-        """开关膨胀地图展示。状态变化立刻广播给所有 ws 客户端(不受限流影响),
-        好让多开的标签页里勾选框保持一致。"""
+        """开关膨胀地图展示。状态变化(连同当前这片点云, 关闭时是空的)立刻用
+        同一种二进制帧广播给所有 ws 客户端(不受限流影响), 好让多开的标签页里
+        勾选框保持一致。HTTP 响应只回 enabled——points 前端从来不用(靠 ws 广播
+        拿数据), 没必要在这条请求的响应体里再带一遍, 关掉时甚至是空的。"""
         self._ros.set_inflation_map_enabled(enabled)
         with self._lock:
             self._inflation_map_enabled = enabled
             if not enabled:
-                self._inflation_map = []
-            payload = self._inflation_map_payload_locked()
-        self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
-        return payload
+                self._inflation_map = np.empty(0, dtype=np.float32)
+            frame = self._inflation_map_frame_locked()
+        self._ws.broadcast_binary_threadsafe("inflation_map", frame)
+        return {"enabled": enabled}
 
-    def _surf_cloud_payload_locked(self) -> dict:
-        return {"enabled": self._surf_cloud_enabled, "points": list(self._surf_cloud)}
+    def _surf_cloud_frame_locked(self) -> bytes:
+        return _encode_point_frame(_POINT_FRAME_TYPE_SURF_CLOUD, self._surf_cloud_enabled, self._surf_cloud)
 
-    def on_surf_cloud(self, points: List[float]) -> None:
-        """转发 /surf_cloud_in_map 的当前帧点云(拍平的 [x,y,z, ...]), 每次整帧
-        替换(不叠加历史帧)。源头本身 5Hz, 只在勾选框打开时才会被订阅(见
-        ros_bridge.set_surf_cloud_enabled)。限流(SURF_CLOUD_BROADCAST_HZ)在
-        ros_bridge 那边、解码 PointCloud2 之前就做了, 这里不用再自己维护一份
-        时间戳。"""
+    def on_surf_cloud(self, points: np.ndarray) -> None:
+        """转发 /surf_cloud_in_map 的当前帧点云(拍平的 float32 [x,y,z, ...]
+        数组), 每次整帧替换(不叠加历史帧)。源头本身 5Hz, 只在勾选框打开时才会
+        被订阅(见 ros_bridge.set_surf_cloud_enabled)。限流
+        (SURF_CLOUD_BROADCAST_HZ)在 ros_bridge 那边、解码 PointCloud2 之前就
+        做了, 这里不用再自己维护一份时间戳。"""
         with self._lock:
             if not self._surf_cloud_enabled:
                 return
             self._surf_cloud = points
-            payload = self._surf_cloud_payload_locked()
-        self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
+            frame = self._surf_cloud_frame_locked()
+        self._ws.broadcast_binary_threadsafe("surf_cloud", frame)
 
     def set_surf_cloud_enabled(self, enabled: bool) -> dict:
-        """开关雷达点云展示。状态变化立刻广播给所有 ws 客户端(不受限流影响),
-        好让多开的标签页里勾选框保持一致。"""
+        """开关雷达点云展示, 理由同 set_inflation_map_enabled。"""
         self._ros.set_surf_cloud_enabled(enabled)
         with self._lock:
             self._surf_cloud_enabled = enabled
             if not enabled:
-                self._surf_cloud = []
-            payload = self._surf_cloud_payload_locked()
-        self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
-        return payload
+                self._surf_cloud = np.empty(0, dtype=np.float32)
+            frame = self._surf_cloud_frame_locked()
+        self._ws.broadcast_binary_threadsafe("surf_cloud", frame)
+        return {"enabled": enabled}
 
     def _check_stuck_locked(self) -> None:
         """planner 不报失败, 只能靠"长时间没靠近目标"来判卡住。

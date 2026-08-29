@@ -34,12 +34,14 @@ interface Props {
    *  (前/后各一个), 只在页面上的勾选框打开时后端才会有数据。 */
   selfInflation?: SelfInflationMarker[] | null;
   /** /grid_map/occupancy_inflate 原样转发, 拍平的 [x0,y0,z0, x1,y1,z1, ...],
-   *  只在页面上的勾选框打开时后端才会有数据。 */
-  inflationMap?: number[] | null;
+   *  只在页面上的勾选框打开时后端才会有数据。后端走二进制 WS 帧、前端直接
+   *  Float32Array 解出来(见 useNavStatus.ts), 不再是普通 number[]——省掉大
+   *  数组从 JSON 文本解析成普通数组这一步, 点数一多(几千到上万)差距明显。 */
+  inflationMap?: Float32Array | null;
   /** /surf_cloud_in_map 原样转发, 拍平的 [x0,y0,z0, x1,y1,z1, ...], 雷达当前帧
    *  降采样点云(每帧整体替换, 不叠加历史帧), 只在页面上的勾选框打开时后端才会
-   *  有数据。 */
-  surfCloud?: number[] | null;
+   *  有数据。同 inflationMap, 是 Float32Array。 */
+  surfCloud?: Float32Array | null;
   /** 是否支持"镜头跟随机器狗": 决定 updateFollow() 有没有意义(还得看
    *  status.robot_pose 有没有值), 跟下面 showFollowButton 是两件事——这个控制
    *  能力, 那个只控制"要不要画组件自带的那颗按钮"。 */
@@ -218,9 +220,16 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   const selfInflationGroupRef = useRef<THREE.Group | null>(null);
   const inflationMapGroupRef = useRef<THREE.Group | null>(null);
   // 膨胀地图的 Points/几何体在多次更新之间复用(见下面那个 effect), 不是每次都
-  // 整个丢掉重建; capacity 记录当前顶点/颜色缓冲区能容纳的点数上限。
+  // 整个丢掉重建; capacity 记录当前顶点缓冲区能容纳的点数上限。
   const inflationPointsRef = useRef<THREE.Points | null>(null);
   const inflationCapacityRef = useRef(0);
+  // 彩虹着色挪到顶点着色器算(见下面 onBeforeCompile), CPU 每次更新只需要算好
+  // zMin/zRangeInv 这两个数塞进 uniform, 不用再逐点算颜色写进单独的 color
+  // 缓冲区——这个 ref 存的是 onBeforeCompile 里拿到的 shader.uniforms 引用,
+  // 材质只编译一次, 后续更新直接改 uniform.value, 不触发重新编译。
+  const inflationRainbowUniformsRef = useRef<{
+    uZMin: { value: number }; uZRangeInv: { value: number };
+  } | null>(null);
   const surfCloudGroupRef = useRef<THREE.Group | null>(null);
   // 雷达实时点云同样用持久 Points/缓冲区(见下面那个 effect), 不逐帧整个重建。
   const surfCloudPointsRef = useRef<THREE.Points | null>(null);
@@ -477,6 +486,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     inflationMapGroupRef.current = inflationMapGroup;
     inflationPointsRef.current = null;
     inflationCapacityRef.current = 0;
+    inflationRainbowUniformsRef.current = null;
 
     const surfCloudGroup = new THREE.Group();
     scene.add(surfCloudGroup);
@@ -1097,12 +1107,19 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     });
   }, [selfInflation]);
 
-  // 膨胀地图 (/grid_map/occupancy_inflate): points 是拍平的
+  // 膨胀地图 (/grid_map/occupancy_inflate): points 是拍平的 float32
   // [x0,y0,z0, x1,y1,z1, ...], 跟 rviz 的 inflate_map 显示项对齐: Axis=Z +
   // Use rainbow + Autocompute Value Bounds (按当前这批点的 z 范围实时取
   // min/max, 不是固定阈值), Size (m)=0.1, Alpha=1, 不做插值/下采样。
   // 更新时原地复用 GPU 缓冲区(见下面 inflationPointsRef/inflationCapacityRef),
   // 只有点数超出当前容量才重新分配, 不是每帧都整个 dispose 重建。
+  //
+  // 彩虹着色挪到了顶点着色器里算(见下面 material.onBeforeCompile), 不再用
+  // CPU 逐点算颜色写进单独的 color 缓冲区——这个 effect 每次更新只需要扫一遍
+  // 拿 zMin/zMax(找最值本身很便宜), 塞进两个 uniform, 归一化/HSV 转 RGB 都在
+  // GPU 每个顶点算, 主线程不再有这部分开销, 也省了一份 capacity*3 的颜色数组。
+  // 材质只在第一次创建时编译一次(见下面的 shader chunk 替换), 之后的更新只是
+  // 改 uniform.value, 不会触发重新编译。
   useEffect(() => {
     const group = inflationMapGroupRef.current;
     if (!group) return;
@@ -1129,12 +1146,61 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       const capacity = Math.ceil(count * 1.5); // 留 50% 余量, 减少反复扩容重建
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
-      geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
       const material = new THREE.PointsMaterial({
-        size: 0.1, vertexColors: true, clippingPlanes: [heightPlaneRef.current],
+        size: 0.1, clippingPlanes: [heightPlaneRef.current],
       });
+      // 在 PointsMaterial 编译好的着色器上做最小改动: 保留它自带的裁剪平面/
+      // 点大小衰减等处理(#include 那些 chunk 原样不动), 只插入"按 z 算彩虹色"
+      // 这一小段, 再把算出来的颜色接到最终输出上——比手写一整个 ShaderMaterial
+      // (还要自己重新实现裁剪/衰减)风险小得多。字符串替换的目标文本对应装的
+      // three.js 版本(package.json 锁的 three@0.185.1)的 points_vert.glsl /
+      // points_frag.glsl 原文, 换 three 版本升级时如果这段样式变了, 效果是
+      // "颜色不再按高度渐变"(fallback 到不确定的默认色), 不会报错也不会崩,
+      // 但升级 three 之后要留意这一处还成不成立。
+      material.onBeforeCompile = (shader) => {
+        shader.uniforms.uZMin = { value: 0 };
+        shader.uniforms.uZRangeInv = { value: 0 };
+        shader.vertexShader = shader.vertexShader
+          .replace(
+            "uniform float size;\nuniform float scale;",
+            "uniform float size;\nuniform float scale;\nuniform float uZMin;\nuniform float uZRangeInv;\nvarying vec3 vRainbowColor;",
+          )
+          .replace(
+            "void main() {",
+            [
+              "void main() {",
+              "\tfloat rv = uZRangeInv > 0.0 ? clamp((position.z - uZMin) * uZRangeInv, 0.0, 1.0) : 0.0;",
+              "\tfloat rh = rv * 5.0 + 1.0;",
+              "\tfloat ri = floor(rh);",
+              "\tfloat rf = rh - ri;",
+              "\tif (mod(ri, 2.0) < 0.5) rf = 1.0 - rf;",
+              "\tfloat rn = 1.0 - rf;",
+              "\tif (ri <= 1.0) vRainbowColor = vec3(rn, 0.0, 1.0);",
+              "\telse if (ri < 2.5) vRainbowColor = vec3(0.0, rn, 1.0);",
+              "\telse if (ri < 3.5) vRainbowColor = vec3(0.0, 1.0, rn);",
+              "\telse if (ri < 4.5) vRainbowColor = vec3(rn, 1.0, 0.0);",
+              "\telse vRainbowColor = vec3(1.0, rn, 0.0);",
+            ].join("\n"),
+          );
+        shader.fragmentShader = shader.fragmentShader
+          .replace(
+            "uniform vec3 diffuse;\nuniform float opacity;",
+            "uniform vec3 diffuse;\nuniform float opacity;\nvarying vec3 vRainbowColor;",
+          )
+          .replace(
+            "vec4 diffuseColor = vec4( diffuse, opacity );",
+            "vec4 diffuseColor = vec4( diffuse, opacity );\n\tdiffuseColor.rgb = vRainbowColor;",
+          );
+        inflationRainbowUniformsRef.current = shader.uniforms as unknown as {
+          uZMin: { value: number }; uZRangeInv: { value: number };
+        };
+      };
       points = new THREE.Points(geometry, material);
       points.renderOrder = 9;
+      // 传感器数据本来就是机器狗附近的局部范围, 不值得为它单独维护一个精确
+      // 包围球来做视锥裁剪——每次更新都 computeBoundingSphere() 是一次额外的
+      // O(点数)全量扫描, 直接关掉裁剪比这个划算。
+      points.frustumCulled = false;
       group.add(points);
       inflationPointsRef.current = points;
       inflationCapacityRef.current = capacity;
@@ -1143,9 +1209,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
 
     const geometry = points.geometry;
     const posAttr = geometry.getAttribute("position") as THREE.BufferAttribute;
-    const colorAttr = geometry.getAttribute("color") as THREE.BufferAttribute;
     const positions = posAttr.array as Float32Array;
-    const colors = colorAttr.array as Float32Array;
 
     positions.set(inflationMap); // 定长数组间的原生批量拷贝, 比逐元素手写循环快
 
@@ -1157,30 +1221,14 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       if (z > zMax) zMax = z;
     }
     const zRange = zMax - zMin;
-    const invRange = zRange > 1e-6 ? 1 / zRange : 0;
-
-    // rvizRainbowColor 内联展开: 避免每个点一次函数调用 + THREE.Color 对象读写的
-    // 开销, 这个循环每帧要跑几千到几万次, 内联后就是纯数值运算。
-    for (let i = 0; i < count; i++) {
-      const si = i * 3;
-      const z = inflationMap[si + 2];
-      const v = invRange > 0 ? Math.min(1, Math.max(0, (z - zMin) * invRange)) : 0;
-      const h = v * 5 + 1;
-      const ii = Math.floor(h);
-      let f = h - ii;
-      if ((ii & 1) === 0) f = 1 - f;
-      const n = 1 - f;
-      if (ii <= 1) { colors[si] = n; colors[si + 1] = 0; colors[si + 2] = 1; }
-      else if (ii === 2) { colors[si] = 0; colors[si + 1] = n; colors[si + 2] = 1; }
-      else if (ii === 3) { colors[si] = 0; colors[si + 1] = 1; colors[si + 2] = n; }
-      else if (ii === 4) { colors[si] = n; colors[si + 1] = 1; colors[si + 2] = 0; }
-      else { colors[si] = 1; colors[si + 1] = n; colors[si + 2] = 0; }
+    const uniforms = inflationRainbowUniformsRef.current;
+    if (uniforms) {
+      uniforms.uZMin.value = zMin;
+      uniforms.uZRangeInv.value = zRange > 1e-6 ? 1 / zRange : 0;
     }
 
     posAttr.needsUpdate = true;
-    colorAttr.needsUpdate = true;
     geometry.setDrawRange(0, count);
-    geometry.computeBoundingSphere();
   }, [inflationMap]);
 
   // 雷达实时点云 (/surf_cloud_in_map): 每帧整体替换的当前帧降采样点云, 5Hz,
@@ -1214,6 +1262,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       });
       points = new THREE.Points(geometry, material);
       points.renderOrder = 8;
+      // 理由同膨胀地图那个 effect: 局部传感器点云, 不值得为它维护精确包围球。
+      points.frustumCulled = false;
       group.add(points);
       surfCloudPointsRef.current = points;
       surfCloudCapacityRef.current = capacity;
@@ -1225,7 +1275,6 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     (posAttr.array as Float32Array).set(surfCloud);
     posAttr.needsUpdate = true;
     geometry.setDrawRange(0, count);
-    geometry.computeBoundingSphere();
   }, [surfCloud]);
 
   const hasPose = Boolean(status?.robot_pose);

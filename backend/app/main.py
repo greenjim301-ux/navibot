@@ -325,8 +325,11 @@ async def ws_nav(ws: WebSocket):
         if optimal_traj:
             await ws.send_json({"type": "optimal_traj", "data": {"points": optimal_traj}})
         await ws.send_json({"type": "self_inflation", "data": route_manager.get_self_inflation_state()})
-        await ws.send_json({"type": "inflation_map", "data": route_manager.get_inflation_map_state()})
-        await ws.send_json({"type": "surf_cloud", "data": route_manager.get_surf_cloud_state()})
+        # 膨胀地图/雷达点云走二进制帧, 跟广播用的是同一种编码(见
+        # route_manager._encode_point_frame), 前端解码路径完全一样, 不用为
+        # "刚连上时补一份初始状态"单独维护一套 JSON 格式。
+        await ws.send_bytes(route_manager.get_inflation_map_state())
+        await ws.send_bytes(route_manager.get_surf_cloud_state())
         while True:
             # 前端目前不需要往这条连接发消息, 只是保持连接存活/感知断开
             await ws.receive_text()

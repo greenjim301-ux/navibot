@@ -10,11 +10,11 @@ import threading
 import time
 from typing import Callable, List, Optional
 
+import numpy as np
 import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs import point_cloud2
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Empty
 from visualization_msgs.msg import Marker
 import tf.transformations as tft
@@ -29,10 +29,55 @@ PoseCallback = Callable[[float, float, float, float, float, float], None]
 OptimalTrajCallback = Callable[[List[dict]], None]
 # 一个 self_inflation 圆柱: {"id":.., "x":.., "y":.., "z":.., "radius":.., "height":.., "r":.., "g":.., "b":.., "a":..}
 SelfInflationCallback = Callable[[dict], None]
-# 膨胀地图整片点云, 拍平成 [x0,y0,z0, x1,y1,z1, ...] (每次整片替换, 不是增量)
-InflationMapCallback = Callable[[List[float]], None]
-# 雷达实时点云 (/surf_cloud_in_map), 同样拍平成 [x0,y0,z0, ...], 每帧整体替换
-SurfCloudCallback = Callable[[List[float]], None]
+# 膨胀地图整片点云, 拍平成 float32 一维数组 [x0,y0,z0, x1,y1,z1, ...] (每次整片
+# 替换, 不是增量) —— 见 _decode_xyz_flat, 不再是 Python list。
+InflationMapCallback = Callable[[np.ndarray], None]
+# 雷达实时点云 (/surf_cloud_in_map), 同样拍平成 float32 一维数组, 每帧整体替换
+SurfCloudCallback = Callable[[np.ndarray], None]
+
+# PointField.datatype -> numpy 单字符类型码, 给 _decode_xyz_flat 拼结构化 dtype 用。
+_POINTFIELD_DATATYPE_CHAR = {
+    PointField.INT8: "i1", PointField.UINT8: "u1",
+    PointField.INT16: "i2", PointField.UINT16: "u2",
+    PointField.INT32: "i4", PointField.UINT32: "u4",
+    PointField.FLOAT32: "f4", PointField.FLOAT64: "f8",
+}
+
+
+def _decode_xyz_flat(msg: PointCloud2) -> np.ndarray:
+    """把 PointCloud2 的 x/y/z 三个字段整体解出来, 拍平成
+    [x0,y0,z0, x1,y1,z1, ...] 的 float32 一维数组, 丢掉含 NaN 的点(对齐以前
+    point_cloud2.read_points(..., skip_nans=True) 的行为)。
+
+    向量化实现: 按 msg.fields 里 x/y/z 各自的 offset/datatype 拼一个结构化
+    dtype, 用 np.frombuffer 在 msg.data 上一次性按 point_step 切出所有点,
+    不逐点跑 Python 循环——膨胀地图单帧常有几千到上万个点, 之前用的
+    sensor_msgs.point_cloud2.read_points 是纯 Python 生成器(逐点 struct.unpack
+    + isnan 判断), 点数一多是解码这几个回调里唯一真正花 CPU 的地方, 换成
+    numpy 整体操作后差距是数量级的。
+
+    不再 round 到 3 位小数——以前 round 是为了压 JSON 文本体积/去掉 float32
+    转 double 带来的精度噪声, 现在这两个话题走二进制帧(ws_manager.py /
+    route_manager.py 的 _encode_point_frame), 直接发原始 float32 字节,
+    round 与否体积一样, 没必要再花这个 CPU。
+    """
+    field_map = {f.name: f for f in msg.fields}
+    endian = ">" if msg.is_bigendian else "<"
+    names = ("x", "y", "z")
+    dtype = np.dtype({
+        "names": names,
+        "formats": [endian + _POINTFIELD_DATATYPE_CHAR[field_map[n].datatype] for n in names],
+        "offsets": [field_map[n].offset for n in names],
+        "itemsize": msg.point_step,
+    })
+    n = msg.width * msg.height
+    structured = np.frombuffer(msg.data, dtype=dtype, count=n)
+    xyz = np.empty((n, 3), dtype=np.float32)
+    xyz[:, 0] = structured["x"]
+    xyz[:, 1] = structured["y"]
+    xyz[:, 2] = structured["z"]
+    valid = ~np.isnan(xyz).any(axis=1)
+    return xyz[valid].reshape(-1)
 # scan_planner/PlanFinished 的 status 字段(REACHED=0/EMERGENCY_STOP=1), navi_mode
 # 字段不转发——route_manager 不需要它, 见该回调的说明
 PlanningFinishedCallback = Callable[[int], None]
@@ -214,26 +259,16 @@ class RosBridge:
         整片重发(不是增量), 只有 x/y/z 三个字段。原样转发, 不做下采样——是否
         订阅这个话题本身就已经是"要不要看"的开关了。
 
-        round 到 3 位小数(毫米级, 展示用完全够): 消息里的坐标本来就是 float32,
-        直接 float() 提升成 double 会把 float32 的精度噪声原样带进 JSON 文本
-        (比如 1.23 变成 1.2299999713897705), 不是真精度, 只是白白撑大 payload
-        和 json.dumps/JSON.parse 两端的开销。
-
         按 INFLATION_MAP_BROADCAST_HZ 限流, 而且是在解码 PointCloud2 之前就
-        挡掉——这一片点云可能有几千到上万个点, 逐点 read_points + round 是这几个
-        回调里唯一真正花 CPU 的地方, 没通过限流的消息不值得白解码一份马上要丢的
-        数据。"""
+        挡掉——这一片点云可能有几千到上万个点, 解码 PointCloud2 是这几个回调
+        里唯一真正花 CPU 的地方(见 _decode_xyz_flat), 没通过限流的消息不值得
+        白解码一份马上要丢的数据。"""
         now = time.time()
         if now - self._last_inflation_map_emit_at < 1.0 / config.INFLATION_MAP_BROADCAST_HZ:
             return
         self._last_inflation_map_emit_at = now
         assert self._on_inflation_map is not None
-        flat: List[float] = []
-        for x, y, z in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-            flat.append(round(float(x), 3))
-            flat.append(round(float(y), 3))
-            flat.append(round(float(z), 3))
-        self._on_inflation_map(flat)
+        self._on_inflation_map(_decode_xyz_flat(msg))
 
     def set_inflation_map_enabled(self, enabled: bool) -> None:
         """grid_map.cpp 侧 publishMapInflate() 本身就是"没有订阅者就不发布"
@@ -255,9 +290,6 @@ class RosBridge:
         """/surf_cloud_in_map: hand-lio 降采样+畸变校正后的当前帧激光点云, 已经
         转到 map 系, 5Hz。原样转发, 只取 x/y/z——每帧整体替换, 不在这里做叠加。
 
-        round 到 3 位小数, 理由同 _handle_inflation_map: 消息本来就是 float32,
-        直接提升成 double 只会把精度噪声原样带进 JSON, 白白撑大 payload。
-
         按 SURF_CLOUD_BROADCAST_HZ 限流, 同样挡在解码之前, 理由同
         _handle_inflation_map。"""
         now = time.time()
@@ -265,12 +297,7 @@ class RosBridge:
             return
         self._last_surf_cloud_emit_at = now
         assert self._on_surf_cloud is not None
-        flat: List[float] = []
-        for x, y, z in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-            flat.append(round(float(x), 3))
-            flat.append(round(float(y), 3))
-            flat.append(round(float(z), 3))
-        self._on_surf_cloud(flat)
+        self._on_surf_cloud(_decode_xyz_flat(msg))
 
     def set_surf_cloud_enabled(self, enabled: bool) -> None:
         """跟 self_inflation/膨胀地图一样默认不订阅, 前端"雷达点云"勾选框打开
