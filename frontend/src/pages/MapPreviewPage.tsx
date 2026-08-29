@@ -3,9 +3,9 @@ import { Link, useParams } from "react-router-dom";
 import {
   ArrowLeft, PanelRight, X, Target, RefreshCw,
   ZoomIn, ZoomOut, RotateCcw, RotateCw,
-  MapPin, CircleCheck, Trash2, Play, Flag,
+  MapPin, CircleCheck, Trash2, Play, Flag, OctagonX,
 } from "lucide-react";
-import { planPath, setInflationMap, setSelfInflation, setSurfCloud } from "../api";
+import { estop, planPath, setInflationMap, setSelfInflation, setSurfCloud } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
@@ -152,10 +152,19 @@ export default function MapPreviewPage() {
   // navRunning 只反映 RouteManager 的状态机(navi_mode=2, submit_route 那条
   // 链路)——这个面板的"开始导航"走的是 plan_path/navi_mode=3, RouteManager
   // 完全不知道它的存在(见 route_manager.py 顶部的类注释, 明确只对接
-  // navi_mode=2), 所以下发成功之后这里的状态/徽标不会变成"执行中", 是已知
-  // 的后端侧限制, 不是这页的 bug。
+  // navi_mode=2), 下发成功之后 navState/navRunning 不会变成"执行中", 这是
+  // 后端状态机本身的限制, 没法在这页单方面修好。"是不是正在跑""要不要显示
+  // 路线/停止导航按钮"改用下面 dispatchedRoute 这个页面本地信号来判断——
+  // 不依赖后端状态机, 单纯"点了开始导航且下发成功"就是 true, 点了停止导航/
+  // 换地图才清空。
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
+  // plan_path(publish=true)下发成功后返回的参考路线, 用来在地图上画出来 +
+  // 判断"当前是不是有一条通过这个面板下发的导航在跑"(navDispatchActive)。
+  // estop() 现在不再要求后端状态机处于 running 才能调(见
+  // route_manager.estop 的说明), 所以"停止导航"按钮在这条信号下能真的调得通。
+  const [dispatchedRoute, setDispatchedRoute] = useState<PlannedRoutePoint[] | null>(null);
+  const navDispatchActive = Boolean(dispatchedRoute && dispatchedRoute.length > 0);
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
   // 独立的另一条链路——起终点在 2D 栅格图上跑 A* 规划(global_planner.py),
@@ -171,6 +180,10 @@ export default function MapPreviewPage() {
   const [plannedRoute, setPlannedRoute] = useState<PlannedRoutePoint[] | null>(null);
   const [planning, setPlanning] = useState(false);
   const hasStartGoal = Boolean(startGoal.start || startGoal.goal);
+  // 画在地图上的到底是哪条线: 真的下发过的路线(dispatchedRoute)优先于"路线
+  // 预览"算出来的那条(plannedRoute)——前者代表机器狗实际在走的路径, 比一份
+  // 单纯的预览更重要, 两者目前没有会同时非空又需要一起显示的场景。
+  const displayRoute = dispatchedRoute ?? plannedRoute;
 
   // 下发失败的错误提示过一会儿自己消失, 不然会一直挡在屏幕上——每次 navError
   // 变化(包括又失败一次, 换成新消息)都重新计时。路线规划失败也复用这同一条
@@ -191,6 +204,7 @@ export default function MapPreviewPage() {
     setStartGoal({ start: null, goal: null });
     setStartGoalPicking(false);
     setPlannedRoute(null);
+    setDispatchedRoute(null);
   }, [name]);
 
   // 切到 2D 时 PointCloudView 会整个卸载(见下面渲染部分), "点选新中心点"/
@@ -280,8 +294,31 @@ export default function MapPreviewPage() {
       const result = await planPath(name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, true);
       if (!result.published) {
         setNavError(result.publishError ?? "路径规划成功, 但下发失败");
+        return;
       }
+      // 只有真的发下去了(published=true)才画出来、才算"进入了导航中"——
+      // published=false 时机器狗压根没收到这条路径, 显示"正在导航"/画一条
+      // 实际没在走的路线只会误导。
+      setDispatchedRoute(result.points);
       setRouteEditing(false);
+    } catch (e) {
+      setNavError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  /** 停止刚才这个面板下发的导航(navi_mode=3)。estop() 现在不再要求后端
+   *  RouteManager 状态机处于 running 才能调(见 route_manager.estop 的说明,
+   *  navi_mode=3 本来就不会让那个状态机进 running), 真正的安全网在后端:
+   *  planner 没在跑(没有订阅者接住这条 /planning/emergency_stop)会报错,
+   *  这里如实把错误显示出来, 不吞掉。 */
+  async function handleStopNav() {
+    setSubmitting(true);
+    setNavError(null);
+    try {
+      await estop();
+      setDispatchedRoute(null);
     } catch (e) {
       setNavError(String(e));
     } finally {
@@ -372,7 +409,7 @@ export default function MapPreviewPage() {
               startGoalPickMode={startGoalPicking}
               startGoal={startGoal}
               onChangeStartGoal={setStartGoal}
-              plannedRoute={plannedRoute}
+              plannedRoute={displayRoute}
               selfInflation={selfInflation}
               inflationMap={inflationMap}
               surfCloud={surfCloud}
@@ -390,7 +427,7 @@ export default function MapPreviewPage() {
                 startGoalPickMode={startGoalPicking}
                 startGoal={startGoal}
                 onChangeStartGoal={setStartGoal}
-                plannedRoute={plannedRoute}
+                plannedRoute={displayRoute}
                 status={displayStatus}
                 maxWidth={viewportSize.width}
                 maxHeight={viewportSize.height}
@@ -579,9 +616,9 @@ export default function MapPreviewPage() {
                         icon={MapPin}
                         label={routeEditing ? "取消设置目标点" : "设置目标点"}
                         active={routeEditing}
-                        disabled={navRunning || startGoalPicking}
+                        disabled={navRunning || navDispatchActive || startGoalPicking}
                         title={
-                          navRunning ? "导航进行中不能设置目标点"
+                          navRunning || navDispatchActive ? "导航进行中不能设置目标点"
                             : startGoalPicking ? "设置起终点中, 先点「设置完成」"
                               : undefined
                         }
@@ -590,17 +627,26 @@ export default function MapPreviewPage() {
                       <PanelButton
                         icon={Trash2}
                         label="清空目标点"
-                        disabled={waypoints.length === 0 || submitting || navRunning}
-                        title={navRunning ? "导航进行中不能清空目标点" : undefined}
+                        disabled={waypoints.length === 0 || submitting || navRunning || navDispatchActive}
+                        title={navRunning || navDispatchActive ? "导航进行中不能清空目标点" : undefined}
                         onClick={() => setWaypoints([])}
                       />
-                      <PanelButton
-                        icon={Play}
-                        label={navRunning ? "导航中…" : submitting ? "下发中…" : "开始导航"}
-                        disabled={waypoints.length === 0 || !hasPose || submitting || navRunning}
-                        title={waypoints.length > 0 && !hasPose ? "还没有收到机器狗位姿" : undefined}
-                        onClick={handleStartNav}
-                      />
+                      {navDispatchActive ? (
+                        <PanelButton
+                          icon={OctagonX}
+                          label={submitting ? "停止中…" : "停止导航"}
+                          disabled={submitting}
+                          onClick={handleStopNav}
+                        />
+                      ) : (
+                        <PanelButton
+                          icon={Play}
+                          label={submitting ? "下发中…" : "开始导航"}
+                          disabled={waypoints.length === 0 || !hasPose || submitting || navRunning}
+                          title={waypoints.length > 0 && !hasPose ? "还没有收到机器狗位姿" : undefined}
+                          onClick={handleStartNav}
+                        />
+                      )}
                     </div>
                   </PanelSection>
                 )}

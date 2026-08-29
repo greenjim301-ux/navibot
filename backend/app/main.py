@@ -137,8 +137,6 @@ async def submit_route(req: RouteRequest):
 async def estop():
     try:
         return route_manager.estop()
-    except ValueError as e:
-        raise HTTPException(400, str(e))
     except RuntimeError as e:
         # planner 没在跑, 没有订阅者接住这条 stop 消息, 必须原样告诉用户
         raise HTTPException(503, str(e))

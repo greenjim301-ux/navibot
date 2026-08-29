@@ -271,10 +271,16 @@ class RouteManager:
         """急停 (/planning/emergency_stop)。会让 planner 悬停并作废当前任务
         (userEmergencyStopCallback), 恢复必须重新设置并提交一整轮路线, 所以
         停下来之后状态直接进 STOPPED。
+
+        不再要求 self._state == RUNNING 才能调——/planning/emergency_stop 是
+        SCAN-Planner fsm 层的通用急停, 不区分 navi_mode, 但 self._state 只有
+        navi_mode=2(submit_route)那条链路会设成 RUNNING; navi_mode=3
+        (/api/maps/{name}/plan_path, publish=true)走的是完全独立的下发路径,
+        不碰这个状态机(见类文档), 之前这条守卫会让"用 plan_path 下发导航之后
+        想停"的请求平白被拒。真正的安全网在 ros_bridge.emergency_stop 那边:
+        话题没有订阅者(planner 根本没在跑)会直接抛 RuntimeError, 这里不用
+        自己再判断"当前是不是在跑"。
         """
-        with self._lock:
-            if self._state != TaskState.RUNNING:
-                raise ValueError(f"当前状态 {self._state} 不能停止")
         self._ros.emergency_stop()
         with self._lock:
             self._state = TaskState.STOPPED
