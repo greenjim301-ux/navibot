@@ -138,6 +138,15 @@ INFLATION_MAP_BROADCAST_HZ = float(os.environ.get("NAVIBOT_INFLATION_MAP_BROADCA
 # surf_cloud_in_map 源头本身就是 5Hz, 这里的限流基本不生效, 只是留一道保险
 # (topic 换成更高频的源时不至于失控), 跟其它几个话题的配置方式保持一致
 SURF_CLOUD_BROADCAST_HZ = float(os.environ.get("NAVIBOT_SURF_CLOUD_BROADCAST_HZ", "5.0"))
+# 广播前按体素网格去重降采样(见 ros_bridge._voxel_downsample_flat), 减少
+# json.dumps 要格式化的点数——JSON 把每个浮点数转成十进制文本本身就不便宜,
+# 点数一多(膨胀地图单帧上万点)是这两个话题目前后端 CPU 的主要瓶颈, 比解码
+# PointCloud2 本身还贵。默认值对齐 PointCloudView.tsx 里这两片点云的渲染
+# 点大小(膨胀地图 0.1m、雷达点云 0.05m)——网格边长跟渲染出来的点本身一样大,
+# 挤在同一个格子里的点在屏幕上原本就分不清, 降采样掉视觉上基本看不出来。
+# <=0 关掉降采样(原样转发)。
+INFLATION_MAP_VOXEL_SIZE_M = float(os.environ.get("NAVIBOT_INFLATION_MAP_VOXEL_SIZE_M", "0.1"))
+SURF_CLOUD_VOXEL_SIZE_M = float(os.environ.get("NAVIBOT_SURF_CLOUD_VOXEL_SIZE_M", "0.05"))
 # 给某个客户端发一条 ws 消息等这么久还没发完就放弃并断开它。膨胀地图这类大 payload
 # (几千到上万个点的 JSON) 如果客户端(浏览器主线程忙着重建 Three.js 几何体)跟不上
 # 消费速度, ws.send_json 会一直卡在 TCP 背压上不返回——不设超时的话, WebSocketManager

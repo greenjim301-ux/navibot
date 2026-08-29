@@ -82,6 +82,28 @@ def _decode_xyz_flat(msg: PointCloud2) -> np.ndarray:
     xyz[:, 2] = structured["z"]
     valid = ~np.isnan(xyz).any(axis=1)
     return xyz[valid].reshape(-1)
+
+
+def _voxel_downsample_flat(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """按体素网格去重降采样: 把每个点的坐标除以 voxel_size 后取整当格子坐标,
+    同一个格子只保留(原始扫描顺序里)第一个出现的点——不是取质心, 展示用没必要
+    为了"更准的代表点"多一次分组平均。points 是 _decode_xyz_flat 那种拍平的
+    [x0,y0,z0, ...] float32 一维数组, 返回同样约定的一维数组(保留的是原始
+    坐标, 不是量化后的网格坐标, 精度不受影响, 只是点变少了)。voxel_size<=0
+    或没有点时原样返回(不降采样)。
+
+    向量化实现(np.unique 按行去重), 不逐点跑 Python 循环——降采样这一步本身
+    的开销要远小于它省下来的: 点数少了之后, 后面 json.dumps 把每个浮点数格式化
+    成十进制文本的成本(目前这两个话题后端 CPU 的主要瓶颈, 比这里解码/降采样
+    都贵)跟着按比例下降。"""
+    if voxel_size <= 0 or points.size == 0:
+        return points
+    xyz = points.reshape(-1, 3)
+    grid = np.floor(xyz / voxel_size).astype(np.int64)
+    _, keep_idx = np.unique(grid, axis=0, return_index=True)
+    return xyz[keep_idx].reshape(-1)
+
+
 # scan_planner/PlanFinished 的 status 字段(REACHED=0/EMERGENCY_STOP=1), navi_mode
 # 字段不转发——route_manager 不需要它, 见该回调的说明
 PlanningFinishedCallback = Callable[[int], None]
@@ -260,19 +282,23 @@ class RosBridge:
 
     def _handle_inflation_map(self, msg: PointCloud2) -> None:
         """/grid_map/occupancy_inflate 是 grid_map.cpp 的膨胀后占据栅格, 每次
-        整片重发(不是增量), 只有 x/y/z 三个字段。原样转发, 不做下采样——是否
-        订阅这个话题本身就已经是"要不要看"的开关了。
+        整片重发(不是增量), 只有 x/y/z 三个字段。解码完按
+        INFLATION_MAP_VOXEL_SIZE_M 做一次体素去重降采样(见
+        _voxel_downsample_flat)——是否订阅这个话题本身已经是"要不要看"的开关,
+        降采样只是减少同一屏幕像素范围内挤着发的冗余点, 不是砍功能。
 
         按 INFLATION_MAP_BROADCAST_HZ 限流, 而且是在解码 PointCloud2 之前就
         挡掉——这一片点云可能有几千到上万个点, 解码 PointCloud2 是这几个回调
-        里唯一真正花 CPU 的地方(见 _decode_xyz_flat), 没通过限流的消息不值得
+        里最花 CPU 的地方之一(见 _decode_xyz_flat), 没通过限流的消息不值得
         白解码一份马上要丢的数据。"""
         now = time.time()
         if now - self._last_inflation_map_emit_at < 1.0 / config.INFLATION_MAP_BROADCAST_HZ:
             return
         self._last_inflation_map_emit_at = now
         assert self._on_inflation_map is not None
-        self._on_inflation_map(_decode_xyz_flat(msg))
+        points = _decode_xyz_flat(msg)
+        points = _voxel_downsample_flat(points, config.INFLATION_MAP_VOXEL_SIZE_M)
+        self._on_inflation_map(points)
 
     def set_inflation_map_enabled(self, enabled: bool) -> None:
         """grid_map.cpp 侧 publishMapInflate() 本身就是"没有订阅者就不发布"
@@ -292,7 +318,9 @@ class RosBridge:
 
     def _handle_surf_cloud(self, msg: PointCloud2) -> None:
         """/surf_cloud_in_map: hand-lio 降采样+畸变校正后的当前帧激光点云, 已经
-        转到 map 系, 5Hz。原样转发, 只取 x/y/z——每帧整体替换, 不在这里做叠加。
+        转到 map 系, 5Hz。只取 x/y/z, 解码完按 SURF_CLOUD_VOXEL_SIZE_M 做体素
+        去重降采样(理由同 _handle_inflation_map)——每帧整体替换, 不在这里做
+        叠加。
 
         按 SURF_CLOUD_BROADCAST_HZ 限流, 同样挡在解码之前, 理由同
         _handle_inflation_map。"""
@@ -301,7 +329,9 @@ class RosBridge:
             return
         self._last_surf_cloud_emit_at = now
         assert self._on_surf_cloud is not None
-        self._on_surf_cloud(_decode_xyz_flat(msg))
+        points = _decode_xyz_flat(msg)
+        points = _voxel_downsample_flat(points, config.SURF_CLOUD_VOXEL_SIZE_M)
+        self._on_surf_cloud(points)
 
     def set_surf_cloud_enabled(self, enabled: bool) -> None:
         """跟 self_inflation/膨胀地图一样默认不订阅, 前端"雷达点云"勾选框打开
