@@ -56,10 +56,14 @@ def _decode_xyz_flat(msg: PointCloud2) -> np.ndarray:
     + isnan 判断), 点数一多是解码这几个回调里唯一真正花 CPU 的地方, 换成
     numpy 整体操作后差距是数量级的。
 
-    不再 round 到 3 位小数——以前 round 是为了压 JSON 文本体积/去掉 float32
-    转 double 带来的精度噪声, 现在这两个话题走二进制帧(ws_manager.py /
-    route_manager.py 的 _encode_point_frame), 直接发原始 float32 字节,
-    round 与否体积一样, 没必要再花这个 CPU。
+    这里不 round——保持 float32 原始精度返回, 压 JSON 体积用的"round 到 3 位
+    小数"挪到了 route_manager.py 的 _inflation_map_payload_locked/
+    _surf_cloud_payload_locked 里做(那边转成 Python float(double)之后再
+    round, 不是在这里对 float32 数组直接 round——float32 自己的最近可表示值
+    未必是"干净"的十进制小数, 在这个精度上 round 完再转 double 一样会带出一堆
+    噪声位, 必须先转 double 再 round 才能得到 1.235 这种干净的输出, 等价于以前
+    逐点 round(float(x), 3) 的做法, 只是这个模块只管解码, 不管"给谁用/怎么编码
+    传输", 那部分留给调用方)。
     """
     field_map = {f.name: f for f in msg.fields}
     endian = ">" if msg.is_bigendian else "<"

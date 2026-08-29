@@ -1,18 +1,13 @@
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, Optional, Set
 
 from fastapi import WebSocket
 
 from . import config
 
 logger = logging.getLogger("navibot.ws")
-
-# 一份已经编码好、可以直接发的待发数据: JSON 消息是文本(str), 膨胀地图/雷达
-# 点云这类走 broadcast_binary_threadsafe 的是二进制帧(bytes)。两种都只编码
-# 一次, 广播给 N 个客户端时复用同一份, 不会每个连接各自 json.dumps 一遍。
-_Payload = Union[str, bytes]
 
 
 class WebSocketManager:
@@ -34,13 +29,13 @@ class WebSocketManager:
     Starlette 内部会各自 json.dumps 一遍——开着 N 个标签页就是 N 倍重复的
     JSON 编码成本, 还是在唯一的事件循环线程上同步跑, 会卡住其它请求。现在
     broadcast_threadsafe 在丢进 _pending 之前就把 data 序列化成文本, 之后
-    每个客户端发的是同一份现成的 str/bytes, 只是 socket 写, 不再重复编码。
+    每个客户端发的是同一份现成的文本, 只是 socket 写, 不再重复编码。
     """
 
     def __init__(self) -> None:
         self._connections: Set[WebSocket] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._pending: Dict[str, _Payload] = {}  # type -> 还没发出去的最新一份(已编码好)
+        self._pending: Dict[str, str] = {}  # type -> 还没发出去的最新一份(已经序列化好)
         self._senders: Dict[str, "asyncio.Task[None]"] = {}  # type -> 正在跑的发送任务
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -55,10 +50,9 @@ class WebSocketManager:
         self._connections.discard(ws)
         logger.info("ws disconnected, total=%d", len(self._connections))
 
-    async def _send_one(self, ws: WebSocket, payload: _Payload) -> None:
+    async def _send_one(self, ws: WebSocket, text: str) -> None:
         try:
-            send = ws.send_bytes(payload) if isinstance(payload, bytes) else ws.send_text(payload)
-            await asyncio.wait_for(send, timeout=config.WS_SEND_TIMEOUT_S)
+            await asyncio.wait_for(ws.send_text(text), timeout=config.WS_SEND_TIMEOUT_S)
         except Exception:
             self._connections.discard(ws)
 
@@ -68,32 +62,24 @@ class WebSocketManager:
         "最新状态是什么", 发得慢的话中间几帧丢了也没关系(下一帧本来就是全量替换)。
         """
         while True:
-            payload = self._pending.pop(msg_type, None)
-            if payload is None:
+            text = self._pending.pop(msg_type, None)
+            if text is None:
                 del self._senders[msg_type]
                 return
-            await asyncio.gather(*(self._send_one(ws, payload) for ws in list(self._connections)))
+            await asyncio.gather(*(self._send_one(ws, text) for ws in list(self._connections)))
 
-    async def _schedule(self, msg_type: str, payload: _Payload) -> None:
-        self._pending[msg_type] = payload
+    async def _schedule(self, msg_type: str, text: str) -> None:
+        self._pending[msg_type] = text
         if msg_type not in self._senders:
             self._senders[msg_type] = asyncio.create_task(self._drain(msg_type))
 
     def broadcast_threadsafe(self, data: Dict[str, Any]) -> None:
         """可以从任意线程 (包括 rospy 回调线程) 调用。JSON 只在这里(调用方
-        线程上)序列化一次, 后面每个客户端复用同一份文本。"""
+        线程上)序列化一次, 后面每个客户端复用同一份文本, 不会每个连接各自
+        再 json.dumps 一遍。"""
         if self._loop is None:
             logger.warning("event loop not bound yet, drop message: %s", data)
             return
         msg_type = data.get("type", "")
         text = json.dumps(data, separators=(",", ":"))
         asyncio.run_coroutine_threadsafe(self._schedule(msg_type, text), self._loop)
-
-    def broadcast_binary_threadsafe(self, msg_type: str, payload: bytes) -> None:
-        """二进制帧广播(膨胀地图/雷达点云用, 见 route_manager._encode_point_frame),
-        复用跟 broadcast_threadsafe 一样的按 type 合并/丢帧机制, 只是发送时走
-        ws.send_bytes 而不是 ws.send_text。可以从任意线程调用。"""
-        if self._loop is None:
-            logger.warning("event loop not bound yet, drop binary message: type=%s", msg_type)
-            return
-        asyncio.run_coroutine_threadsafe(self._schedule(msg_type, payload), self._loop)

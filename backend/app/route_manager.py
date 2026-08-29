@@ -1,6 +1,5 @@
 import logging
 import math
-import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -15,22 +14,20 @@ from .ws_manager import WebSocketManager
 
 logger = logging.getLogger("navibot.route_manager")
 
-# 膨胀地图/雷达点云走二进制 WS 帧, 不再是 JSON——这两个是唯一"单帧成千上万个
-# 浮点数"的高频展示话题, JSON 文本编解码(后端 json.dumps、前端 JSON.parse)本身
-# 就是一笔不小的开销, 换成二进制帧连这步都省了(见 _encode_point_frame,
-# frontend/src/useNavStatus.ts 对应的解码)。
-_POINT_FRAME_TYPE_INFLATION_MAP = 1
-_POINT_FRAME_TYPE_SURF_CLOUD = 2
 
+def _point_array_to_json_list(points: np.ndarray) -> List[float]:
+    """膨胀地图/雷达点云(ros_bridge._decode_xyz_flat 出来的 float32 一维数组)
+    转成能塞进 JSON 的普通 Python float 列表, round 到 3 位小数(毫米级, 展示用
+    完全够)。
 
-def _encode_point_frame(msg_type: int, enabled: bool, points: np.ndarray) -> bytes:
-    """4 字节头(消息类型、enabled、2 字节保留位) + 拍平的 [x0,y0,z0, ...]
-    float32 数组原始字节。保留位纯粹是为了让 float32 数组从第 4 字节(4 的
-    倍数)开始, 前端能直接 `new Float32Array(buf, 4)` 原地取用, 不用现拷贝
-    一份对齐——见 ws_manager.py 的 broadcast_binary_threadsafe 和
-    PointCloudView.tsx / useNavStatus.ts 里对应的解码。"""
-    header = struct.pack("<BB2x", msg_type, 1 if enabled else 0)
-    return header + points.astype("<f4", copy=False).tobytes()
+    必须先转 double(astype(float64))再 round, 不能对 float32 数组直接
+    round——float32 自己"最近的可表示值"未必是干净的十进制小数, 在这个精度上
+    round 完再提升成 double, 噪声照样在(比如 1.235 变成 1.2350000143051147);
+    只有先转 double 再 round, 才能得到跟以前逐点 round(float(x), 3) 完全一样
+    的干净输出, 不白白撑大 payload 和 json.dumps/JSON.parse 两端的开销。
+    tolist() 是 numpy 自带的"转成原生 Python 类型"方法, json 标准库不认识
+    numpy.float64 标量, 直接 list() 拆出来会在 dumps 时报 TypeError。"""
+    return np.round(points.astype(np.float64), 3).tolist()
 
 
 @dataclass
@@ -98,6 +95,13 @@ class RouteManager:
         self._inflation_map: np.ndarray = np.empty(0, dtype=np.float32)  # 拍平的 [x0,y0,z0, ...]
         self._surf_cloud_enabled: bool = False
         self._surf_cloud: np.ndarray = np.empty(0, dtype=np.float32)  # 拍平的 [x0,y0,z0, ...], 每帧整体替换
+        # ↑ 两个都是 ros_bridge._decode_xyz_flat 出来的 numpy 数组(向量化解码,
+        # 保留), 但对外(WS 广播/补发)走 JSON 而不是二进制帧——二进制帧那版
+        # (自定义 4 字节头 + 原始 float32 字节, 前端 Float32Array 直接视图到
+        # WS 收到的 ArrayBuffer 上)上线后浏览器标签页内存持续上涨、用一阵子就
+        # 卡死, 具体是二进制这条链路本身的问题还是别的没能在没有真实浏览器的
+        # 情况下查清楚, 先整体回退回验证过没有这个问题的 JSON 方案(见
+        # _point_array_to_json_list)。
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -130,18 +134,15 @@ class RouteManager:
         with self._lock:
             return self._self_inflation_payload_locked()
 
-    def get_inflation_map_state(self) -> bytes:
-        """当前是否订阅了膨胀地图 + 最新一片点云, 编码成跟广播用的同一种二进制
-        帧(见 _encode_point_frame), 给新连上的 ws 客户端补发用——main.py 直接
-        ws.send_bytes() 发出去, 前端解码路径跟收到的实时广播完全一样, 不用
-        为"刚连上时补一份"单独维护一套 JSON 格式。"""
+    def get_inflation_map_state(self) -> dict:
+        """当前是否订阅了膨胀地图 + 最新一片点云, 给新连上的 ws 客户端补发用。"""
         with self._lock:
-            return self._inflation_map_frame_locked()
+            return self._inflation_map_payload_locked()
 
-    def get_surf_cloud_state(self) -> bytes:
-        """同上, 雷达点云。"""
+    def get_surf_cloud_state(self) -> dict:
+        """当前是否订阅了雷达点云 + 最新一帧, 给新连上的 ws 客户端补发用。"""
         with self._lock:
-            return self._surf_cloud_frame_locked()
+            return self._surf_cloud_payload_locked()
 
     # ---- 指令 ----
     def get_altitude_calibration(self, map_name: Optional[str]) -> Optional[float]:
@@ -415,10 +416,8 @@ class RouteManager:
         self._ws.broadcast_threadsafe({"type": "self_inflation", "data": payload})
         return payload
 
-    def _inflation_map_frame_locked(self) -> bytes:
-        return _encode_point_frame(
-            _POINT_FRAME_TYPE_INFLATION_MAP, self._inflation_map_enabled, self._inflation_map,
-        )
+    def _inflation_map_payload_locked(self) -> dict:
+        return {"enabled": self._inflation_map_enabled, "points": _point_array_to_json_list(self._inflation_map)}
 
     def on_inflation_map(self, points: np.ndarray) -> None:
         """转发 /grid_map/occupancy_inflate 的一整片点云 (拍平的 float32
@@ -431,25 +430,23 @@ class RouteManager:
             if not self._inflation_map_enabled:
                 return
             self._inflation_map = points
-            frame = self._inflation_map_frame_locked()
-        self._ws.broadcast_binary_threadsafe("inflation_map", frame)
+            payload = self._inflation_map_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
 
     def set_inflation_map_enabled(self, enabled: bool) -> dict:
-        """开关膨胀地图展示。状态变化(连同当前这片点云, 关闭时是空的)立刻用
-        同一种二进制帧广播给所有 ws 客户端(不受限流影响), 好让多开的标签页里
-        勾选框保持一致。HTTP 响应只回 enabled——points 前端从来不用(靠 ws 广播
-        拿数据), 没必要在这条请求的响应体里再带一遍, 关掉时甚至是空的。"""
+        """开关膨胀地图展示。状态变化立刻广播给所有 ws 客户端(不受限流影响),
+        好让多开的标签页里勾选框保持一致。"""
         self._ros.set_inflation_map_enabled(enabled)
         with self._lock:
             self._inflation_map_enabled = enabled
             if not enabled:
                 self._inflation_map = np.empty(0, dtype=np.float32)
-            frame = self._inflation_map_frame_locked()
-        self._ws.broadcast_binary_threadsafe("inflation_map", frame)
-        return {"enabled": enabled}
+            payload = self._inflation_map_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "inflation_map", "data": payload})
+        return payload
 
-    def _surf_cloud_frame_locked(self) -> bytes:
-        return _encode_point_frame(_POINT_FRAME_TYPE_SURF_CLOUD, self._surf_cloud_enabled, self._surf_cloud)
+    def _surf_cloud_payload_locked(self) -> dict:
+        return {"enabled": self._surf_cloud_enabled, "points": _point_array_to_json_list(self._surf_cloud)}
 
     def on_surf_cloud(self, points: np.ndarray) -> None:
         """转发 /surf_cloud_in_map 的当前帧点云(拍平的 float32 [x,y,z, ...]
@@ -461,8 +458,8 @@ class RouteManager:
             if not self._surf_cloud_enabled:
                 return
             self._surf_cloud = points
-            frame = self._surf_cloud_frame_locked()
-        self._ws.broadcast_binary_threadsafe("surf_cloud", frame)
+            payload = self._surf_cloud_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
 
     def set_surf_cloud_enabled(self, enabled: bool) -> dict:
         """开关雷达点云展示, 理由同 set_inflation_map_enabled。"""
@@ -471,9 +468,9 @@ class RouteManager:
             self._surf_cloud_enabled = enabled
             if not enabled:
                 self._surf_cloud = np.empty(0, dtype=np.float32)
-            frame = self._surf_cloud_frame_locked()
-        self._ws.broadcast_binary_threadsafe("surf_cloud", frame)
-        return {"enabled": enabled}
+            payload = self._surf_cloud_payload_locked()
+        self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
+        return payload
 
     def _check_stuck_locked(self) -> None:
         """planner 不报失败, 只能靠"长时间没靠近目标"来判卡住。

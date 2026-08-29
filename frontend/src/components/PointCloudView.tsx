@@ -34,14 +34,12 @@ interface Props {
    *  (前/后各一个), 只在页面上的勾选框打开时后端才会有数据。 */
   selfInflation?: SelfInflationMarker[] | null;
   /** /grid_map/occupancy_inflate 原样转发, 拍平的 [x0,y0,z0, x1,y1,z1, ...],
-   *  只在页面上的勾选框打开时后端才会有数据。后端走二进制 WS 帧、前端直接
-   *  Float32Array 解出来(见 useNavStatus.ts), 不再是普通 number[]——省掉大
-   *  数组从 JSON 文本解析成普通数组这一步, 点数一多(几千到上万)差距明显。 */
-  inflationMap?: Float32Array | null;
+   *  只在页面上的勾选框打开时后端才会有数据。 */
+  inflationMap?: number[] | null;
   /** /surf_cloud_in_map 原样转发, 拍平的 [x0,y0,z0, x1,y1,z1, ...], 雷达当前帧
    *  降采样点云(每帧整体替换, 不叠加历史帧), 只在页面上的勾选框打开时后端才会
-   *  有数据。同 inflationMap, 是 Float32Array。 */
-  surfCloud?: Float32Array | null;
+   *  有数据。 */
+  surfCloud?: number[] | null;
   /** 是否支持"镜头跟随机器狗": 决定 updateFollow() 有没有意义(还得看
    *  status.robot_pose 有没有值), 跟下面 showFollowButton 是两件事——这个控制
    *  能力, 那个只控制"要不要画组件自带的那颗按钮"。 */
