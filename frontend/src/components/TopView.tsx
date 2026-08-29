@@ -13,6 +13,10 @@ interface Props {
   waypoints: Waypoint[];
   onChangeWaypoints: (wps: Waypoint[]) => void;
   editable: boolean;
+  /** 途经点圆点上要不要画编号(1, 2, 3...)。默认 true——多途经点路线(如
+   *  NavigatePage)靠这个看顺序; 只有一个目标点的场景(如 MapPreviewPage 的
+   *  "设置目标点")传 false, 一个点标个"1"没有意义, 纯干扰。 */
+  showWaypointNumbers?: boolean;
   /** "设置起终点"(路线预览)模式, 跟 editable(设置路线) 互斥, 用法/手势跟
    *  PointCloudView 的同名 prop 完全一致: 左键先设起点再设终点, 两个都设好了
    *  再点不生效; 右键撤销最近设置的那个点(先撤终点, 再撤起点), 不需要点在
@@ -109,6 +113,7 @@ function centerOnOrigin(meta: Topview2D): Topview2D {
 
 export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
+  showWaypointNumbers = true,
   startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null,
   maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight, defaultZoom = DEFAULT_ZOOM,
   showControls = true, onViewChange,
@@ -379,14 +384,16 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
                     }}
                   />
                   {/* 反向抵消父级 Group 的旋转, 让编号文字始终正立可读 */}
-                  <Text
-                    x={px + WAYPOINT_LABEL_OFFSET_PX.x / zoom}
-                    y={py + WAYPOINT_LABEL_OFFSET_PX.y / zoom}
-                    text={String(idx + 1)}
-                    fontSize={WAYPOINT_LABEL_FONT_PX / zoom}
-                    fill="#111"
-                    rotation={-rotation}
-                  />
+                  {showWaypointNumbers && (
+                    <Text
+                      x={px + WAYPOINT_LABEL_OFFSET_PX.x / zoom}
+                      y={py + WAYPOINT_LABEL_OFFSET_PX.y / zoom}
+                      text={String(idx + 1)}
+                      fontSize={WAYPOINT_LABEL_FONT_PX / zoom}
+                      fill="#111"
+                      rotation={-rotation}
+                    />
+                  )}
                 </Group>
               );
             })}

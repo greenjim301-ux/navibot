@@ -19,6 +19,10 @@ interface Props {
    *  加载/卸载分片细节层。不传或没有 tiles 字段就只有整图预览, 跟以前一样。 */
   pointcloudMeta?: PointcloudMeta | null;
   waypoints?: Waypoint[];
+  /** 途经点小球上要不要浮一个编号(1, 2, 3...)。默认 true——多途经点路线靠这个
+   *  看顺序; 只有一个目标点的场景(MapPreviewPage 的"设置目标点")传 false,
+   *  一个点标"1"没有意义, 纯干扰。 */
+  showWaypointNumbers?: boolean;
   status?: NavStatus | null;
   /** 机器狗实际走过的轨迹 (世界坐标, 含 z)。由页面按位姿累积后传进来 —— 这里
    *  只负责画, 不持有状态, 页面才知道什么时候该清空(比如开始新一轮导航)。 */
@@ -147,7 +151,7 @@ function createWaypointLabelSprite(text: string): THREE.Sprite {
 }
 
 export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function PointCloudView({
-  mapName, meta, pointcloudMeta = null, waypoints = [], status = null, trail = null,
+  mapName, meta, pointcloudMeta = null, waypoints = [], showWaypointNumbers = true, status = null, trail = null,
   optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, enableFollow = false,
   showFollowButton = true, onFollowingChange,
   heightLimit, controlMode = "orbit", onRecenterModeChange,
@@ -922,12 +926,14 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
 
       // 编号浮在小球正上方(+Z): 默认视角是俯视, 不管水平方向怎么转, "上方"
       // 都读得出来是"上方", 不会像水平偏移那样随相机角度改变相对位置。
-      const label = createWaypointLabelSprite(String(idx + 1));
-      label.position.set(wp.x, wp.y, ground + 0.1 + 0.3);
-      label.userData.waypointIndex = idx;
-      group.add(label);
+      if (showWaypointNumbers) {
+        const label = createWaypointLabelSprite(String(idx + 1));
+        label.position.set(wp.x, wp.y, ground + 0.1 + 0.3);
+        label.userData.waypointIndex = idx;
+        group.add(label);
+      }
     });
-  }, [waypoints, waypointZ, status, meta.world_bounds.z_min]);
+  }, [waypoints, waypointZ, status, meta.world_bounds.z_min, showWaypointNumbers]);
 
   // 起点/终点标记 (跟途经点标记同一套画法, 颜色/文字区分开: 绿色"起", 红色"终")
   useEffect(() => {
