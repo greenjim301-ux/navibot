@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
-  ArrowLeft, PanelRight, X, Target, RefreshCw, Crosshair,
+  ArrowLeft, PanelRight, X, Target, RefreshCw,
   ZoomIn, ZoomOut, RotateCcw, RotateCw,
   MapPin, CircleCheck, Trash2, Play, Flag,
 } from "lucide-react";
-import { planPath, submitRoute } from "../api";
+import { planPath, setInflationMap, setSelfInflation, setSurfCloud } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
@@ -14,9 +14,20 @@ import type { PlannedRoutePoint, Waypoint, XY } from "../types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 
 const HEIGHT_LIMIT_STEP = 0.25;
+
+// 面板背景是暗色(bg-neutral-900/90), 但 Switch 组件的默认配色走的是全局(浅色)
+// 主题 token——关闭态的滑轨(bg-input, 浅灰)跟球(bg-background, 近白)几乎同色,
+// 糊在一起很难看清"这是个开关"; 开着的球虽然跟主题蓝色滑轨还行, 但两种状态
+// 观感不统一。这里强制球用纯白、加一圈深色描边保证任何状态下都能跟滑轨分开,
+// 滑轨颜色跟这个面板本来就在用的 cyan 高亮色(PanelButton 的 active 态)对齐,
+// 不用全局的 primary 蓝——面板内的开关外观统一, 一眼能看出扳到哪一边。
+const PANEL_SWITCH_CLASS =
+  "data-unchecked:bg-white/15 data-checked:bg-cyan-500 " +
+  "[&_[data-slot=switch-thumb]]:bg-white [&_[data-slot=switch-thumb]]:shadow-[0_0_0_1px_rgba(0,0,0,0.35)]";
 
 type ViewMode = "3d" | "2d";
 
@@ -29,11 +40,66 @@ export default function MapPreviewPage() {
   // (TopView 传了 showControls={false})——百分比/角度靠 onViewChange 回调同步。
   const [tvView, setTvView] = useState({ zoomPercent: 100, rotationDeg: 0 });
 
-  // 机器狗实时位姿只在"正在导航的地图就是这张预览的地图"时才有意义——odom
-  // 坐标是相对当前定位用的那张地图算的, 换一张不相关的图叠上去只会是错的点。
-  const { status } = useNavStatus();
+  // 只有"激活地图"(见 backend/app/map_registry.py, 全局同时最多一张, 地图
+  // 管理页可以切换)才叠加机器狗的实时状态——odom/传感器数据本身不区分地图,
+  // 只有明确"当前就是在这张图上跑"才有意义, 换一张不相关的图叠上去要么是
+  // 误导, 要么(图层数据)干脆没有对应的坐标系可画。图层/导航控制这两个面板
+  // 整个依赖这份实时状态, 因此也只在激活地图上显示(见下面 PanelSection 的
+  // isActive 条件)。
+  const isActive = info?.active === true;
+  // self_inflation/膨胀地图/雷达点云这三个是后端的全局订阅开关(不区分地图,
+  // 跟 NavigatePage 用法一致), 不用像 status 那样按地图过滤。
+  const {
+    status, selfInflationEnabled, selfInflation,
+    inflationMapEnabled, inflationMap, surfCloudEnabled, surfCloud,
+  } = useNavStatus();
+  // status.map_name 只在下发路线时才会设(见 route_manager.py 的
+  // submit_route), 单纯激活/预览、没提交过路线时是 null——liveStatus 优先用
+  // (路线进度字段更准), 拿不到就退回原始 status 并把 current_index/state 这些
+  // "路线进度"字段清成中性值(state 置 idle、current_index 置 -1, 让
+  // isCurrent/isDone 判断恒为 false), 只留位姿。两条路径都要求 isActive,
+  // 不激活整个是 null。
   const liveStatus = status?.map_name === name ? status : null;
-  const hasPose = Boolean(liveStatus?.robot_pose);
+  const displayStatus = isActive
+    ? (liveStatus ?? (status ? { ...status, state: "idle" as const, current_index: -1 } : null))
+    : null;
+  const hasPose = Boolean(displayStatus?.robot_pose);
+
+  // 三个显示图层开关跟 NavigatePage 一样是全局后端订阅(默认不订阅, 话题很吵),
+  // 勾选框只提交开关状态, 真正的 enabled/数据都是从 ws 推回来的。
+  const [selfInflationBusy, setSelfInflationBusy] = useState(false);
+  async function handleToggleSelfInflation(checked: boolean) {
+    setSelfInflationBusy(true);
+    try {
+      await setSelfInflation(checked);
+    } catch (e) {
+      setNavError(String(e));
+    } finally {
+      setSelfInflationBusy(false);
+    }
+  }
+  const [inflationMapBusy, setInflationMapBusy] = useState(false);
+  async function handleToggleInflationMap(checked: boolean) {
+    setInflationMapBusy(true);
+    try {
+      await setInflationMap(checked);
+    } catch (e) {
+      setNavError(String(e));
+    } finally {
+      setInflationMapBusy(false);
+    }
+  }
+  const [surfCloudBusy, setSurfCloudBusy] = useState(false);
+  async function handleToggleSurfCloud(checked: boolean) {
+    setSurfCloudBusy(true);
+    try {
+      await setSurfCloud(checked);
+    } catch (e) {
+      setNavError(String(e));
+    } finally {
+      setSurfCloudBusy(false);
+    }
+  }
 
   // 显示方式: 3D 点云(默认) 或 2D 栅格(topview.png)。切到 2D 时高度限制/视角
   // 这套东西都是给点云用的, 对栅格图没有意义, 面板里对应项跟着禁用——不卸载掉
@@ -68,16 +134,26 @@ export default function MapPreviewPage() {
   }, []);
 
   // 导航控制: 直接在当前视图(3D 点云或 2D 栅格, 两边都支持, 跟 viewMode 无关)
-  // 点选设置途经点, 参考 NavigatePage 的路线提交流程, 只是把"画路线"从单独的
-  // 弹窗挪到了跟预览同一个画面里。这里的 waypoints 是本地草稿, 提交后端才会
-  // 变成正式路线(status.waypoints), 语义跟 NavigatePage 的本地 waypoints 状态
-  // 完全一致(参考它)。
+  // 点选设置一个目标点(只要一个, 不是多途经点路线), 点「开始导航」时以机器狗
+  // 当前位置为起点、这个点为终点调用 plan_path 并直接下发 /initial_path
+  // (navi_mode=3, publish=true)——跟下面"路线预览"用的是同一条 global_planner
+  // 规划链路, 区别只在于: 这里起点是自动取的机器狗当前位姿、只需要点一个终点,
+  // 且规划完真的会下发让机器狗动; "路线预览"两个点都要手动点, 且从不下发。
+  // waypoints 复用 Waypoint[] 类型但语义上只有 0 或 1 个元素——onChangeWaypoints
+  // 每次都只保留最新点选的那个(见下面 handleChangeGoalPoint), 右键删除时清空。
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
-  // 是否处于"设置路线"模式: 3D 用 PointCloudView 的 routeEditMode prop, 2D 用
+  // 是否处于"设置目标点"模式: 3D 用 PointCloudView 的 routeEditMode prop, 2D 用
   // TopView 的 editable prop, 两边同一个开关, 切换 2D/3D 时这个状态原样保留。
+  // 只需要一个点, 点选后不用再手动"设置完成"——这颗按钮本身就是开关, 再点一次
+  // (或点「开始导航」下发成功后)就退出。
   const [routeEditing, setRouteEditing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [navError, setNavError] = useState<string | null>(null);
+  // navRunning 只反映 RouteManager 的状态机(navi_mode=2, submit_route 那条
+  // 链路)——这个面板的"开始导航"走的是 plan_path/navi_mode=3, RouteManager
+  // 完全不知道它的存在(见 route_manager.py 顶部的类注释, 明确只对接
+  // navi_mode=2), 所以下发成功之后这里的状态/徽标不会变成"执行中", 是已知
+  // 的后端侧限制, 不是这页的 bug。
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
 
@@ -128,16 +204,31 @@ export default function MapPreviewPage() {
     }
   }, [viewMode]);
 
-  function handleStartRouteEdit() {
-    // "点选新中心点"/"设置路线"/"设置起终点"在 3D 视图里是同一个左键点击手势,
-    // 三者语义互斥, 进路线编辑前把另外两个都取消掉。
+  /** "设置目标点"按钮本身就是开关: 没在编辑时点一下进入拾取模式, 已经在编辑
+   *  时再点一下直接退出——没有单独的"设置完成"步骤(只需要一个点, 点选/改点
+   *  都在拾取模式里直接生效, 见 handleChangeGoalPoint)。 */
+  function handleToggleGoalPick() {
+    if (routeEditing) {
+      setRouteEditing(false);
+      return;
+    }
+    // "点选新中心点"/"设置目标点"/"设置起终点"在 3D 视图里是同一个左键点击
+    // 手势, 三者语义互斥, 进拾取前把另外两个都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (startGoalPicking) setStartGoalPicking(false);
     setRouteEditing(true);
   }
 
+  /** 目标点只要一个: PointCloudView/TopView 的 routeEditMode 手势是"左键在
+   *  数组末尾追加一个点、右键从数组里删掉某个点"(本来是给多途经点路线设计
+   *  的), 这里只取最新的最后一个点, 每次左键点选都直接替换掉上一个, 右键删除
+   *  时数组变空、slice 结果也是空——不用改 PointCloudView/TopView 本身。 */
+  function handleChangeGoalPoint(next: Waypoint[]) {
+    setWaypoints(next.slice(-1));
+  }
+
   function handleStartStartGoalPick() {
-    // 同上, 进起终点拾取前把"点选新中心点"/"设置路线"都取消掉。
+    // 同上, 进起终点拾取前把"点选新中心点"/"设置目标点"都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (routeEditing) setRouteEditing(false);
     setStartGoalPicking(true);
@@ -172,11 +263,24 @@ export default function MapPreviewPage() {
     setStartGoalPicking(false);
   }
 
+  /** 起点用机器狗当前位姿(displayStatus.robot_pose, 逻辑同"显示当前位置"那部分
+   *  ——不按地图过滤, 见 hasPose 声明处的注释), 终点是面板里点选的那个目标点。
+   *  跟"路线预览"的 handleFinishStartGoalPick 共用同一个 plan_path 接口, 区别
+   *  是这里 publish 传 true, 真的会下发 /initial_path 让机器狗动——所以除了
+   *  规划本身失败(接口抛错)之外, 还要额外处理"规划成功但下发失败"这种情况
+   *  (published=false, 比如 ROS bridge 没起来/没有 navi_mode=3 订阅者), 不能
+   *  像"路线预览"那样直接忽略 published/publishError。 */
   async function handleStartNav() {
+    const goal = waypoints[0];
+    const pose = displayStatus?.robot_pose;
+    if (!goal || !pose) return;
     setSubmitting(true);
     setNavError(null);
     try {
-      await submitRoute(waypoints, name);
+      const result = await planPath(name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, true);
+      if (!result.published) {
+        setNavError(result.publishError ?? "路径规划成功, 但下发失败");
+      }
       setRouteEditing(false);
     } catch (e) {
       setNavError(String(e));
@@ -255,7 +359,8 @@ export default function MapPreviewPage() {
               meta={info.topview_meta}
               pointcloudMeta={info.pointcloud_meta}
               waypoints={waypoints}
-              status={liveStatus}
+              showWaypointNumbers={false}
+              status={displayStatus}
               heightLimit={effectiveHeightLimit}
               controlMode="fixed"
               enableFollow
@@ -263,11 +368,14 @@ export default function MapPreviewPage() {
               onRecenterModeChange={setRecentering}
               onFollowingChange={setFollowing}
               routeEditMode={routeEditing}
-              onChangeWaypoints={setWaypoints}
+              onChangeWaypoints={handleChangeGoalPoint}
               startGoalPickMode={startGoalPicking}
               startGoal={startGoal}
               onChangeStartGoal={setStartGoal}
               plannedRoute={plannedRoute}
+              selfInflation={selfInflation}
+              inflationMap={inflationMap}
+              surfCloud={surfCloud}
             />
           ) : topview2d ? (
             <div className="flex size-full items-center justify-center">
@@ -276,13 +384,14 @@ export default function MapPreviewPage() {
                 mapName={name}
                 meta={topview2d}
                 waypoints={waypoints}
-                onChangeWaypoints={setWaypoints}
+                showWaypointNumbers={false}
+                onChangeWaypoints={handleChangeGoalPoint}
                 editable={routeEditing}
                 startGoalPickMode={startGoalPicking}
                 startGoal={startGoal}
                 onChangeStartGoal={setStartGoal}
                 plannedRoute={plannedRoute}
-                status={liveStatus}
+                status={displayStatus}
                 maxWidth={viewportSize.width}
                 maxHeight={viewportSize.height}
                 defaultZoom={1}
@@ -304,7 +413,7 @@ export default function MapPreviewPage() {
             </div>
           ) : routeEditing ? (
             <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
-              设置路线中: 左键新增导航点, 右键删除已有的点
+              设置目标点中: 左键点选/重新点选目标点, 右键删除
             </div>
           ) : startGoalPicking ? (
             <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
@@ -376,18 +485,76 @@ export default function MapPreviewPage() {
                   </div>
                 </PanelSection>
 
+                {!isActive && (
+                  <div className="border-b border-white/10 px-4 py-3 text-xs text-white/50">
+                    这张地图还没有激活, "图层"和"导航控制"不可用——去
+                    <Link to="/maps" className="mx-1 text-cyan-300 hover:underline">地图管理</Link>
+                    激活它。
+                  </div>
+                )}
+
+                {/* self_inflation/膨胀地图/雷达点云都是 PointCloudView 才画的
+                    3D 图层, 2D 栅格图没有对应渲染, 切到 2D 时禁用(不改变已勾选
+                    的状态, 只是这个视图下用不上)——参考"视角"那块的做法。整个
+                    面板只在激活地图上显示, 见 isActive 声明处的注释。 */}
+                {isActive && (
+                  <PanelSection title="图层">
+                    <div className={cn("flex flex-col gap-2.5 transition-opacity", viewMode === "2d" && "pointer-events-none opacity-40")}>
+                      <label className="flex items-center justify-between text-xs text-white/70">
+                        自身膨胀
+                        <Switch
+                          className={PANEL_SWITCH_CLASS}
+                          checked={selfInflationEnabled}
+                          disabled={viewMode === "2d" || selfInflationBusy}
+                          onCheckedChange={handleToggleSelfInflation}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between text-xs text-white/70">
+                        膨胀地图
+                        <Switch
+                          className={PANEL_SWITCH_CLASS}
+                          checked={inflationMapEnabled}
+                          disabled={viewMode === "2d" || inflationMapBusy}
+                          onCheckedChange={handleToggleInflationMap}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between text-xs text-white/70">
+                        实时点云
+                        <Switch
+                          className={PANEL_SWITCH_CLASS}
+                          checked={surfCloudEnabled}
+                          disabled={viewMode === "2d" || surfCloudBusy}
+                          onCheckedChange={handleToggleSurfCloud}
+                        />
+                      </label>
+                      <label
+                        className="flex items-center justify-between text-xs text-white/70"
+                        title={viewMode === "2d" ? undefined : hasPose ? undefined : "还没有收到机器狗位姿"}
+                      >
+                        跟随机器狗
+                        <Switch
+                          className={PANEL_SWITCH_CLASS}
+                          checked={following}
+                          disabled={viewMode === "2d" || !hasPose}
+                          onCheckedChange={() => pcRef.current?.toggleFollow()}
+                        />
+                      </label>
+                    </div>
+                  </PanelSection>
+                )}
+
                 <PanelSection title="视角">
                   <div className={cn("flex flex-col gap-1.5 transition-opacity", viewMode === "2d" && "pointer-events-none opacity-40")}>
                     <PanelButton
                       icon={Target}
                       label={recentering ? "点击点云取消" : "点选旋转中心"}
                       active={recentering}
-                      // 跟"设置路线"/"设置起终点"在 3D 视图里是同一个左键点击
-                      // 手势, 那两个模式开着的时候不能再切进这个模式, 得先点
-                      // 各自的"设置完成"。
+                      // 跟"设置目标点"/"设置起终点"在 3D 视图里是同一个左键
+                      // 点击手势, 那两个模式开着的时候不能再切进这个模式,
+                      // 得先退出各自的拾取模式。
                       disabled={viewMode === "2d" || routeEditing || startGoalPicking}
                       title={
-                        routeEditing ? "设置路线中, 先点「设置完成」"
+                        routeEditing ? "设置目标点中, 先点「取消设置目标点」"
                           : startGoalPicking ? "设置起终点中, 先点「设置完成」"
                             : undefined
                       }
@@ -399,57 +566,49 @@ export default function MapPreviewPage() {
                       disabled={viewMode === "2d"}
                       onClick={() => pcRef.current?.resetView()}
                     />
-                    <PanelButton
-                      icon={Crosshair}
-                      label={following ? "跟随中" : "跟随机器狗"}
-                      active={following}
-                      disabled={viewMode === "2d" || !hasPose}
-                      title={viewMode === "2d" ? undefined : hasPose ? undefined : "还没有收到机器狗位姿"}
-                      onClick={() => pcRef.current?.toggleFollow()}
-                    />
                   </div>
                 </PanelSection>
 
-                <PanelSection title="导航控制">
-                  <div className="flex flex-col gap-1.5">
-                    <PanelButton
-                      icon={MapPin}
-                      label="设置路线"
-                      active={routeEditing}
-                      disabled={routeEditing || navRunning || startGoalPicking}
-                      title={
-                        navRunning ? "导航进行中不能设置路线"
-                          : startGoalPicking ? "设置起终点中, 先点「设置完成」"
-                            : undefined
-                      }
-                      onClick={handleStartRouteEdit}
-                    />
-                    <PanelButton
-                      icon={CircleCheck}
-                      label="设置完成"
-                      disabled={!routeEditing}
-                      onClick={() => setRouteEditing(false)}
-                    />
-                    <PanelButton
-                      icon={Trash2}
-                      label="清空路线"
-                      disabled={waypoints.length === 0 || submitting || navRunning}
-                      title={navRunning ? "导航进行中不能清空路线" : undefined}
-                      onClick={() => setWaypoints([])}
-                    />
-                    <PanelButton
-                      icon={Play}
-                      label={navRunning ? "导航中…" : submitting ? "下发中…" : "开始导航"}
-                      disabled={waypoints.length === 0 || submitting || navRunning}
-                      onClick={handleStartNav}
-                    />
-                  </div>
-                </PanelSection>
+                {/* 只在激活地图上显示, 见 isActive 声明处的注释——"开始导航"
+                    下发的是机器狗当前位姿, 不激活的地图上这份位姿要么对不上
+                    坐标系、要么(见 hasPose)干脆拿不到, 显示出来只会误导。 */}
+                {isActive && (
+                  <PanelSection title="导航控制">
+                    <div className="flex flex-col gap-1.5">
+                      <PanelButton
+                        icon={MapPin}
+                        label={routeEditing ? "取消设置目标点" : "设置目标点"}
+                        active={routeEditing}
+                        disabled={navRunning || startGoalPicking}
+                        title={
+                          navRunning ? "导航进行中不能设置目标点"
+                            : startGoalPicking ? "设置起终点中, 先点「设置完成」"
+                              : undefined
+                        }
+                        onClick={handleToggleGoalPick}
+                      />
+                      <PanelButton
+                        icon={Trash2}
+                        label="清空目标点"
+                        disabled={waypoints.length === 0 || submitting || navRunning}
+                        title={navRunning ? "导航进行中不能清空目标点" : undefined}
+                        onClick={() => setWaypoints([])}
+                      />
+                      <PanelButton
+                        icon={Play}
+                        label={navRunning ? "导航中…" : submitting ? "下发中…" : "开始导航"}
+                        disabled={waypoints.length === 0 || !hasPose || submitting || navRunning}
+                        title={waypoints.length > 0 && !hasPose ? "还没有收到机器狗位姿" : undefined}
+                        onClick={handleStartNav}
+                      />
+                    </div>
+                  </PanelSection>
+                )}
 
-                {/* 独立于上面的"导航控制"(navi_mode=2): 起终点在 2D 栅格图上跑
-                    A* 全局规划(global_planner.py), 补好 z 算出参考路线画出来
-                    看——调用 planPath 时 publish 传 false, 只看规划结果, 不会
-                    真的下发给 navi_mode=3(/initial_path), 也不会让机器狗动。
+                {/* 独立于上面的"导航控制": 两边都是 global_planner.plan_path
+                    算出参考路线补好 z, 走的是同一条 navi_mode=3(/initial_path)
+                    链路, 区别是这里起终点都要手动点选, 且调用 planPath 时
+                    publish 恒传 false, 只看规划结果, 不会真的下发让机器狗动。
                     3D/2D 都支持拾取(见 startGoalPickMode 相关的 PointCloudView/
                     TopView props)。 */}
                 <PanelSection title="路线预览">
@@ -461,7 +620,7 @@ export default function MapPreviewPage() {
                       disabled={startGoalPicking || navRunning || routeEditing}
                       title={
                         navRunning ? "导航进行中不能规划路线"
-                          : routeEditing ? "设置路线中, 先点「设置完成」"
+                          : routeEditing ? "设置目标点中, 先点「取消设置目标点」"
                             : undefined
                       }
                       onClick={handleStartStartGoalPick}
