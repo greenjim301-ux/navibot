@@ -107,7 +107,7 @@ INFLATION_MAP_TOPIC = os.environ.get("NAVIBOT_INFLATION_MAP_TOPIC", "/grid_map/o
 # "降采样后的激光点云,已进行降采样,经过畸变校正,转到地图坐标系下", 5Hz, 只有
 # x/y/z。跟 inflation_map 一样默认不订阅, 前端"雷达点云"勾选框打开才让后端订阅,
 # 每次整帧替换(不叠加历史帧)。
-SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURF_CLOUD_TOPIC", "/surf_cloud_in_map")
+SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURF_CLOUD_TOPIC", "/hand_lio/clouds_lidar")
 
 # 对齐 fsm/waypoint_arrival_radius (advanced_param.xml 里配的 0.3): 途中点提前切
 # 下一个的半径, 不是到达判据本身; 最后一个点没有这条, 精度比这个值高得多——见上面
