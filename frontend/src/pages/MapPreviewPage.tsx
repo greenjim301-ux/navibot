@@ -10,7 +10,7 @@ import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
-import type { PlannedRoutePoint, Waypoint, XY } from "../types";
+import type { PlannedRoutePoint, TrailPoint, Waypoint, XY } from "../types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -18,6 +18,12 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 
 const HEIGHT_LIMIT_STEP = 0.25;
+
+// 轨迹采样阈值/上限, 跟 NavigatePage 保持一致(见该文件同名常量的说明): odom
+// 是 200Hz 的, 每帧都记会瞬间堆出几万个点且肉眼看不出区别; 按位移采样,
+// 0.05m 一个点在 3D 里已经是平滑曲线了, 上限防止长时间挂着页面把内存吃掉。
+const TRAIL_MIN_STEP_M = 0.05;
+const TRAIL_MAX_POINTS = 5000;
 
 // 面板背景是暗色(bg-neutral-900/90), 但 Switch 组件的默认配色走的是全局(浅色)
 // 主题 token——关闭态的滑轨(bg-input, 浅灰)跟球(bg-background, 近白)几乎同色,
@@ -50,7 +56,7 @@ export default function MapPreviewPage() {
   // self_inflation/膨胀地图/雷达点云这三个是后端的全局订阅开关(不区分地图,
   // 跟 NavigatePage 用法一致), 不用像 status 那样按地图过滤。
   const {
-    status, selfInflationEnabled, selfInflation,
+    status, optimalTraj, selfInflationEnabled, selfInflation,
     inflationMapEnabled, inflationMap, surfCloudEnabled, surfCloud,
   } = useNavStatus();
   // status.map_name 只在下发路线时才会设(见 route_manager.py 的
@@ -64,6 +70,25 @@ export default function MapPreviewPage() {
     ? (liveStatus ?? (status ? { ...status, state: "idle" as const, current_index: -1 } : null))
     : null;
   const hasPose = Boolean(displayStatus?.robot_pose);
+
+  // 机器狗实际走过的轨迹, 做法照抄 NavigatePage(见该文件同名 effect 的说明):
+  // 一直记(不限于导航进行中), 这样跑完之后那条线还留在图上能回看; 换地图/
+  // 开始新一趟导航时清空(见下面 [name] 那个 effect 和 handleStartNav)。用
+  // displayStatus 而不是原始 status——只有 isActive 时才有意义, 见 hasPose
+  // 声明处的注释, 不激活时 displayStatus 恒为 null, 这里自然不会累积。
+  const [trail, setTrail] = useState<TrailPoint[]>([]);
+  const pose = displayStatus?.robot_pose;
+  useEffect(() => {
+    if (!pose) return;
+    setTrail((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && Math.hypot(pose.x - last.x, pose.y - last.y, pose.z - last.z) < TRAIL_MIN_STEP_M) {
+        return prev;
+      }
+      const next = [...prev, { x: pose.x, y: pose.y, z: pose.z }];
+      return next.length > TRAIL_MAX_POINTS ? next.slice(next.length - TRAIL_MAX_POINTS) : next;
+    });
+  }, [pose?.x, pose?.y, pose?.z]);
 
   // 三个显示图层开关跟 NavigatePage 一样是全局后端订阅(默认不订阅, 话题很吵),
   // 勾选框只提交开关状态, 真正的 enabled/数据都是从 ws 推回来的。
@@ -150,21 +175,23 @@ export default function MapPreviewPage() {
   const [submitting, setSubmitting] = useState(false);
   const [navError, setNavError] = useState<string | null>(null);
   // navRunning 只反映 RouteManager 的状态机(navi_mode=2, submit_route 那条
-  // 链路)——这个面板的"开始导航"走的是 plan_path/navi_mode=3, RouteManager
-  // 完全不知道它的存在(见 route_manager.py 顶部的类注释, 明确只对接
-  // navi_mode=2), 下发成功之后 navState/navRunning 不会变成"执行中", 这是
-  // 后端状态机本身的限制, 没法在这页单方面修好。"是不是正在跑""要不要显示
-  // 路线/停止导航按钮"改用下面 dispatchedRoute 这个页面本地信号来判断——
-  // 不依赖后端状态机, 单纯"点了开始导航且下发成功"就是 true, 点了停止导航/
-  // 换地图才清空。
+  // 链路), 跟这个面板走的 plan_path/navi_mode=3 无关(见 route_manager.py
+  // 顶部的类注释), 保留给"路线预览"那边复用同一套互斥禁用逻辑。
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
-  // plan_path(publish=true)下发成功后返回的参考路线, 用来在地图上画出来 +
-  // 判断"当前是不是有一条通过这个面板下发的导航在跑"(navDispatchActive)。
-  // estop() 现在不再要求后端状态机处于 running 才能调(见
-  // route_manager.estop 的说明), 所以"停止导航"按钮在这条信号下能真的调得通。
+  // navDispatchActive: navi_mode=3 是否正有一条参考路线在跑, 直接读后端广播
+  // 的 NavStatus.reference_path_active(见 route_manager.mark_reference_path_
+  // dispatched/on_planning_finished/estop)——用 liveStatus(要求 map_name
+  // 精确匹配这张地图), 不用 displayStatus: 后者在 liveStatus 缺失时会退回
+  // 原始 status 且不清空 reference_path_active 字段(只清 state/current_index
+  // 那两个), 会把"其它地图正在跑"误当成"这张地图正在跑"。到达终点/急停退出/
+  // 手动停止都由后端广播同步过来, 不需要这页自己猜"是不是跑完了"。
+  const navDispatchActive = Boolean(liveStatus?.reference_path_active);
+  // plan_path(publish=true)下发成功后返回的参考路线, 单纯用来在地图上画出来
+  // (跟"这条导航是不是还在跑"是两回事, 见上面 navDispatchActive)——完成/
+  // 失败之后仍然留着当"最近一次下发的路线"看, 不跟着自动清空; 只有换地图或
+  // 点"停止导航"才清, 参考 NavigatePage 的 trail(跑完了也留着能回看)。
   const [dispatchedRoute, setDispatchedRoute] = useState<PlannedRoutePoint[] | null>(null);
-  const navDispatchActive = Boolean(dispatchedRoute && dispatchedRoute.length > 0);
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
   // 独立的另一条链路——起终点在 2D 栅格图上跑 A* 规划(global_planner.py),
@@ -286,7 +313,6 @@ export default function MapPreviewPage() {
    *  像"路线预览"那样直接忽略 published/publishError。 */
   async function handleStartNav() {
     const goal = waypoints[0];
-    const pose = displayStatus?.robot_pose;
     if (!goal || !pose) return;
     setSubmitting(true);
     setNavError(null);
@@ -296,9 +322,12 @@ export default function MapPreviewPage() {
         setNavError(result.publishError ?? "路径规划成功, 但下发失败");
         return;
       }
-      // 只有真的发下去了(published=true)才画出来、才算"进入了导航中"——
-      // published=false 时机器狗压根没收到这条路径, 显示"正在导航"/画一条
-      // 实际没在走的路线只会误导。
+      // 只有真的发下去了(published=true)才画出来——published=false 时机器狗
+      // 压根没收到这条路径, 画一条实际没在走的路线只会误导。是不是"进入了
+      // 导航中"由后端广播的 reference_path_active 决定(见 navDispatchActive
+      // 声明处的注释), 不是这里的本地状态。开新一趟前把上一趟的轨迹清掉,
+      // 理由同 NavigatePage 的 handleStart。
+      setTrail([]);
       setDispatchedRoute(result.points);
       setRouteEditing(false);
     } catch (e) {
@@ -398,6 +427,8 @@ export default function MapPreviewPage() {
               waypoints={waypoints}
               showWaypointNumbers={false}
               status={displayStatus}
+              trail={isActive ? trail : null}
+              optimalTraj={isActive ? optimalTraj : null}
               heightLimit={effectiveHeightLimit}
               controlMode="fixed"
               enableFollow

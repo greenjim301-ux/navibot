@@ -78,6 +78,9 @@ class RouteManager:
         self._lock = threading.Lock()
 
         self._state = TaskState.IDLE
+        # navi_mode=3(见 mark_reference_path_dispatched)是不是正有一条参考
+        # 路线在跑, 跟上面 self._state 这套 navi_mode=2 状态机完全独立维护。
+        self._reference_path_active: bool = False
         self._waypoints: List[Waypoint] = []
         self._dispatched_z: List[float] = []
         self._current_index: int = -1
@@ -118,6 +121,7 @@ class RouteManager:
             message=self._message,
             robot_pose=self._robot_pose,
             updated_at=time.time(),
+            reference_path_active=self._reference_path_active,
         )
 
     def _broadcast_locked(self) -> None:
@@ -267,10 +271,24 @@ class RouteManager:
         logger.info("route submitted: label=%s, 当前目标 #%d", label, self._current_index + 1)
         return status
 
+    def mark_reference_path_dispatched(self, map_name: Optional[str]) -> None:
+        """navi_mode=3(/api/maps/{name}/plan_path, publish=true)成功下发
+        /initial_path 之后调用(main.py 的 plan_path 端点里, published=True
+        时才调)。这条下发链路完全不经过 submit_route/self._state 那一套
+        navi_mode=2 状态机(见类文档), 单独用 self._reference_path_active
+        表示"navi_mode=3 现在是不是有一条在跑", 广播给前端——前端靠它决定
+        要不要显示"停止导航"按钮/禁用途经点编辑, 不依赖对 navi_mode=3 天生
+        不准的 self._state。跟 self._map_name 共用同一个字段(两条下发链路
+        不会同时跑, 单机同一时间只有一个任务)。"""
+        with self._lock:
+            self._reference_path_active = True
+            self._map_name = map_name
+            self._broadcast_locked()
+
     def estop(self) -> NavStatus:
         """急停 (/planning/emergency_stop)。会让 planner 悬停并作废当前任务
         (userEmergencyStopCallback), 恢复必须重新设置并提交一整轮路线, 所以
-        停下来之后状态直接进 STOPPED。
+        停下来之后 navi_mode=2 状态直接进 STOPPED(如果当时确实在 RUNNING)。
 
         不再要求 self._state == RUNNING 才能调——/planning/emergency_stop 是
         SCAN-Planner fsm 层的通用急停, 不区分 navi_mode, 但 self._state 只有
@@ -279,12 +297,15 @@ class RouteManager:
         不碰这个状态机(见类文档), 之前这条守卫会让"用 plan_path 下发导航之后
         想停"的请求平白被拒。真正的安全网在 ros_bridge.emergency_stop 那边:
         话题没有订阅者(planner 根本没在跑)会直接抛 RuntimeError, 这里不用
-        自己再判断"当前是不是在跑"。
+        自己再判断"当前是不是在跑"。self._reference_path_active 不管当前是
+        不是 True 都直接清掉(navi_mode=3 那条肯定也跟着停了)。
         """
         self._ros.emergency_stop()
         with self._lock:
-            self._state = TaskState.STOPPED
-            self._message = "已停止, 需要重新设置并提交路线"
+            self._reference_path_active = False
+            if self._state == TaskState.RUNNING:
+                self._state = TaskState.STOPPED
+                self._message = "已停止, 需要重新设置并提交路线"
             self._broadcast_locked()
             return self._status_locked()
 
@@ -353,35 +374,45 @@ class RouteManager:
     def on_planning_finished(self, status: int) -> None:
         """/planning/finished 回调(见 ros_bridge._handle_planning_finished 和
         config.py PLANNING_FINISHED_TOPIC 的说明)。不看消息里的 navi_mode——
-        RUNNING 这个状态本身就只在 route_manager 自己刚下发过 preset_waypoints
-        时才成立, 单机同一时间只会有一个任务在跑, 用不着再额外核对是不是自己
-        这个模式发的。
+        这条完成信号 navi_mode=2/3 共用, 这里分两条独立的线索处理:
 
-        只在自己还处于 RUNNING 时才动:
-        - REACHED: planner 确认到达终点, 比 _advance_reached_locked 的距离近似
-          精确得多, 直接确认 SUCCEEDED。就算距离近似已经先一步判定过也没关系,
-          这时候 self._state 已经不是 RUNNING 了, 下面的检查会跳过, 不会重复
-          触发。
-        - EMERGENCY_STOP: planner 自己从急停流程里退出、等新目标——如果是
-          estop() 主动触发的, 那条路径已经同步把状态置成了 STOPPED, 这里的
-          RUNNING 检查天然跳过, 不会把主动停止误判成失败; 能走到这里的都是
-          planner 自己触发的 fail-safe(比如避障反复重规划失败), 直接判
-          FAILED, 不用再干等 STUCK_TIMEOUT_S。
+        - self._reference_path_active(navi_mode=3): 不管 self._state 是什么,
+          只要收到 REACHED 或 EMERGENCY_STOP 就认为"这条参考路线结束了", 直接
+          清掉并广播, 好让前端的"停止导航"按钮能自动变回"开始导航"——这条
+          链路没有 self._state 那一套状态机, 完成/急停退出都不会更新它, 只能
+          靠这里同步。
+
+        - self._state(navi_mode=2, 只在自己还处于 RUNNING 时才动):
+          - REACHED: planner 确认到达终点, 比 _advance_reached_locked 的距离
+            近似精确得多, 直接确认 SUCCEEDED。就算距离近似已经先一步判定过也
+            没关系, 这时候 self._state 已经不是 RUNNING 了, 下面的检查会跳过,
+            不会重复触发。
+          - EMERGENCY_STOP: planner 自己从急停流程里退出、等新目标——如果是
+            estop() 主动触发的, 那条路径已经同步把状态置成了 STOPPED, 这里的
+            RUNNING 检查天然跳过, 不会把主动停止误判成失败; 能走到这里的都是
+            planner 自己触发的 fail-safe(比如避障反复重规划失败), 直接判
+            FAILED, 不用再干等 STUCK_TIMEOUT_S。
         """
+        if status not in (self.FINISHED_REACHED, self.FINISHED_EMERGENCY_STOP):
+            return
         with self._lock:
-            if self._state != TaskState.RUNNING:
-                return
-            if status == self.FINISHED_REACHED:
-                self._state = TaskState.SUCCEEDED
-                self._message = "路线执行完成 (planner 确认到达)"
-                self._current_index = len(self._waypoints)
-            elif status == self.FINISHED_EMERGENCY_STOP:
-                self._state = TaskState.FAILED
-                self._message = "planner 自行触发急停并退出任务 (不是用户主动停止)"
-                logger.warning(self._message)
-            else:
-                return
-            self._broadcast_locked()
+            was_reference_path_active = self._reference_path_active
+            self._reference_path_active = False
+
+            state_changed = False
+            if self._state == TaskState.RUNNING:
+                if status == self.FINISHED_REACHED:
+                    self._state = TaskState.SUCCEEDED
+                    self._message = "路线执行完成 (planner 确认到达)"
+                    self._current_index = len(self._waypoints)
+                else:
+                    self._state = TaskState.FAILED
+                    self._message = "planner 自行触发急停并退出任务 (不是用户主动停止)"
+                    logger.warning(self._message)
+                state_changed = True
+
+            if state_changed or was_reference_path_active:
+                self._broadcast_locked()
 
     def on_optimal_traj(self, points: List[dict]) -> None:
         """转发 /scan_planner_node/optimal_list, 纯展示用途, 不参与任何进度/状态

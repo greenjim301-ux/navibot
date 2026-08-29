@@ -246,6 +246,11 @@ async def plan_path(name: str, req: PlanPathRequest):
             # "不管下发那步炸成什么样都不能带崩这个接口的成功返回", 所以兜个底。
             publish_error = str(e)
             logger.warning("plan_path: 规划成功, 但下发 /initial_path 失败(不影响本次返回): %s", e)
+        else:
+            # 真的发下去了才标记"navi_mode=3 有一条在跑"(见
+            # route_manager.mark_reference_path_dispatched)——发失败的话机器狗
+            # 根本没收到, 不能广播成"正在导航"误导前端。
+            route_manager.mark_reference_path_dispatched(name)
 
     return PlanPathResponse(
         points=[PlanPathPoint(**p) for p in points],

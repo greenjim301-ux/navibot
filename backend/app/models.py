@@ -91,6 +91,12 @@ class NavStatus(BaseModel):
     message: Optional[str] = None
     robot_pose: Optional[Pose] = None
     updated_at: float
+    reference_path_active: bool = False
+    """navi_mode=3(/api/maps/{name}/plan_path, publish=true)是否正有一条参考
+    路线在跑——这条下发链路完全不经过 state/waypoints/current_index 这套
+    navi_mode=2 的状态机(见 route_manager.RouteManager 类文档), 但前端仍然
+    需要一个"现在是不是在跑"的信号来决定要不要显示停止导航按钮/禁用途经点
+    编辑, 所以单独给一个字段, 不往 state 里硬塞一个它本不认识的语义。"""
 
 
 class MapStatus(str, Enum):
