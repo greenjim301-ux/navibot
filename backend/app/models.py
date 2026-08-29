@@ -148,3 +148,8 @@ class MapInfo(BaseModel):
     """3d_map/dense_cloud_map.pcd 的原始文件大小 (字节), 地图列表卡片展示用——不是
     预处理后的点数, 是建图直接产出的源文件大小, 跟是否已预处理无关。"""
     updated_at: float = Field(default_factory=time.time)
+    active: bool = False
+    """全局同时最多只有一张地图处于激活状态(见 map_registry.py 的
+    activate_map/deactivate_map)。地图预览页只在预览的是激活地图时才显示
+    "图层"/"导航控制"这类跟机器狗实时状态挂钩的面板——机器狗的定位/传感器
+    数据不区分地图, 只有明确"当前就是在这张图上跑"时叠加上去才有意义。"""

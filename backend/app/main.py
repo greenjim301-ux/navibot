@@ -279,6 +279,34 @@ async def preprocess_map(name: str):
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/maps/{name}/activate", response_model=MapInfo)
+async def activate_map(name: str):
+    """把 name 设为全局唯一激活的地图(自动取消掉之前激活的那张, 见
+    map_registry.activate_map)。地图预览页只在预览的是激活地图时才显示
+    "图层"/"导航控制"以及机器狗当前位置。"""
+    try:
+        await run_in_threadpool(map_registry.activate_map, name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    info = await run_in_threadpool(map_registry.get_map_info, name)
+    if info is None:
+        raise HTTPException(404, f"地图 '{name}' 不存在")
+    return info
+
+
+@app.post("/api/maps/{name}/deactivate", response_model=MapInfo)
+async def deactivate_map(name: str):
+    """取消激活。如果 name 当前并不是激活的那张, 这个接口是 no-op。"""
+    try:
+        await run_in_threadpool(map_registry.deactivate_map, name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    info = await run_in_threadpool(map_registry.get_map_info, name)
+    if info is None:
+        raise HTTPException(404, f"地图 '{name}' 不存在")
+    return info
+
+
 @app.delete("/api/maps/{name}", status_code=204)
 async def delete_map(name: str):
     try:

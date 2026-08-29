@@ -48,11 +48,18 @@ def _is_valid_map_dir(path: Path) -> bool:
     )
 
 
+_ACTIVE_MAP_FILE = "_active_map.json"
+
+
 class MapRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._processing: Dict[str, threading.Thread] = {}
         self._errors: Dict[str, str] = {}
+        # 激活地图: 全局同时最多一张, 跨重启保留——落一个小 json 在
+        # MAP_ASSETS_DIR 根下(不放 MAP_DATA_DIR: 那是外部建图产物目录, 不是
+        # navibot 自己的状态该待的地方, 见 config.py 对两个目录的说明)。
+        self._active: Optional[str] = self._load_active()
 
     def _assets_dir(self, name: str) -> Path:
         _validate_name(name)
@@ -64,6 +71,28 @@ class MapRegistry:
 
     def _source_pcd(self, name: str) -> Path:
         return self._map_dir(name) / config.MAP_3D_SUBDIR / config.MAP_3D_PCD_FILENAME
+
+    def _active_map_file(self) -> Path:
+        return Path(config.MAP_ASSETS_DIR) / _ACTIVE_MAP_FILE
+
+    def _load_active(self) -> Optional[str]:
+        try:
+            data = json.loads(self._active_map_file().read_text())
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        name = data.get("active")
+        return name if isinstance(name, str) and name else None
+
+    def _save_active(self, name: Optional[str]) -> None:
+        # 只是记个书签, 写失败(目录还没建出来等)不该带崩激活这个动作本身——
+        # 这次进程里内存状态已经对了, 顶多重启后这次激活没保留住, 打个日志
+        # 就够了。
+        try:
+            path = self._active_map_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"active": name}))
+        except OSError as e:
+            logger.warning("持久化激活地图状态失败(不影响本次激活/取消): %s", e)
 
     # ---- 查询 ----
     def list_map_names(self) -> List[str]:
@@ -85,11 +114,12 @@ class MapRegistry:
         with self._lock:
             processing = name in self._processing
             error = self._errors.get(name)
+            active = name == self._active
 
         if processing:
             return MapInfo(
                 name=name, status=MapStatus.PROCESSING, storage_path=storage_path,
-                source_pcd_bytes=pcd_bytes,
+                source_pcd_bytes=pcd_bytes, active=active,
             )
 
         meta_path = self._assets_dir(name) / "topview_meta.json"
@@ -100,20 +130,47 @@ class MapRegistry:
             return MapInfo(
                 name=name, status=MapStatus.READY, storage_path=storage_path,
                 topview_meta=topview_meta, pointcloud_meta=pointcloud_meta,
-                source_pcd_bytes=pcd_bytes,
+                source_pcd_bytes=pcd_bytes, active=active,
                 updated_at=meta_path.stat().st_mtime,
             )
 
         if error:
             return MapInfo(
                 name=name, status=MapStatus.ERROR, storage_path=storage_path, error_message=error,
-                source_pcd_bytes=pcd_bytes,
+                source_pcd_bytes=pcd_bytes, active=active,
             )
 
         return MapInfo(
             name=name, status=MapStatus.NOT_PROCESSED, storage_path=storage_path,
-            source_pcd_bytes=pcd_bytes,
+            source_pcd_bytes=pcd_bytes, active=active,
         )
+
+    # ---- 激活状态 ----
+    def activate_map(self, name: str) -> None:
+        """把 name 设为全局唯一的激活地图, 顺带取消掉之前那张(不用单独找出
+        旧的那张来改——下次 get_map_info 算 active 字段时自然就是 False 了)。
+        只有预处理完成(READY)的地图能激活: 地图预览页的"图层"/"导航控制"
+        依赖预处理产物(topview_meta 等), 激活一张还没处理完的图没有意义。"""
+        info = self.get_map_info(name)
+        if info is None:
+            raise ValueError(f"地图 '{name}' 不存在")
+        if info.status != MapStatus.READY:
+            raise ValueError(f"地图 '{name}' 还没有预处理完成, 不能激活")
+        with self._lock:
+            self._active = name
+        self._save_active(name)
+        logger.info("activated map=%s", name)
+
+    def deactivate_map(self, name: str) -> None:
+        """取消激活。只有 name 确实是当前激活的那张才会真的清掉——不是就当
+        no-op, 不报错(前端"取消激活"按钮不用先查一遍当前激活的是不是自己)。"""
+        _validate_name(name)
+        with self._lock:
+            if self._active != name:
+                return
+            self._active = None
+        self._save_active(None)
+        logger.info("deactivated map=%s", name)
 
     def list_maps(self) -> List[MapInfo]:
         infos = (self.get_map_info(name) for name in self.list_map_names())
@@ -180,4 +237,12 @@ class MapRegistry:
 
         shutil.rmtree(map_dir, ignore_errors=True)
         shutil.rmtree(self._assets_dir(name), ignore_errors=True)
+        # 删掉的正好是当前激活的那张, 不能让 active 继续指向一个已经不存在的
+        # 地图名。
+        with self._lock:
+            was_active = self._active == name
+            if was_active:
+                self._active = None
+        if was_active:
+            self._save_active(None)
         logger.info("deleted map=%s", name)
