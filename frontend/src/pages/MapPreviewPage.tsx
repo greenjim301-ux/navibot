@@ -701,22 +701,27 @@ export default function MapPreviewPage() {
                           setOptimalTrajHidden(true);
                         }}
                       />
-                      {navRunning ? (
-                        <PanelButton
-                          icon={OctagonX}
-                          label={submitting ? "停止中…" : "停止导航"}
-                          disabled={submitting}
-                          onClick={handleStopNav}
-                        />
-                      ) : (
-                        <PanelButton
-                          icon={Play}
-                          label={submitting ? "下发中…" : "开始导航"}
-                          disabled={waypoints.length === 0 || !hasPose || submitting || navRunning}
-                          title={waypoints.length > 0 && !hasPose ? "还没有收到机器狗位姿" : undefined}
-                          onClick={handleStartNav}
-                        />
-                      )}
+                      <PanelButton
+                        icon={Play}
+                        label={submitting ? "下发中…" : "开始导航"}
+                        disabled={waypoints.length === 0 || !hasPose || submitting || navRunning}
+                        title={waypoints.length > 0 && !hasPose ? "还没有收到机器狗位姿" : undefined}
+                        onClick={handleStartNav}
+                      />
+                      {/* "停止导航"故意不按 navRunning 隐藏/切换——这是安全动作,
+                          不能让"要不要显示这颗按钮"依赖前端对"现在是不是在跑"的
+                          判断(WS 广播延迟/丢失、liveStatus 的 map_name 匹配没对上
+                          等任何一种前端自己没检测对的情况, 都不该导致用户点不到
+                          停止)。一直显示、只在请求进行中禁用, 真正的安全网仍然在
+                          后端: 没有导航在跑时点了也只是 /planning/emergency_stop
+                          没有订阅者、报个错, 不会有副作用(见 handleStopNav 的
+                          说明)。 */}
+                      <PanelButton
+                        icon={OctagonX}
+                        label={submitting ? "处理中…" : "停止导航"}
+                        disabled={submitting}
+                        onClick={handleStopNav}
+                      />
                     </div>
                   </PanelSection>
                 )}
