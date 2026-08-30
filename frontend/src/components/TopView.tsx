@@ -27,6 +27,10 @@ interface Props {
   /** 路线预览算出来的参考路线, 只读展示, 画法/颜色跟 PointCloudView 保持一致
    *  (青色, 见下面 ROUTE preview 相关常量)。 */
   plannedRoute?: PlannedRoutePoint[] | null;
+  /** 真的下发给机器狗、正在跑(或刚跑完)的那条路线, 跟 plannedRoute 是两条
+   *  独立的线、颜色不同(见下面 NAV_ROUTE_COLOR), 可能同时非空——跟
+   *  PointCloudView 的同名 prop 语义一致, 不做互斥/优先级合并。 */
+  navRoute?: PlannedRoutePoint[] | null;
   status: NavStatus | null;
   maxWidth?: number;
   /** 画布可视高度上限, 内容超出的部分靠拖拽/缩放查看, 不传则不限制高度 */
@@ -90,6 +94,10 @@ const GOAL_COLOR = "#d74747";
 // 路线预览算出来的参考路线, 跟"设置路线"草稿线(#2376e5)区分开, 用青色——
 // 跟 PointCloudView 的 plannedRouteMaterial 同一个强调色。
 const PLANNED_ROUTE_COLOR = "#22d3ee";
+// 真的下发下去的导航路线, 跟上面的"路线预览"用不同颜色区分开——两条线可能
+// 同时显示(见 Props.navRoute 的说明), 颜色跟 PointCloudView 的 navRouteMaterial
+// 保持一致。
+const NAV_ROUTE_COLOR = "#ec4899";
 const ROBOT_RADIUS_PX = 10;
 const ROBOT_STROKE_PX = 1.5;
 const HOVER_RADIUS_PX = 4;
@@ -114,7 +122,7 @@ function centerOnOrigin(meta: Topview2D): Topview2D {
 export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
   showWaypointNumbers = true,
-  startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null,
+  startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
   maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight, defaultZoom = DEFAULT_ZOOM,
   showControls = true, onViewChange,
 }, ref) {
@@ -406,6 +414,19 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
                   return [rp.col * baseScale, rp.row * baseScale];
                 })}
                 stroke={PLANNED_ROUTE_COLOR}
+                strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
+                listening={false}
+              />
+            )}
+
+            {/* 真的下发下去的导航路线, 跟上面的路线预览可能同时显示, 颜色区分开 */}
+            {navRoute && navRoute.length >= 2 && (
+              <Line
+                points={navRoute.flatMap((p) => {
+                  const rp = worldToPixel(centeredMeta, p.x, p.y);
+                  return [rp.col * baseScale, rp.row * baseScale];
+                })}
+                stroke={NAV_ROUTE_COLOR}
                 strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
                 listening={false}
               />

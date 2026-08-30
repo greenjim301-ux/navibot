@@ -207,10 +207,6 @@ export default function MapPreviewPage() {
   const [plannedRoute, setPlannedRoute] = useState<PlannedRoutePoint[] | null>(null);
   const [planning, setPlanning] = useState(false);
   const hasStartGoal = Boolean(startGoal.start || startGoal.goal);
-  // 画在地图上的到底是哪条线: 真的下发过的路线(dispatchedRoute)优先于"路线
-  // 预览"算出来的那条(plannedRoute)——前者代表机器狗实际在走的路径, 比一份
-  // 单纯的预览更重要, 两者目前没有会同时非空又需要一起显示的场景。
-  const displayRoute = dispatchedRoute ?? plannedRoute;
 
   // 下发失败的错误提示过一会儿自己消失, 不然会一直挡在屏幕上——每次 navError
   // 变化(包括又失败一次, 换成新消息)都重新计时。路线规划失败也复用这同一条
@@ -440,7 +436,8 @@ export default function MapPreviewPage() {
               startGoalPickMode={startGoalPicking}
               startGoal={startGoal}
               onChangeStartGoal={setStartGoal}
-              plannedRoute={displayRoute}
+              plannedRoute={plannedRoute}
+              navRoute={isActive ? dispatchedRoute : null}
               selfInflation={selfInflation}
               inflationMap={inflationMap}
               surfCloud={surfCloud}
@@ -458,7 +455,8 @@ export default function MapPreviewPage() {
                 startGoalPickMode={startGoalPicking}
                 startGoal={startGoal}
                 onChangeStartGoal={setStartGoal}
-                plannedRoute={displayRoute}
+                plannedRoute={plannedRoute}
+                navRoute={isActive ? dispatchedRoute : null}
                 status={displayStatus}
                 maxWidth={viewportSize.width}
                 maxHeight={viewportSize.height}
@@ -660,7 +658,11 @@ export default function MapPreviewPage() {
                         label="清空目标点"
                         disabled={waypoints.length === 0 || submitting || navRunning || navDispatchActive}
                         title={navRunning || navDispatchActive ? "导航进行中不能清空目标点" : undefined}
-                        onClick={() => setWaypoints([])}
+                        // 顺带清掉维持在图上的机器狗轨迹(trail)——导航进行中本来就
+                        // 禁用这颗按钮(见上面 disabled), 能点到这里说明上一趟导航
+                        // (如果有)已经结束, 那条轨迹只是"最近一次的回看", 跟目标点
+                        // 一起清掉, 不然留着旧轨迹会跟接下来要设的新目标点混在一起。
+                        onClick={() => { setWaypoints([]); setTrail([]); }}
                       />
                       {navDispatchActive ? (
                         <PanelButton

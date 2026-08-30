@@ -88,6 +88,11 @@ interface Props {
   /** global_planner.plan_path 规划出来的参考路线(世界坐标 + 已补好的 z), 只
    *  负责画一条线, 不参与任何拾取逻辑——由页面在拿到 /plan_path 的响应后传入。 */
   plannedRoute?: PlannedRoutePoint[] | null;
+  /** 真的下发给机器狗、正在跑(或刚跑完)的那条路线(navi_mode=3, /initial_path)。
+   *  跟 plannedRoute 是两条独立的线、颜色也不同(见下面 navRouteMaterial),
+   *  两者可能同时非空——地图预览页允许"这趟导航正在跑"和"顺手预览另一条路线"
+   *  同时显示, 不做互斥/优先级合并。 */
+  navRoute?: PlannedRoutePoint[] | null;
 }
 
 export interface PointCloudViewHandle {
@@ -156,7 +161,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   showFollowButton = true, onFollowingChange,
   heightLimit, controlMode = "orbit", onRecenterModeChange,
   routeEditMode = false, onChangeWaypoints,
-  startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null,
+  startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   // toggleRecenter/resetView 的实际实现绑定着某一套 camera/controls, 每次挂载
@@ -209,6 +214,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   const startGoalGroupRef = useRef<THREE.Group | null>(null);
   const plannedRouteGroupRef = useRef<THREE.Group | null>(null);
   const plannedRouteMaterialRef = useRef<LineMaterial | null>(null);
+  const navRouteGroupRef = useRef<THREE.Group | null>(null);
+  const navRouteMaterialRef = useRef<LineMaterial | null>(null);
   const robotMeshRef = useRef<THREE.Mesh | null>(null);
   const pathGroupRef = useRef<THREE.Group | null>(null);
   const pathMarkersRef = useRef<THREE.Group | null>(null);
@@ -428,6 +435,20 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     const plannedRouteGroup = new THREE.Group();
     scene.add(plannedRouteGroup);
     plannedRouteGroupRef.current = plannedRouteGroup;
+
+    // 真的下发下去的导航路线, 跟"路线预览"(plannedRouteMaterial, 青色)用不同
+    // 颜色区分开——两条线可能同时显示(见 Props.navRoute 的说明), 颜色必须
+    // 一眼能分清"哪条是正在跑的, 哪条只是随手预览的"。粉色跟场景里其它颜色
+    // (青色预览/绿色轨迹/红色机器狗/橙红速度渐变)都不冲突。
+    const navRouteMaterial = new LineMaterial({
+      color: 0xec4899, linewidth: 2.5, transparent: true, opacity: 0.95, depthTest: false,
+    });
+    navRouteMaterial.resolution.set(width, height);
+    navRouteMaterialRef.current = navRouteMaterial;
+
+    const navRouteGroup = new THREE.Group();
+    scene.add(navRouteGroup);
+    navRouteGroupRef.current = navRouteGroup;
 
     const robotMesh = new THREE.Mesh(
       new THREE.ConeGeometry(0.18, 0.4, 12),
@@ -832,6 +853,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       trailMaterial.resolution.set(w, h);
       optimalMaterial.resolution.set(w, h);
       plannedRouteMaterial.resolution.set(w, h);
+      navRouteMaterial.resolution.set(w, h);
     }
     window.addEventListener("resize", handleResize);
 
@@ -856,6 +878,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       optimalMaterial.dispose();
       plannedRouteGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       plannedRouteMaterial.dispose();
+      navRouteGroup.children.forEach((c) => (c as Line2).geometry.dispose());
+      navRouteMaterial.dispose();
       selfInflationGroup.children.forEach((c) => {
         const m = c as THREE.Mesh;
         m.geometry.dispose();
@@ -986,6 +1010,30 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     line.renderOrder = 10;
     group.add(line);
   }, [plannedRoute]);
+
+  // 真的下发下去的导航路线, 画法跟上面的 plannedRoute 完全一样(单段直连,
+  // 抬高 0.1m 避免被地面点云埋住), 只是用独立的 group/material, 好让它跟
+  // "路线预览"那条线同时显示、互不覆盖(见 Props.navRoute 的说明)。
+  useEffect(() => {
+    const group = navRouteGroupRef.current;
+    const material = navRouteMaterialRef.current;
+    if (!group || !material) return;
+    needsRenderRef.current = true;
+
+    group.children.forEach((c) => (c as Line2).geometry.dispose());
+    group.clear();
+
+    if (!navRoute || navRoute.length < 2) return;
+
+    const flat: number[] = [];
+    navRoute.forEach((p) => flat.push(p.x, p.y, p.z + 0.1));
+    const geometry = new LineGeometry();
+    geometry.setPositions(flat);
+    const line = new Line2(geometry, material);
+    line.computeLineDistances();
+    line.renderOrder = 10;
+    group.add(line);
+  }, [navRoute]);
 
   // 机器狗实时位姿标记
   useEffect(() => {
