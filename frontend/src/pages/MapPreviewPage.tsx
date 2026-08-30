@@ -90,6 +90,14 @@ export default function MapPreviewPage() {
     });
   }, [pose?.x, pose?.y, pose?.z]);
 
+  // "清空目标点" 也要把 planner 局部轨迹线(optimalTraj)擦掉, 但那条线是 ws
+  // 推来的、页面并不持有它的数据, 只能记一个"擦掉了"标记, 下一条新轨迹
+  // (重规划)推过来时自动恢复显示——做法照抄 NavigatePage 的 optimalTrajHidden。
+  const [optimalTrajHidden, setOptimalTrajHidden] = useState(false);
+  useEffect(() => {
+    setOptimalTrajHidden(false);
+  }, [optimalTraj]);
+
   // 三个显示图层开关跟 NavigatePage 一样是全局后端订阅(默认不订阅, 话题很吵),
   // 勾选框只提交开关状态, 真正的 enabled/数据都是从 ws 推回来的。
   const [selfInflationBusy, setSelfInflationBusy] = useState(false);
@@ -424,7 +432,7 @@ export default function MapPreviewPage() {
               showWaypointNumbers={false}
               status={displayStatus}
               trail={isActive ? trail : null}
-              optimalTraj={isActive ? optimalTraj : null}
+              optimalTraj={isActive && !optimalTrajHidden ? optimalTraj : null}
               heightLimit={effectiveHeightLimit}
               controlMode="fixed"
               enableFollow
@@ -658,11 +666,20 @@ export default function MapPreviewPage() {
                         label="清空目标点"
                         disabled={waypoints.length === 0 || submitting || navRunning || navDispatchActive}
                         title={navRunning || navDispatchActive ? "导航进行中不能清空目标点" : undefined}
-                        // 顺带清掉维持在图上的机器狗轨迹(trail)——导航进行中本来就
-                        // 禁用这颗按钮(见上面 disabled), 能点到这里说明上一趟导航
-                        // (如果有)已经结束, 那条轨迹只是"最近一次的回看", 跟目标点
-                        // 一起清掉, 不然留着旧轨迹会跟接下来要设的新目标点混在一起。
-                        onClick={() => { setWaypoints([]); setTrail([]); }}
+                        // 顺带清掉维持在图上的所有"上一趟导航"残留——导航进行中
+                        // 本来就禁用这颗按钮(见上面 disabled), 能点到这里说明上一趟
+                        // 导航(如果有)已经结束, 这些都只是"最近一次的回看", 跟目标点
+                        // 一起清掉, 不然会跟接下来要设的新目标点/新导航混在一起:
+                        // trail 是机器狗实际走过的轨迹, dispatchedRoute 是全局规划出的
+                        // 参考路线(navRoute), optimalTraj 是 planner 的局部路线——
+                        // 后者是 ws 推来的、页面不持有数据, 只能记一个隐藏标记(见
+                        // optimalTrajHidden 声明处的注释)。
+                        onClick={() => {
+                          setWaypoints([]);
+                          setTrail([]);
+                          setDispatchedRoute(null);
+                          setOptimalTrajHidden(true);
+                        }}
                       />
                       {navDispatchActive ? (
                         <PanelButton
