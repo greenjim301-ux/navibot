@@ -5,7 +5,7 @@ import {
   ZoomIn, ZoomOut, RotateCcw, RotateCw,
   MapPin, CircleCheck, Trash2, Play, Flag, OctagonX,
 } from "lucide-react";
-import { estop, planPath, setInflationMap, setSelfInflation, setSurfCloud } from "../api";
+import { estop, planPath, setInflationMap, setSelfInflation, setSurfCloud, submitRoute } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
@@ -70,6 +70,13 @@ export default function MapPreviewPage() {
     ? (liveStatus ?? (status ? { ...status, state: "idle" as const, current_index: -1 } : null))
     : null;
   const hasPose = Boolean(displayStatus?.robot_pose);
+  // 给"设置目标点"那颗小球用的 status: current_index 强制清成 -1。
+  // handleStartNav 现在下发的是 plan_path 规划出来的一整串拐点(navi_mode=2),
+  // 不是这颗本地存的单目标点 waypoints——后端广播的 current_index 是"走到那串
+  // 拐点里第几个了", 跟这颗小球(永远是 idx 0)不是同一份列表, 不清零的话狗
+  // 刚走到第一个拐点就会把这颗目标点小球误判成"已到达"点绿, 其实离真正的
+  // 终点还远。这颗小球只表达"用户点的目标在哪", 不表达导航进度。
+  const goalMarkerStatus = displayStatus ? { ...displayStatus, current_index: -1 } : null;
 
   // 机器狗实际走过的轨迹, 做法照抄 NavigatePage(见该文件同名 effect 的说明):
   // 一直记(不限于导航进行中), 这样跑完之后那条线还留在图上能回看; 换地图/
@@ -168,12 +175,15 @@ export default function MapPreviewPage() {
 
   // 导航控制: 直接在当前视图(3D 点云或 2D 栅格, 两边都支持, 跟 viewMode 无关)
   // 点选设置一个目标点(只要一个, 不是多途经点路线), 点「开始导航」时以机器狗
-  // 当前位置为起点、这个点为终点调用 plan_path 并直接下发 /initial_path
-  // (navi_mode=3, publish=true)——跟下面"路线预览"用的是同一条 global_planner
-  // 规划链路, 区别只在于: 这里起点是自动取的机器狗当前位姿、只需要点一个终点,
-  // 且规划完真的会下发让机器狗动; "路线预览"两个点都要手动点, 且从不下发。
+  // 当前位置为起点、这个点为终点调用 plan_path(publish=false, 只要规划结果,
+  // 不走 navi_mode=3 下发), 再把规划出来的稀疏拐点当 navi_mode=2 的途经点
+  // 通过 submit_route 下发(见 handleStartNav)——实测 navi_mode=3
+  // (REFERENCE_PATH/initial_path)对全局路线的贴合度不稳定, 狗不一定真的顺着
+  // 那条参考线走, navi_mode=2 是逐点下发、逐点判到达的, 贴合度更可控。
   // waypoints 复用 Waypoint[] 类型但语义上只有 0 或 1 个元素——onChangeWaypoints
-  // 每次都只保留最新点选的那个(见下面 handleChangeGoalPoint), 右键删除时清空。
+  // 每次都只保留最新点选的那个(见下面 handleChangeGoalPoint), 右键删除时清空;
+  // 这只是"用户点的目标在哪", 不是真正下发给 planner 的那份途经点列表(那份是
+  // plan_path 规划出来的一串拐点, 见 handleStartNav)。
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
   // 是否处于"设置目标点"模式: 3D 用 PointCloudView 的 routeEditMode prop, 2D 用
   // TopView 的 editable prop, 两边同一个开关, 切换 2D/3D 时这个状态原样保留。
@@ -182,23 +192,21 @@ export default function MapPreviewPage() {
   const [routeEditing, setRouteEditing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [navError, setNavError] = useState<string | null>(null);
-  // navRunning 只反映 RouteManager 的状态机(navi_mode=2, submit_route 那条
-  // 链路), 跟这个面板走的 plan_path/navi_mode=3 无关(见 route_manager.py
-  // 顶部的类注释), 保留给"路线预览"那边复用同一套互斥禁用逻辑。
+  // navRunning 直接反映 RouteManager 的状态机(navi_mode=2, submit_route 那条
+  // 链路)——这个面板自己的「开始导航」现在也走这条链路(见 handleStartNav),
+  // 所以 navRunning 既是"这个面板是不是正在导航中"的信号, 也是跟下面"路线
+  // 预览"互斥禁用要用的同一个状态, 不需要再像 navi_mode=3 时代那样另外维护
+  // 一个 navDispatchActive: 到达终点/planner 急停退出/手动停止都会让
+  // RouteManager 的 state 自动变回非 running(见 route_manager.py
+  // on_planning_finished/_advance_reached_locked/estop), 「停止导航」按钮的
+  // 状态因此也会跟着自动复位, 不需要额外的信号。
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
-  // navDispatchActive: navi_mode=3 是否正有一条参考路线在跑, 直接读后端广播
-  // 的 NavStatus.reference_path_active(见 route_manager.mark_reference_path_
-  // dispatched/on_planning_finished/estop)——用 liveStatus(要求 map_name
-  // 精确匹配这张地图), 不用 displayStatus: 后者在 liveStatus 缺失时会退回
-  // 原始 status 且不清空 reference_path_active 字段(只清 state/current_index
-  // 那两个), 会把"其它地图正在跑"误当成"这张地图正在跑"。到达终点/急停退出/
-  // 手动停止都由后端广播同步过来, 不需要这页自己猜"是不是跑完了"。
-  const navDispatchActive = Boolean(liveStatus?.reference_path_active);
-  // plan_path(publish=true)下发成功后返回的参考路线, 单纯用来在地图上画出来
-  // (跟"这条导航是不是还在跑"是两回事, 见上面 navDispatchActive)——完成/
-  // 失败之后仍然留着当"最近一次下发的路线"看, 不跟着自动清空; 只有换地图或
-  // 点"停止导航"才清, 参考 NavigatePage 的 trail(跑完了也留着能回看)。
+  // plan_path(publish=false)规划出来、再通过 submit_route(navi_mode=2)下发
+  // 下去的那条参考路线, 单纯用来在地图上画出来(跟"是不是正在跑"是两回事,
+  // 那个用上面的 navRunning)——完成/失败之后仍然留着当"最近一次下发的路线"看,
+  // 不跟着自动清空; 只有换地图、点"停止导航"或"清空目标点"才清, 参考
+  // NavigatePage 的 trail(跑完了也留着能回看)。
   const [dispatchedRoute, setDispatchedRoute] = useState<PlannedRoutePoint[] | null>(null);
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
@@ -310,29 +318,42 @@ export default function MapPreviewPage() {
 
   /** 起点用机器狗当前位姿(displayStatus.robot_pose, 逻辑同"显示当前位置"那部分
    *  ——不按地图过滤, 见 hasPose 声明处的注释), 终点是面板里点选的那个目标点。
-   *  跟"路线预览"的 handleFinishStartGoalPick 共用同一个 plan_path 接口, 区别
-   *  是这里 publish 传 true, 真的会下发 /initial_path 让机器狗动——所以除了
-   *  规划本身失败(接口抛错)之外, 还要额外处理"规划成功但下发失败"这种情况
-   *  (published=false, 比如 ROS bridge 没起来/没有 navi_mode=3 订阅者), 不能
-   *  像"路线预览"那样直接忽略 published/publishError。 */
+   *
+   *  跟"路线预览"的 handleFinishStartGoalPick 共用同一个 plan_path 接口
+   *  (global_planner.py 的 A* + line-of-sight 剪枝, 见该模块 docstring), 但
+   *  publish 传 false——不走 navi_mode=3(/initial_path)下发, 只要规划结果。
+   *  规划出来的 points 本身就已经是剪枝后的稀疏关键拐点(不是密集网格路径,
+   *  navi_mode=3 的剪枝逻辑对 navi_mode=2 同样适用: 都是"给关键拐点, 不需要
+   *  密集重采样"), 直接当 navi_mode=2 的途经点通过 submit_route 下发:
+   *
+   *    - points[0] 是规划起点(A* 量化到栅格后的自由格, 约等于机器狗当前位置
+   *      但不完全重合), 不当成一个要"到达"的途经点下发——机器狗已经在那儿了,
+   *      硬塞一个当前位置附近的点只会让它先原地拐一下再走。真正下发的是
+   *      points[1:]; 规划出来只有起点一个点(起终点落在同一格这种退化情况)
+   *      时退回用最后一个点兜底, 保证至少发一个目标。
+   *    - 每个途经点的朝向按"上一个点 -> 这个点"算, 跟 handleChangeGoalPoint/
+   *      TopView.handleClick 用的是同一个策略(而不是留给后端默认的 0)。
+   *
+   *  submit_route 走的是 RouteManager 的状态机(navi_mode=2), 到达终点/
+   *  planner 急停退出/手动停止都会自动把 state 带出 running, 不需要再像
+   *  navi_mode=3 时代那样自己维护一个"是否在跑"的信号(见 navRunning 声明处
+   *  的注释)。 */
   async function handleStartNav() {
     const goal = waypoints[0];
     if (!goal || !pose) return;
     setSubmitting(true);
     setNavError(null);
     try {
-      const result = await planPath(name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, true);
-      if (!result.published) {
-        setNavError(result.publishError ?? "路径规划成功, 但下发失败");
-        return;
-      }
-      // 只有真的发下去了(published=true)才画出来——published=false 时机器狗
-      // 压根没收到这条路径, 画一条实际没在走的路线只会误导。是不是"进入了
-      // 导航中"由后端广播的 reference_path_active 决定(见 navDispatchActive
-      // 声明处的注释), 不是这里的本地状态。开新一趟前把上一趟的轨迹清掉,
-      // 理由同 NavigatePage 的 handleStart。
+      const planned = await planPath(name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, false);
+      const corners = planned.points.slice(1);
+      const toDispatch = corners.length > 0 ? corners : planned.points.slice(-1);
+      const dispatchWaypoints: Waypoint[] = toDispatch.map((p, i) => {
+        const prev = i === 0 ? planned.points[0] : toDispatch[i - 1];
+        return { x: p.x, y: p.y, yaw: Math.atan2(p.y - prev.y, p.x - prev.x) };
+      });
+      await submitRoute(dispatchWaypoints, name);
       setTrail([]);
-      setDispatchedRoute(result.points);
+      setDispatchedRoute(planned.points);
       setRouteEditing(false);
     } catch (e) {
       setNavError(String(e));
@@ -341,11 +362,10 @@ export default function MapPreviewPage() {
     }
   }
 
-  /** 停止刚才这个面板下发的导航(navi_mode=3)。estop() 现在不再要求后端
-   *  RouteManager 状态机处于 running 才能调(见 route_manager.estop 的说明,
-   *  navi_mode=3 本来就不会让那个状态机进 running), 真正的安全网在后端:
-   *  planner 没在跑(没有订阅者接住这条 /planning/emergency_stop)会报错,
-   *  这里如实把错误显示出来, 不吞掉。 */
+  /** 停止当前导航(/planning/emergency_stop, 不区分 navi_mode)。estop() 不
+   *  要求后端 RouteManager 状态机处于 running 才能调, 真正的安全网在后端:
+   *  planner 没在跑(没有订阅者接住这条 stop 消息)会报错, 这里如实把错误
+   *  显示出来, 不吞掉。 */
   async function handleStopNav() {
     setSubmitting(true);
     setNavError(null);
@@ -430,7 +450,7 @@ export default function MapPreviewPage() {
               pointcloudMeta={info.pointcloud_meta}
               waypoints={waypoints}
               showWaypointNumbers={false}
-              status={displayStatus}
+              status={goalMarkerStatus}
               trail={isActive ? trail : null}
               optimalTraj={isActive && !optimalTrajHidden ? optimalTraj : null}
               heightLimit={effectiveHeightLimit}
@@ -465,7 +485,7 @@ export default function MapPreviewPage() {
                 onChangeStartGoal={setStartGoal}
                 plannedRoute={plannedRoute}
                 navRoute={isActive ? dispatchedRoute : null}
-                status={displayStatus}
+                status={goalMarkerStatus}
                 maxWidth={viewportSize.width}
                 maxHeight={viewportSize.height}
                 defaultZoom={1}
@@ -653,9 +673,9 @@ export default function MapPreviewPage() {
                         icon={MapPin}
                         label={routeEditing ? "取消设置目标点" : "设置目标点"}
                         active={routeEditing}
-                        disabled={navRunning || navDispatchActive || startGoalPicking}
+                        disabled={navRunning || startGoalPicking}
                         title={
-                          navRunning || navDispatchActive ? "导航进行中不能设置目标点"
+                          navRunning ? "导航进行中不能设置目标点"
                             : startGoalPicking ? "设置起终点中, 先点「设置完成」"
                               : undefined
                         }
@@ -664,8 +684,8 @@ export default function MapPreviewPage() {
                       <PanelButton
                         icon={Trash2}
                         label="清空目标点"
-                        disabled={waypoints.length === 0 || submitting || navRunning || navDispatchActive}
-                        title={navRunning || navDispatchActive ? "导航进行中不能清空目标点" : undefined}
+                        disabled={waypoints.length === 0 || submitting || navRunning}
+                        title={navRunning ? "导航进行中不能清空目标点" : undefined}
                         // 顺带清掉维持在图上的所有"上一趟导航"残留——导航进行中
                         // 本来就禁用这颗按钮(见上面 disabled), 能点到这里说明上一趟
                         // 导航(如果有)已经结束, 这些都只是"最近一次的回看", 跟目标点
@@ -681,7 +701,7 @@ export default function MapPreviewPage() {
                           setOptimalTrajHidden(true);
                         }}
                       />
-                      {navDispatchActive ? (
+                      {navRunning ? (
                         <PanelButton
                           icon={OctagonX}
                           label={submitting ? "停止中…" : "停止导航"}
@@ -702,9 +722,9 @@ export default function MapPreviewPage() {
                 )}
 
                 {/* 独立于上面的"导航控制": 两边都是 global_planner.plan_path
-                    算出参考路线补好 z, 走的是同一条 navi_mode=3(/initial_path)
-                    链路, 区别是这里起终点都要手动点选, 且调用 planPath 时
-                    publish 恒传 false, 只看规划结果, 不会真的下发让机器狗动。
+                    算出参考路线补好 z, 调用 planPath 时 publish 都传 false——
+                    区别是这里起终点要手动点选两个, 且规划结果只用来看, 不会像
+                    "导航控制"那样接着调 submit_route 真的下发让机器狗动。
                     3D/2D 都支持拾取(见 startGoalPickMode 相关的 PointCloudView/
                     TopView props)。 */}
                 <PanelSection title="路线预览">
