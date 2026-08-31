@@ -25,7 +25,7 @@ from typing import Dict, Optional
 import numpy as np
 
 from . import config
-from .map_registry import clear_localization_link, validate_map_name
+from .map_registry import MapRegistry, clear_localization_link, validate_map_name
 from .models import MappingState, MappingStatus
 from .ros_bridge import RosBridge
 from .route_manager import point_array_to_json_list
@@ -43,9 +43,14 @@ def _find_mode(mode_id: str) -> Dict[str, str]:
 
 
 class MappingManager:
-    def __init__(self, ros_bridge: RosBridge, ws_manager: WebSocketManager) -> None:
+    def __init__(self, ros_bridge: RosBridge, ws_manager: WebSocketManager, map_registry: MapRegistry) -> None:
         self._ros_bridge = ros_bridge
         self._ws_manager = ws_manager
+        # 开始建图时要同步清掉 map_registry 里"当前激活地图"的记账(见 start()
+        # 里调用 map_registry.clear_active() 的说明), 所以需要拿到同一个
+        # MapRegistry 实例, 不是新建一个——地图列表接口(main.py 的 /api/maps)
+        # 读的也必须是这同一个实例, 不然两边状态各记各的, 还是会对不上。
+        self._map_registry = map_registry
         self._lock = threading.Lock()
         self._state = MappingState.IDLE
         self._mode_id: Optional[str] = None
@@ -103,6 +108,11 @@ class MappingManager:
         # 或者上次建图失败留下的真实目录——两种都清掉, 摘链接不删任何地图数据,
         # 真实目录直接删(打日志警告), 见该函数的说明。
         clear_localization_link()
+        # 上面这行摘掉/清空的正是 activate_map 建的那个软链接, 之前激活的地图
+        # (如果有)现在已经没有真的处于"激活"状态了——同步清掉 map_registry
+        # 里的记账, 不然 GET /api/maps 会一直显示一张其实已经不再激活的地图
+        # (见 MapRegistry.clear_active 的说明)。
+        self._map_registry.clear_active()
 
         with self._lock:
             if self._state in (MappingState.RUNNING, MappingState.SAVING):

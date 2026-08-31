@@ -37,23 +37,53 @@ def validate_map_name(name: str) -> None:
         raise ValueError(f"非法地图名: {name!r}")
 
 
+_RM_TIMEOUT_S = 10.0
+
+
+def _rm_rf(path: Path) -> None:
+    """删 path(可能是软链接/真实目录/文件), 走特权命令(config.RM_SUDO_CMD),
+    不是 Python 自己 path.unlink()/shutil.rmtree()——建图服务的 systemd 单元是
+    用 root 起的, 建图/保存过程中在 config.SAVE_MAP_DIR 这个路径下产出的目录/
+    文件是 root 所有, 就算跑后端的用户对上级目录有写权限、摘得掉软链接本身,
+    shutil.rmtree 递归删 root 建的子目录/文件时很容易半路 PermissionError。
+    跟 service_manager.systemctl_action 用同一套 sudo -n 特权命令模式。
+
+    'rm -rf' 对软链接只删链接本身、不会顺着链接删掉目标(跟原来
+    path.unlink() 对符号链接的行为一致), 对真实目录/文件也是预期行为, 三种
+    情况用同一条命令处理, 不用分开调用不同的删除方式。
+
+    失败(sudoers 没配好等)抛 RuntimeError, 不吞掉——真删不掉的话紧接着
+    activate_map/mapping_manager.start 尝试在这个路径建新软链接会失败在"目标
+    已存在"上, 不如让真正的原因(rm 失败, 多半是权限没配对)直接透给调用方。"""
+    cmd = [*config.RM_SUDO_CMD, str(path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_RM_TIMEOUT_S)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"清空 {path} 超时") from e
+    except OSError as e:
+        raise RuntimeError(f"清空 {path} 执行失败: {e}") from e
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit={result.returncode}"
+        raise RuntimeError(f"清空 {path} 失败: {detail}")
+
+
 def clear_localization_link() -> None:
     """清空 config.SAVE_MAP_DIR 这个共享槽位。建图服务(把原始产出写进这里,
     见 mapping_manager.start)和 localization.service(启动时只认死这一个固定
     路径, 不接受传参指定用哪张图)同一时刻只能有一边在用这个路径——是软链接就
     直接摘掉(不管指向哪张图, 摘链接本身不删任何地图数据); 是真实目录/文件就
-    直接删掉、打日志警告一声, 不 raise——建图服务自己 start_save_map.bash
-    保存时本来就会整个覆写这个路径(见 mapping_manager._run_save), 这里跟它
-    保持同一个尺度, 没必要比它还谨慎地挡住用户。"""
+    直接删掉、打日志警告一声——建图服务自己 start_save_map.bash 保存时本来就
+    会整个覆写这个路径(见 mapping_manager._run_save), 这里跟它保持同一个
+    尺度, 不要求用户先手动确认才让删这一步。真正的删除动作见 _rm_rf 的说明。"""
     path = Path(config.SAVE_MAP_DIR)
     if path.is_symlink():
-        path.unlink()
+        _rm_rf(path)
     elif path.is_dir():
         logger.warning("%s 是残留的真实目录(不是软链接), 直接删除清空", path)
-        shutil.rmtree(path)
+        _rm_rf(path)
     elif path.exists():
         logger.warning("%s 是残留的文件(不是软链接), 直接删除清空", path)
-        path.unlink()
+        _rm_rf(path)
 
 
 def _is_valid_map_dir(path: Path) -> bool:
@@ -215,6 +245,25 @@ class MapRegistry:
         self._save_active(None)
         clear_localization_link()
         logger.info("deactivated map=%s", name)
+
+    def clear_active(self) -> None:
+        """无条件清掉"当前激活地图"这一笔记录(内存 + 持久化), 不管现在激活的
+        是哪张、也不摘 config.SAVE_MAP_DIR 的软链接——mapping_manager.start()
+        开始建图时调这个: 它自己已经在调 clear_localization_link() 摘掉/清空
+        了那个共享槽位(建图服务要把原始产出写进去), 这里只是同步 navibot 这边
+        的 active 记账, 两件事分开是因为 mapping_manager 只认 map_registry 里
+        这几个方法, 不需要、也不应该知道 clear_localization_link 内部干了什么。
+
+        不做跟 deactivate_map 一样的"确认 name 匹配"检查: 开始建图这个动作
+        本身就是"不管之前激活的是谁, 反正现在没有激活地图了"(建图服务马上要
+        独占那个共享路径), 不需要先知道具体是哪张。不调这个方法的话
+        self._active 会一直停在建图开始前的值, 跟磁盘上的真实状态(软链接已经
+        被 mapping_manager.start 摘掉/清空)对不上, GET /api/maps 会一直显示
+        一张其实已经不再激活的地图。"""
+        with self._lock:
+            self._active = None
+        self._save_active(None)
+        logger.info("cleared active map (mapping started)")
 
     def list_maps(self) -> List[MapInfo]:
         infos = (self.get_map_info(name) for name in self.list_map_names())

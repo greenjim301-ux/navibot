@@ -131,7 +131,7 @@ async def on_startup() -> None:
         on_mapping_surf_cloud=_on_mapping_surf_cloud,
     )
     route_manager = RouteManager(ros_bridge, ws_manager)
-    mapping_manager = MappingManager(ros_bridge, mapping_ws_manager)
+    mapping_manager = MappingManager(ros_bridge, mapping_ws_manager, map_registry)
     ros_bridge.start()
     logger.info("navibot backend started")
 

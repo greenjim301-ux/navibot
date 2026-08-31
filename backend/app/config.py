@@ -306,3 +306,9 @@ SAVE_MAP_SCRIPT = os.environ.get("NAVIBOT_SAVE_MAP_SCRIPT", "/home/cat/start_sav
 # 单一数据源, 不再定义一个可能跟它对不上的新常量。
 SAVE_MAP_DIR = os.path.dirname(HANDBOT_SLAM_MAP_DIR)
 SAVE_MAP_TIMEOUT_S = float(os.environ.get("NAVIBOT_SAVE_MAP_TIMEOUT_S", "180.0"))
+# map_registry.clear_localization_link 清空 SAVE_MAP_DIR 用的特权命令——建图
+# 服务的 systemd 单元是用 root 起的, 建图/保存过程中在这个路径下产出的目录/
+# 文件是 root 所有, 跑后端的用户不一定删得动(尤其是 shutil.rmtree 递归删
+# root 建的子目录), 跟 SYSTEMCTL_SUDO_CMD 一样用 sudo -n 包一层, 部署时要配
+# 对应的 sudoers NOPASSWD 规则(见 README「建图」一节)。
+RM_SUDO_CMD = os.environ.get("NAVIBOT_RM_SUDO_CMD", "sudo -n rm -rf").split()

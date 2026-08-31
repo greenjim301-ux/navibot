@@ -246,16 +246,37 @@ keyframe_info_3d.txt}` + `2d_map/{map_2d.pgm,map_2d.yaml}`）跟
    地图数据）；已经是真实目录/文件（比如建图保存失败留下的残留）就**直接删掉，
    打一条 warning 日志**，不拒绝、不需要人工确认——建图服务自己
    `start_save_map.bash` 保存时本来就会整个覆写这个路径（见
-   `mapping_manager._run_save`），这里跟它保持同一个尺度。
+   `mapping_manager._run_save`），这里跟它保持同一个尺度。真正的删除动作走
+   `map_registry._rm_rf`（`sudo -n rm -rf`，见下面的特权说明），不是 Python
+   自己 `unlink`/`shutil.rmtree`——建图服务的 systemd 单元是 root 起的，这个
+   路径下产出的目录/文件是 root 所有，`shutil.rmtree` 递归删 root 建的子目录
+   很容易半路 `PermissionError`。
 
 `deactivate_map`/`delete_map`（删除的正好是激活地图时）也会顺带摘掉这个软链接，
 让"没有激活地图"这个状态和磁盘上 `localization.service` 实际会读到的内容保持
 一致。`mapping_manager.start`（见上面「建图」一节）复用的是同一个
 `clear_localization_link`——开始新建图前会先清空可能残留的旧激活软链接/残留
-目录，不然建图服务会把数据写进当前激活地图的目录里，或者跟残留目录混在一起。
+目录，不然建图服务会把数据写进当前激活地图的目录里，或者跟残留目录混在一起；
+同时会调 `MapRegistry.clear_active()` 把 `map_registry` 里"当前激活地图"的记账
+也清掉——`clear_localization_link` 只管磁盘上那个软链接，不知道 `navibot`
+自己在内存/`_active_map.json` 里记了哪张图是激活的，这两处状态本来是分开维护
+的，不特意同步一次的话，`GET /api/maps` 会在整个建图会话期间一直显示一张其实
+已经不再激活的旧地图（因为它的软链接已经被上面这行摘掉了）。
 
-**这一整块（激活时的状态检查、软链接创建/摘除）都没有在真实机器上验证过**，
-见下面「已知缺口」。
+**部署时需要额外配一条 `rm` 的 sudoers 规则**（跟「服务状态管理」那节的
+`systemctl` 规则是分开的两条），默认命令是 `sudo -n rm -rf`（`NAVIBOT_RM_SUDO_CMD`
+可覆盖），只放行对 `config.SAVE_MAP_DIR` 这一个固定路径执行，例如：
+
+```
+# /etc/sudoers.d/navibot-mapping
+<backend-user> ALL=(root) NOPASSWD: /bin/rm -rf /home/cat/handbot_slam/catkin_ws_grslam/save_map
+```
+
+没配这条规则时，开始建图（如果这个路径上有残留的软链接/真实目录）或激活地图
+会在页面上收到 500 和 `rm`/`sudo` 的报错文本，不是静默失败或删不干净还继续跑。
+
+**这一整块（激活时的状态检查、软链接创建/摘除、`rm` 特权命令）都没有在真实
+机器上验证过**，见下面「已知缺口」。
 
 ---
 
@@ -350,9 +371,11 @@ keyframe_info_3d.txt}` + `2d_map/{map_2d.pgm,map_2d.yaml}`）跟
   `map_registry.py` 的 `activate_map`/`clear_localization_link` 假定
   `localization.service` 只在启动时读一次 `config.SAVE_MAP_DIR`（之后不管软
   链接怎么变都不受影响），以及跑后端的用户对 `/home/cat/handbot_slam/...`
-  这条路径有创建软链接的权限——这两条都是推断，没有拿真实的 localization
-  相关代码/权限配置核对过。见「激活地图 与 localization.service 共用的固定
-  路径」一节。
+  这条路径的**父目录**有创建软链接的权限（这条本身不需要特权，`sudo -n rm
+  -rf` 管的是删这个路径本身，不是它的父目录）——这两条都是推断，没有拿真实的
+  localization 相关代码/权限配置核对过。`RM_SUDO_CMD` 对应的 sudoers 规则
+  （见上面「建图」一节）也还没在机器上实际配过、验证过报错文本是否可读。见
+  「激活地图 与 localization.service 共用的固定路径」一节。
 - **服务依赖关系（`SERVICE_DEPENDENCIES`/`MAPPING_MODE_DEPENDENCIES`）是按
   用户口述的依赖列出来的，没有拿板子上的实际配置核对过。** 如果实际依赖关系
   跟这两张表不一致（比如还有表里没列的依赖，或者某条依赖其实反了），后果分
