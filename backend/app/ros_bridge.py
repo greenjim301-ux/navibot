@@ -17,6 +17,7 @@ from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Empty
 from visualization_msgs.msg import Marker
+import tf
 import tf.transformations as tft
 
 from . import config
@@ -32,8 +33,18 @@ SelfInflationCallback = Callable[[dict], None]
 # 膨胀地图整片点云, 拍平成 float32 一维数组 [x0,y0,z0, x1,y1,z1, ...] (每次整片
 # 替换, 不是增量) —— 见 _decode_xyz_flat, 不再是 Python list。
 InflationMapCallback = Callable[[np.ndarray], None]
-# 雷达实时点云 (/surf_cloud_in_map), 同样拍平成 float32 一维数组, 每帧整体替换
+# 雷达实时点云 (SURF_CLOUD_TOPIC, 默认 /hand_lio/clouds_lidar, 未降采样——跟建图页
+# 用的 MAPPING_SURF_CLOUD_TOPIC/surf_cloud_in_map 是两个不同的话题, 见 config.py
+# 里两个常量各自的说明), 同样拍平成 float32 一维数组, 每帧整体替换
 SurfCloudCallback = Callable[[np.ndarray], None]
+# 建图页专用: (x, y, z, yaw, stamp), 来自 /tf(map -> latest_lidar), 不是
+# ODOM_TOPIC——建图模式下 SCAN-Planner 不跑, 没有 cov 这个概念(不是 EKF 融合出
+# 来的, 没有对应的定位质量标量), 比 PoseCallback 少一个字段。
+MappingPoseCallback = Callable[[float, float, float, float, float], None]
+# 建图页的两路点云(/surround_map_cloud、建图页专用的 /surf_cloud_in_map 订阅),
+# 跟 SurfCloudCallback 同样的拍平数组约定, 单独起名只是为了在 __init__ 里跟
+# 导航页那几个参数区分开, 不是不同的数据形状。
+MappingCloudCallback = Callable[[np.ndarray], None]
 
 # PointField.datatype -> numpy 单字符类型码, 给 _decode_xyz_flat 拼结构化 dtype 用。
 _POINTFIELD_DATATYPE_CHAR = {
@@ -118,6 +129,9 @@ class RosBridge:
         on_inflation_map: Optional[InflationMapCallback] = None,
         on_surf_cloud: Optional[SurfCloudCallback] = None,
         on_planning_finished: Optional[PlanningFinishedCallback] = None,
+        on_mapping_pose: Optional[MappingPoseCallback] = None,
+        on_mapping_surround_cloud: Optional[MappingCloudCallback] = None,
+        on_mapping_surf_cloud: Optional[MappingCloudCallback] = None,
     ) -> None:
         self._on_pose = on_pose
         self._on_optimal_traj = on_optimal_traj
@@ -125,12 +139,23 @@ class RosBridge:
         self._on_inflation_map = on_inflation_map
         self._on_surf_cloud = on_surf_cloud
         self._on_planning_finished = on_planning_finished
+        self._on_mapping_pose = on_mapping_pose
+        self._on_mapping_surround_cloud = on_mapping_surround_cloud
+        self._on_mapping_surf_cloud = on_mapping_surf_cloud
         self._wp_pub: Optional[rospy.Publisher] = None
         self._initial_path_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
         self._self_inflation_sub: Optional[rospy.Subscriber] = None
         self._inflation_map_sub: Optional[rospy.Subscriber] = None
         self._surf_cloud_sub: Optional[rospy.Subscriber] = None
+        # 建图页专用的三样东西, 一起靠 set_mapping_enabled 开关(见该方法说明),
+        # 跟上面几个导航页的"分别勾选"开关是独立的一套。
+        self._mapping_surround_cloud_sub: Optional[rospy.Subscriber] = None
+        self._mapping_surf_cloud_sub: Optional[rospy.Subscriber] = None
+        self._mapping_tf_timer: Optional[rospy.Timer] = None
+        self._tf_listener: Optional[tf.TransformListener] = None
+        self._last_mapping_surround_cloud_emit_at = 0.0
+        self._last_mapping_surf_cloud_emit_at = 0.0
         self._started = False
         # 这四个纯展示话题的限流(*_BROADCAST_HZ)在这一层做, 不在 route_manager——
         # 挡在解码之前, 没通过限流的消息直接丢, 不用白花 CPU 解码一份马上要扔掉的
@@ -164,11 +189,17 @@ class RosBridge:
                 rospy.Subscriber(
                     config.PLANNING_FINISHED_TOPIC, rospy.AnyMsg, self._handle_planning_finished, queue_size=5,
                 )
+            if self._on_mapping_pose is not None:
+                # 常驻创建(建图不建图都在), 开销是内部维护一份 tf 缓冲区, 可
+                # 忽略——真正"要不要用"由 set_mapping_enabled 控制的那个
+                # rospy.Timer 决定, 这里只是提前把监听器建好。
+                self._tf_listener = tf.TransformListener()
             logger.info(
                 "ROS bridge started: waypoints=%s initial_path=%s estop=%s odom=%s optimal_traj=%s "
-                "planning_finished=%s frame=%s",
+                "planning_finished=%s frame=%s mapping_pose=%s->%s",
                 config.PRESET_WAYPOINTS_TOPIC, config.INITIAL_PATH_TOPIC, config.EMERGENCY_STOP_TOPIC,
                 config.ODOM_TOPIC, config.OPTIMAL_TRAJ_TOPIC, config.PLANNING_FINISHED_TOPIC, config.MAP_FRAME,
+                config.MAPPING_TF_MAP_FRAME, config.MAPPING_TF_BODY_FRAME,
             )
             rospy.spin()
 
@@ -317,10 +348,13 @@ class RosBridge:
                 self._inflation_map_sub = None
 
     def _handle_surf_cloud(self, msg: PointCloud2) -> None:
-        """/surf_cloud_in_map: hand-lio 降采样+畸变校正后的当前帧激光点云, 已经
-        转到 map 系, 5Hz。只取 x/y/z, 解码完按 SURF_CLOUD_VOXEL_SIZE_M 做体素
-        去重降采样(理由同 _handle_inflation_map)——每帧整体替换, 不在这里做
-        叠加。
+        """SURF_CLOUD_TOPIC(默认 /hand_lio/clouds_lidar): hand_lio 侧当前帧激光
+        点云, 已转到 map 系, **没有降采样**——特意选的未降采样版本, 地图预览页
+        对比过, 展示效果比 hand-topic.csv 里标"降采样后"的 /surf_cloud_in_map
+        更好(那条是建图页用的 MAPPING_SURF_CLOUD_TOPIC, 见 config.py), 两个
+        话题不要混用。只取 x/y/z, 解码完按 SURF_CLOUD_VOXEL_SIZE_M 做体素
+        去重降采样(理由同 _handle_inflation_map, 这一步降采样是我们自己做的,
+        跟话题本身有没有降采样是两回事)——每帧整体替换, 不在这里做叠加。
 
         按 SURF_CLOUD_BROADCAST_HZ 限流, 同样挡在解码之前, 理由同
         _handle_inflation_map。"""
@@ -347,6 +381,86 @@ class RosBridge:
             if self._surf_cloud_sub is not None:
                 self._surf_cloud_sub.unregister()
                 self._surf_cloud_sub = None
+
+    def _handle_mapping_surround_cloud(self, msg: PointCloud2) -> None:
+        """/surround_map_cloud: 建图模式下是"当前位姿附近的局部地图点云", 随
+        关键帧更新(见 hand-topic.csv)——不是增量, 每次整片重发, 解码/降采样/
+        限流跟 _handle_inflation_map 是同一套做法, 只是用建图页专属的时间戳和
+        回调, 不跟导航页的任何订阅共用状态。"""
+        now = time.time()
+        if now - self._last_mapping_surround_cloud_emit_at < 1.0 / config.SURROUND_MAP_CLOUD_BROADCAST_HZ:
+            return
+        self._last_mapping_surround_cloud_emit_at = now
+        assert self._on_mapping_surround_cloud is not None
+        points = _decode_xyz_flat(msg)
+        points = _voxel_downsample_flat(points, config.SURROUND_MAP_CLOUD_VOXEL_SIZE_M)
+        self._on_mapping_surround_cloud(points)
+
+    def _handle_mapping_surf_cloud(self, msg: PointCloud2) -> None:
+        """建图页专属的 MAPPING_SURF_CLOUD_TOPIC(/surf_cloud_in_map)订阅——
+        注意这跟导航页"雷达点云"勾选框订阅的 SURF_CLOUD_TOPIC
+        (/hand_lio/clouds_lidar)是两个不同的话题, 不是同一个话题开两个订阅者:
+        /surf_cloud_in_map 是 hand-lio 已经降采样过的版本, 建图页只要"大致扫到
+        哪里"的提示, 没必要用导航页那份为了展示细节特意选的未降采样点云。见
+        config.py 里 MAPPING_SURF_CLOUD_TOPIC 的说明。限流/降采样复用同一套
+        SURF_CLOUD_BROADCAST_HZ/SURF_CLOUD_VOXEL_SIZE_M 常量(这两个只是"多快
+        转发一次""降采样格子多大", 跟具体是哪个话题无关, 没必要为建图页单独
+        定义一份)。"""
+        now = time.time()
+        if now - self._last_mapping_surf_cloud_emit_at < 1.0 / config.SURF_CLOUD_BROADCAST_HZ:
+            return
+        self._last_mapping_surf_cloud_emit_at = now
+        assert self._on_mapping_surf_cloud is not None
+        points = _decode_xyz_flat(msg)
+        points = _voxel_downsample_flat(points, config.SURF_CLOUD_VOXEL_SIZE_M)
+        self._on_mapping_surf_cloud(points)
+
+    def _handle_mapping_tf(self, _event) -> None:
+        """rospy.Timer 回调, 周期性地查 MAPPING_TF_MAP_FRAME -> MAPPING_TF_BODY_FRAME
+        的变换当机器狗当前位置。查不到(tf 缓冲区还没填满、帧名对不上等)直接
+        跳过这一次, 不报错——下一个 tick 再试, 跟 rviz 的 TF 显示是同一种
+        "缺帧就先不画"的容错方式。"""
+        assert self._on_mapping_pose is not None and self._tf_listener is not None
+        try:
+            (tx, ty, tz), rot = self._tf_listener.lookupTransform(
+                config.MAPPING_TF_MAP_FRAME, config.MAPPING_TF_BODY_FRAME, rospy.Time(0),
+            )
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return
+        _, _, yaw = tft.euler_from_quaternion(rot)
+        self._on_mapping_pose(tx, ty, tz, yaw, time.time())
+
+    def set_mapping_enabled(self, enabled: bool) -> None:
+        """建图页整页一次性开关: /surround_map_cloud + 建图页专用的
+        /surf_cloud_in_map 订阅 + TF 位姿轮询定时器, 三个一起开一起关——建图页
+        不像导航页那样有"分别勾选"的粒度, 进页面就是要看全部, 离开/建图结束
+        就都不需要了。"""
+        if not self._started:
+            raise RuntimeError("ROS bridge 尚未启动")
+        if enabled:
+            if self._mapping_surround_cloud_sub is None:
+                self._mapping_surround_cloud_sub = rospy.Subscriber(
+                    config.SURROUND_MAP_CLOUD_TOPIC, PointCloud2, self._handle_mapping_surround_cloud,
+                    queue_size=2,
+                )
+            if self._mapping_surf_cloud_sub is None:
+                self._mapping_surf_cloud_sub = rospy.Subscriber(
+                    config.MAPPING_SURF_CLOUD_TOPIC, PointCloud2, self._handle_mapping_surf_cloud, queue_size=2,
+                )
+            if self._mapping_tf_timer is None and self._tf_listener is not None:
+                self._mapping_tf_timer = rospy.Timer(
+                    rospy.Duration(1.0 / config.MAPPING_POSE_BROADCAST_HZ), self._handle_mapping_tf,
+                )
+        else:
+            if self._mapping_surround_cloud_sub is not None:
+                self._mapping_surround_cloud_sub.unregister()
+                self._mapping_surround_cloud_sub = None
+            if self._mapping_surf_cloud_sub is not None:
+                self._mapping_surf_cloud_sub.unregister()
+                self._mapping_surf_cloud_sub = None
+            if self._mapping_tf_timer is not None:
+                self._mapping_tf_timer.shutdown()
+                self._mapping_tf_timer = None
 
     def publish_waypoints(self, waypoints: List[dict]) -> None:
         """下发一整轮路线。waypoints 里的 z 必须已经是 odom 系机体高度。

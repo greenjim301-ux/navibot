@@ -15,7 +15,7 @@ from .ws_manager import WebSocketManager
 logger = logging.getLogger("navibot.route_manager")
 
 
-def _point_array_to_json_list(points: np.ndarray) -> List[float]:
+def point_array_to_json_list(points: np.ndarray) -> List[float]:
     """膨胀地图/雷达点云(ros_bridge._decode_xyz_flat 出来的 float32 一维数组)
     转成能塞进 JSON 的普通 Python float 列表, round 到 3 位小数(毫米级, 展示用
     完全够)。
@@ -104,7 +104,7 @@ class RouteManager:
         # WS 收到的 ArrayBuffer 上)上线后浏览器标签页内存持续上涨、用一阵子就
         # 卡死, 具体是二进制这条链路本身的问题还是别的没能在没有真实浏览器的
         # 情况下查清楚, 先整体回退回验证过没有这个问题的 JSON 方案(见
-        # _point_array_to_json_list)。
+        # point_array_to_json_list)。
 
     # ---- 对外查询 ----
     def get_status(self) -> NavStatus:
@@ -454,7 +454,7 @@ class RouteManager:
         return payload
 
     def _inflation_map_payload_locked(self) -> dict:
-        return {"enabled": self._inflation_map_enabled, "points": _point_array_to_json_list(self._inflation_map)}
+        return {"enabled": self._inflation_map_enabled, "points": point_array_to_json_list(self._inflation_map)}
 
     def on_inflation_map(self, points: np.ndarray) -> None:
         """转发 /grid_map/occupancy_inflate 的一整片点云 (拍平的 float32
@@ -483,7 +483,7 @@ class RouteManager:
         return payload
 
     def _surf_cloud_payload_locked(self) -> dict:
-        return {"enabled": self._surf_cloud_enabled, "points": _point_array_to_json_list(self._surf_cloud)}
+        return {"enabled": self._surf_cloud_enabled, "points": point_array_to_json_list(self._surf_cloud)}
 
     def on_surf_cloud(self, points: np.ndarray) -> None:
         """转发 /surf_cloud_in_map 的当前帧点云(拍平的 float32 [x,y,z, ...]

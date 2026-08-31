@@ -92,13 +92,166 @@ mamba run -n ros_host python map_pipeline/generate_map_assets.py \
 cd frontend && npm install && npm run dev
 ```
 
-没有实机时，用模拟器验证整条链路（它刻意复刻了真 planner 的到达判据、跳点规则、frozen 行为）：
+没有实机时，用模拟器验证整条链路（它刻意复刻了真 planner 的到达判据、跳点规则、急停悬停确认行为）：
 
 ```bash
 mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 ```
 
 > `--start` 的 Z 是 **odom 系机体高度**（地面高程 + 传感器离地高度），不是离地高度本身。默认 `(0,0,0,0)` 在多数地图里都在墙里。
+
+---
+
+## 服务状态管理
+
+系统管理页有一张"服务状态"卡片，管 4 个固定的 systemd 单元（id/显示名/unit 名见
+`backend/app/config.py` 的 `SYSTEMD_SERVICES`，不接受任意 unit 名）：
+
+| id | 显示名 | systemd 单元 |
+|---|---|---|
+| `lidar` | 激光雷达 | `mid360.service` |
+| `camera` | 相机 | `camera.service` |
+| `localization` | 导航定位 | `localization.service` |
+| `planner` | 路线规划 | `ros-bringup.service` |
+
+对应接口：`GET /api/services`（3s 轮询查状态）、`POST /api/services/{id}/start`、
+`POST /api/services/{id}/stop`（`service_manager.py`）。查状态用 `systemctl show`，
+不需要特权；启动/停止需要特权，默认用 `sudo -n systemctl ...`（`-n` 非交互，没配
+免密的话直接报错而不是卡住等密码），可用 `NAVIBOT_SYSTEMCTL_SUDO_CMD` 覆盖。
+
+**这意味着部署到机器上时要单独配一条 sudoers 规则**，只放行跑后端的用户对这
+4 个单元执行 `start`/`stop`（仓库里没有现成的 unit 文件/sudoers 配置，这步要在
+机器上手动做），例如：
+
+```
+# /etc/sudoers.d/navibot-services
+<backend-user> ALL=(root) NOPASSWD: /bin/systemctl start mid360.service, \
+    /bin/systemctl stop mid360.service, \
+    /bin/systemctl start camera.service, /bin/systemctl stop camera.service, \
+    /bin/systemctl start localization.service, /bin/systemctl stop localization.service, \
+    /bin/systemctl start ros-bringup.service, /bin/systemctl stop ros-bringup.service, \
+    /bin/systemctl start cloud_mapping_small.service, /bin/systemctl stop cloud_mapping_small.service, \
+    /bin/systemctl start cloud_mapping_large.service, /bin/systemctl stop cloud_mapping_large.service, \
+    /bin/systemctl start color_mapping_small.service, /bin/systemctl stop color_mapping_small.service, \
+    /bin/systemctl start color_mapping_large.service, /bin/systemctl stop color_mapping_large.service
+```
+
+没配这条规则时，点"启动"/"停止"会在页面上收到 500 和 `sudo` 的报错文本（比如
+`sudo: a password is required`），不是静默失败。
+
+### 服务依赖关系
+
+`backend/app/config.py` 的 `SERVICE_DEPENDENCIES` + `MAPPING_MODE_DEPENDENCIES`
+声明了这几个 systemd 单元之间的依赖（只列直接依赖，间接依赖靠
+`service_manager.py` 里的传递闭包算法推出来）：
+
+- `localization.service` 依赖 `mid360.service`
+- `ros-bringup.service` 依赖 `localization.service`（因此间接依赖 `mid360.service`）
+- 建图服务（`cloud_mapping_*.service`）依赖 `mid360.service`
+- 彩色点云建图服务（`color_mapping_*.service`）额外依赖 `camera.service`
+
+这些 unit 文件本身没有声明 `Requires=`/`After=`（板子上是各自独立配置的脚本，
+不假设它们互相知道对方存在），依赖关系是在应用层做的：
+
+- **启动一个服务，会自动启动它依赖的服务**（没在跑才启动，见
+  `service_manager.start_with_dependencies`）——比如在系统管理页点"启动"
+  「路线规划」，会先确认「导航定位」和「激光雷达」都已经在跑，没跑就顺带启动；
+  「新建地图」选彩色建图模式同理，会先确认「激光雷达」和「相机」。
+- **停止一个服务，如果有其它正在运行的服务（直接或间接）依赖它，会拒绝**
+  （`service_manager.find_blocking_dependents`），报错里列出是哪些服务，
+  提示用户先停那些——比如「导航定位」还在跑的时候不能停「激光雷达」。
+
+**这一整套依赖解析没有在真实机器上验证过**，见「已知缺口」。
+
+---
+
+## 建图（新建地图）
+
+地图管理页的"新建地图"是一次性的建图会话：选模式 → 填地图名 → 后端启动对应
+systemd 服务 → 跳到建图页实时看点云 → 取消（丢弃）或保存。全局同时只有一个
+建图会话，逻辑在 `backend/app/mapping_manager.py`（状态机模式仿
+`route_manager.py`：`idle → running → (saving) → done/error`）。
+
+4 个互斥的建图模式（`backend/app/config.py` 的 `MAPPING_MODES`）：
+
+| id | 显示名 | systemd 单元 |
+|---|---|---|
+| `cloud_small` | 点云建图 · 室内小尺度 | `cloud_mapping_small.service`（面积 < 5000 ㎡） |
+| `cloud_large` | 点云建图 · 室外大尺度 | `cloud_mapping_large.service`（面积 ≥ 5000 ㎡） |
+| `color_small` | 彩色点云建图 · 室内小尺度 | `color_mapping_small.service`（面积 < 5000 ㎡） |
+| `color_large` | 彩色点云建图 · 室外大尺度 | `color_mapping_large.service`（面积 ≥ 5000 ㎡） |
+
+接口：`GET /api/mapping/modes`、`GET /api/mapping/status`、
+`POST /api/mapping/start`（body `{mode_id, map_name}`）、`POST /api/mapping/cancel`、
+`POST /api/mapping/save`；`/ws/mapping` 推 `mapping_status`/`mapping_pose`/
+`mapping_surround_cloud`/`mapping_surf_cloud` 四种消息（新连接补发最新一份快照，
+理由跟 `/ws/nav` 给 `surf_cloud` 补发一样）。启停服务复用「服务状态管理」那节
+的 `sudo -n systemctl` 机制（`service_manager.py` 里的 `systemctl_status`/
+`systemctl_action` 被两边共用），sudoers 规则要把上表 4 个单元也加进去（见上面
+的示例）。
+
+建图页看的三个数据源：
+
+- 位姿：`/tf`（`MAPPING_TF_MAP_FRAME`→`MAPPING_TF_BODY_FRAME`，默认
+  `map`→`latest_lidar`）——建图模式下 SCAN-Planner 不跑，没有
+  `/hand_lio/odom_vehicle`，只能查 TF。帧名取自
+  `HandBot-S1-view/ros1.rviz` 里的 TF 树，**没有拿到实际建图 launch 文件核对
+  过**，是从可视化配置反推的；如果帧名不对，现场会一直查不到 TF、机器狗
+  marker 不出现，但点云本身不受影响（见「已知缺口」）。
+- `/surround_map_cloud`：建图模式下是"当前位姿附近的局部地图点云"，随关键帧
+  更新（见 `hand-lio/hand-topic.csv`），是建图页真正在看的主体内容。
+- `/surf_cloud_in_map`（`MAPPING_SURF_CLOUD_TOPIC`）：只是"当前这一帧扫到哪里"
+  的高亮提示，**不是**导航页/地图预览页"实时点云"勾选框订阅的那个话题——那个
+  用的是 `SURF_CLOUD_TOPIC`（默认 `/hand_lio/clouds_lidar`，hand_lio 侧**没有
+  降采样**的版本，特意选的：地图预览页对比过，展示效果比这条降采样版好）。
+  `/surf_cloud_in_map` 才是 `hand-topic.csv` 里真正标"降采样后的激光点云"的
+  那条，建图页要的只是个大致位置提示，用不着地图预览页那份精度，两个页面
+  故意订阅两个不同的话题，不要合并成一个常量（见 `config.py` 里
+  `SURF_CLOUD_TOPIC`/`MAPPING_SURF_CLOUD_TOPIC` 各自的说明）。
+
+保存（`POST /api/mapping/save`）立即返回 `saving`，真正的工作在后台线程里跑：
+
+1. 执行 `config.SAVE_MAP_SCRIPT`（默认 `/home/cat/start_save_map.bash`，**只在
+   板子上有，这个开发机上不存在，没法本地验证**）
+2. 成功后把它的产出目录 `config.SAVE_MAP_DIR`（复用已有的
+   `HANDBOT_SLAM_MAP_DIR` 推出父目录，即 `.../save_map/` 整个目录，不只是
+   `3d_map` 子目录）`mv` 到 `map-data-dir/<name>/` 下
+3. 之后这张图会以 `not_processed` 状态自然出现在地图列表里，跟手动把地图数据
+   放进 `MAP_DATA_DIR` 是同一条路径——用已有的"预处理"按钮走完剩下的流程
+
+第 2 步**假定** `start_save_map.bash` 产出的目录结构（`3d_map/{dense_cloud_map.pcd,
+keyframe_info_3d.txt}` + `2d_map/{map_2d.pgm,map_2d.yaml}`）跟
+`map_registry._is_valid_map_dir` 要求的完全一致——这个假设没有拿到脚本本身核对
+过，是从 `HANDBOT_SLAM_MAP_DIR` 已有注释"留着给后面'新建地图'功能用"和文件名
+常量正好对得上推断的。保存失败（脚本非 0 退出/超时/目标目录冲突）时状态转
+`error`，**故意不停服务、不清理任何东西**——用户能看错误重试保存，不会因为
+这一步失败就把建图进度也搭进去；只有保存成功才会停止建图服务。
+
+### 激活地图 与 localization.service 共用的固定路径
+
+`config.SAVE_MAP_DIR`（`/home/cat/handbot_slam/catkin_ws_grslam/save_map`）不只是
+建图保存时的临时输出目录，`localization.service` 启动时也**只会读这一个固定
+路径**，不接受传参指定用哪张地图——所以"激活哪张地图"实际上是"这个路径当前
+指向哪张地图"。因此 `MapRegistry.activate_map`（`map_registry.py`）现在会：
+
+1. 先查 `localization.service` 的状态（复用 `service_manager.systemctl_status`），
+   不是 `inactive`/`failed` 就拒绝激活，报错提示"需要先在系统管理页停止该服务"——
+   它可能正打开着 `save_map/` 下的文件，这时候把路径指向别的地图是不安全的。
+2. 把 `config.SAVE_MAP_DIR` 建成一个指向 `map-data-dir/<name>/` 的**软链接**
+   （`map_registry.clear_localization_link`）：已经是软链接就摘掉重建（不删任何
+   地图数据）；已经是真实目录/文件（比如建图保存失败留下的残留）就**直接删掉，
+   打一条 warning 日志**，不拒绝、不需要人工确认——建图服务自己
+   `start_save_map.bash` 保存时本来就会整个覆写这个路径（见
+   `mapping_manager._run_save`），这里跟它保持同一个尺度。
+
+`deactivate_map`/`delete_map`（删除的正好是激活地图时）也会顺带摘掉这个软链接，
+让"没有激活地图"这个状态和磁盘上 `localization.service` 实际会读到的内容保持
+一致。`mapping_manager.start`（见上面「建图」一节）复用的是同一个
+`clear_localization_link`——开始新建图前会先清空可能残留的旧激活软链接/残留
+目录，不然建图服务会把数据写进当前激活地图的目录里，或者跟残留目录混在一起。
+
+**这一整块（激活时的状态检查、软链接创建/摘除）都没有在真实机器上验证过**，
+见下面「已知缺口」。
 
 ---
 
@@ -109,14 +262,16 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 | 话题 | 类型 | 方向 |
 |---|---|---|
 | `/preset_waypoints` | `nav_msgs/Path` | backend → planner，一条 Path = 一整轮任务 |
-| `/planning/go2_execution_frozen` | `std_msgs/Bool` | backend → planner，冻结/解冻轨迹执行 |
+| `/planning/emergency_stop` | `std_msgs/Empty` | backend → planner，急停并作废当前任务 |
+| `/planning/finished` | `scan_planner/PlanFinished` | planner → backend，整轮任务结束一次（`REACHED` 或 `EMERGENCY_STOP`） |
 | `/hand_lio/odom_vehicle` | `nav_msgs/Odometry` | → backend，位姿 + `covariance[0]` 定位质量 |
 
-**三条必须照抄 planner 行为的地方**，抄错任何一条都会静默错位：
+**几条必须照抄 planner 行为的地方**，抄错任何一条都会静默错位：
 
-1. **到达判定是 3D 距离 < 0.5 m**，而且 planner **不发布任何到达/完成话题**。后端只能订阅 odom 用同一套判据自己推进度。
-2. **新一轮开始时跳过距当前位置 0.5 m 以内的点**（`planNextWaypoint`），后端下发后立刻做同样的跳过，否则第一个点会一直显示成"没到过"。
+1. **途中点的到达判定是 3D 距离 < `waypoint_arrival_radius`（0.3 m）**，靠订阅 odom 自己推进度；最后一个点没有这条提前退出，精度更高的确认来自下面第 4 条的 `/planning/finished`。
+2. **新一轮开始时跳过距当前位置 < `kDegenerateDist`（0.05 m）的点**（`planNextWaypoint`），后端下发后立刻做同样的跳过，否则第一个点会一直显示成"没到过"。
 3. **`/preset_waypoints` 不 latch 且队列为 1**，没订阅者时发出去被静默丢弃。所以下发前等订阅者连上，等不到就返回 HTTP 503。发布端也刻意**不 latch** —— latch 会让 planner 一重启就自己跑上一轮路线。
+4. **`/planning/finished` 整轮只发一次**（到达终点 `REACHED`，或急停悬停确认完退出 `EMERGENCY_STOP`），比距离判据精确得多，收到就直接确认——`REACHED`/`EMERGENCY_STOP` 都可能来自 planner 自己触发的 fail-safe，不一定是用户主动停止。急停期间（`exec_state_==EMERGENCY_STOP`）planner 会忽略新收到的 `/preset_waypoints`，必须等这条消息之后再重发路线。
 
 **路线只发一次。** 重发不是冗余而是有害：planner 收到新 Path 会 `current_wp_ = 0` 整轮重置，跑到一半重发会让狗掉头回起点。
 
@@ -132,7 +287,7 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 - **Δ**：`当前 odom.z − 狗当前位置附近的建图轨迹高度`，**运行时实测**
 - **z_offset**：用户微调（SCAN-Planner 的 README 明确写了爬不上楼梯就抬 keypoint 的 z）
 
-**路线里不存绝对 z。** odom 的 z 基准取决于 hand-lio 的 `lidar_t_body` 外参，存了绝对值就会在某天标定之后集体失效，而且失效得很安静 —— 偏 0.3 m 不报错，只是让那个 0.5 m 的到达判据变脆。
+**路线里不存绝对 z。** odom 的 z 基准取决于 hand-lio 的 `lidar_t_body` 外参，存了绝对值就会在某天标定之后集体失效，而且失效得很安静 —— 偏 0.3 m 不报错，只是让那个 0.3 m 的到达判据变脆。
 
 **不需要单独估"建图设备的传感器离地高度"这个常数。** 以前（点云版高程面）需要专门从点云里量一个 `delta_sensor_m`；现在这个常数会在"目标点轨迹高度 + Δ"这个式子里跟"建图轨迹 z 基准和运行时 odom z 基准的差异"一起自动抵消——两者都是加在轨迹高度上的固定偏移，做减法（算 Δ）再加回去（算目标点 z）就消掉了，不需要分别估计，也不需要碰点云，推导见 `path_planner.py` 模块注释。
 
@@ -171,6 +326,29 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 - **Δ 只用单次采样。** 下发那一刻狗若正好站在楼梯踏面上，台阶量化误差（实测楼梯段 IQR 0.090 vs 平地 0.031）会落到 Δ 上并施加到整条路线。改成滑动窗口取中位数可解。
 - **可站立区只覆盖走过的地方。** 想要更大的可用区域，让狗多走两圈比调参数可靠。
 - **前端未经真人浏览器验证。** 类型检查和构建通过，但布局/配色/交互没有实际看过。
+- **服务状态管理没有在真实机器上验证过。** `backend/app/service_manager.py` 调
+  `systemctl`/`sudo -n systemctl`，开发机没有 systemd/这几个单元，本地跑不了；
+  见"服务状态管理"一节的 sudoers 规则也还没有在机器上实际配过——权限没配对时
+  的报错文本是否真的可读、`sudo -n` 在目标机器上的确切失败提示，都还没实机验证。
+- **建图页/保存流程整体没有在真实机器上跑过。** 没有 board 访问权限，`/tf` 的
+  `map -> latest_lidar` 帧名是从 `HandBot-S1-view/ros1.rviz` 反推的，没有拿建图
+  模式实际的 launch 文件核对过；`start_save_map.bash` 产出的目录结构是否真的跟
+  `map_registry` 期望的一致也是推断，不是核对过的事实——见「建图」一节。这几处
+  只要有一处跟假设不符，现象都是"建图页看不到点云/机器狗位置"或者"保存失败"，
+  不是别的隐蔽 bug。
+- **激活地图时创建软链接、检查 localization.service 状态，都没有实机验证过。**
+  `map_registry.py` 的 `activate_map`/`clear_localization_link` 假定
+  `localization.service` 只在启动时读一次 `config.SAVE_MAP_DIR`（之后不管软
+  链接怎么变都不受影响），以及跑后端的用户对 `/home/cat/handbot_slam/...`
+  这条路径有创建软链接的权限——这两条都是推断，没有拿真实的 localization
+  相关代码/权限配置核对过。见「激活地图 与 localization.service 共用的固定
+  路径」一节。
+- **服务依赖关系（`SERVICE_DEPENDENCIES`/`MAPPING_MODE_DEPENDENCIES`）是按
+  用户口述的依赖列出来的，没有拿板子上的实际配置核对过。** 如果实际依赖关系
+  跟这两张表不一致（比如还有表里没列的依赖，或者某条依赖其实反了），后果分
+  两种：该自动启动的没启动（现象是"点了启动，界面显示成功，但服务其实因为
+  缺依赖起不来"）、或者该拦住的停止操作没拦住（现象是"停了一个服务，另一个
+  正在依赖它的服务跟着挂了却没有任何提示"）——见「服务依赖关系」一节。
 
 ---
 

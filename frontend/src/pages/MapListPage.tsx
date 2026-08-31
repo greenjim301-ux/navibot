@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Trash2, Map as MapIcon, RefreshCw, Plus, Zap, ZapOff } from "lucide-react";
-import { activateMap, deactivateMap, deleteMap, listMaps, mapAssetUrl, preprocessMap } from "../api";
-import type { MapInfo } from "../types";
+import {
+  activateMap, deactivateMap, deleteMap, listMappingModes, listMaps, mapAssetUrl, preprocessMap, startMapping,
+} from "../api";
+import type { MapInfo, MappingModeInfo } from "../types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import {
   Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter,
@@ -14,8 +17,21 @@ import {
   AlertDialog, AlertDialogTrigger, AlertDialogContent, AlertDialogHeader,
   AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction,
 } from "@/components/ui/alert-dialog";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+} from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
+
+// 跟 backend/app/map_registry.py 的 validate_map_name 保持一致: 地图名会拼进
+// map-data-dir/<name>/ 这样的文件系统路径, 前端先挡一道明显非法的输入, 真正
+// 的校验(包括"已存在"这种后端才知道的情况)还是后端做——这里只是少一次无谓的
+// 网络往返。
+function isValidMapName(name: string): boolean {
+  return name.length > 0 && name !== "." && name !== ".." && !/[/\\]/.test(name);
+}
 
 export default function MapListPage() {
+  const navigate = useNavigate();
   const [maps, setMaps] = useState<MapInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
@@ -36,6 +52,52 @@ export default function MapListPage() {
     const timer = window.setInterval(refresh, 3000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  // 「新建地图」弹窗: 选建图模式(对应板子上一个 systemd 单元) + 填地图名,
+  // 点"开始建图"后端启动对应服务, 成功就跳到建图页实时看点云
+  // (backend/app/mapping_manager.py)。
+  const [createOpen, setCreateOpen] = useState(false);
+  const [modes, setModes] = useState<MappingModeInfo[] | null>(null);
+  const [modesError, setModesError] = useState<string | null>(null);
+  const [selectedModeId, setSelectedModeId] = useState<string | null>(null);
+  const [newMapName, setNewMapName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    listMappingModes()
+      .then((list) => {
+        setModes(list);
+        setSelectedModeId((cur) => cur ?? list[0]?.id ?? null);
+      })
+      .catch((e) => setModesError(String(e)));
+  }, []);
+
+  function openCreateDialog() {
+    setCreateError(null);
+    setNewMapName("");
+    setCreateOpen(true);
+  }
+
+  async function handleStartMapping() {
+    if (!selectedModeId) return;
+    const name = newMapName.trim();
+    if (!isValidMapName(name)) {
+      setCreateError("请输入合法的地图名(不能为空, 不能包含 / 或 \\)");
+      return;
+    }
+    setCreating(true);
+    setCreateError(null);
+    try {
+      await startMapping(selectedModeId, name);
+      setCreateOpen(false);
+      navigate(`/mapping/${encodeURIComponent(name)}`);
+    } catch (e) {
+      setCreateError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
 
   async function handlePreprocess(name: string) {
     setPendingAction(name);
@@ -96,7 +158,7 @@ export default function MapListPage() {
           <h1 className="text-2xl font-bold tracking-tight">地图管理</h1>
           <p className="mt-1 text-sm text-muted-foreground">维护用于定位、导航与任务规划的场景地图</p>
         </div>
-        <Button disabled title="即将上线">
+        <Button onClick={openCreateDialog}>
           <Plus />
           新建地图
         </Button>
@@ -145,6 +207,69 @@ export default function MapListPage() {
           ))}
         </div>
       )}
+
+      <Dialog open={createOpen} onOpenChange={(open) => !creating && setCreateOpen(open)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <p className="text-xs text-muted-foreground">NEW MAP</p>
+            <DialogTitle>新建地图</DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-1.5">
+            <Label>建图模式</Label>
+            {modesError ? (
+              <p className="text-xs text-destructive">{modesError}</p>
+            ) : modes === null ? (
+              <p className="text-xs text-muted-foreground">加载中…</p>
+            ) : (
+              <div className="grid grid-cols-2 gap-2">
+                {modes.map((mode) => (
+                  <button
+                    key={mode.id}
+                    type="button"
+                    disabled={creating}
+                    onClick={() => setSelectedModeId(mode.id)}
+                    className={cn(
+                      "rounded-lg border px-3 py-2.5 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+                      selectedModeId === mode.id
+                        ? "border-primary bg-primary/5 text-foreground"
+                        : "border-border hover:bg-accent",
+                    )}
+                  >
+                    <div className="font-medium">{mode.label}</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">{mode.area_desc}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="new-map-name">地图名称</Label>
+            <Input
+              id="new-map-name"
+              placeholder="给这次建图起个名字"
+              value={newMapName}
+              disabled={creating}
+              onChange={(e) => setNewMapName(e.target.value)}
+            />
+          </div>
+
+          {createError && <p className="text-sm text-destructive">{createError}</p>}
+
+          <DialogFooter>
+            <Button variant="outline" disabled={creating} onClick={() => setCreateOpen(false)}>
+              取消
+            </Button>
+            <Button
+              disabled={creating || !selectedModeId || !newMapName.trim()}
+              onClick={handleStartMapping}
+            >
+              {creating ? "启动中…" : "开始建图"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

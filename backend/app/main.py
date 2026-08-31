@@ -11,19 +11,24 @@ from starlette.concurrency import run_in_threadpool
 
 from . import config
 from .map_registry import MapRegistry
+from .mapping_manager import MappingManager
 from .models import (
     GroundZRequest, GroundZResponse,
     MapInfo, NavStatus,
     InflationMapRequest,
+    MappingModeInfo, MappingStatus,
     PlanPathRequest, PlanPathResponse, PlanPathPoint,
     RouteRequest,
     SelfInflationRequest,
+    ServiceInfo,
+    StartMappingRequest,
     SurfCloudRequest,
 )
 from . import global_planner
 from . import path_planner
 from .ros_bridge import RosBridge
 from .route_manager import RouteManager
+from .service_manager import ServiceDependencyError, ServiceManager
 from .ws_manager import WebSocketManager
 
 # 不能用 logging.basicConfig: uvicorn 在导入本模块之前就调过 logging.config.dictConfig,
@@ -73,19 +78,23 @@ async def add_vary_origin(request, call_next):
     return response
 
 ws_manager = WebSocketManager()
+mapping_ws_manager = WebSocketManager()
 route_manager: Optional[RouteManager] = None
+mapping_manager: Optional[MappingManager] = None
 ros_bridge: Optional[RosBridge] = None
 map_registry = MapRegistry()
+service_manager = ServiceManager()
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    global route_manager, ros_bridge
+    global route_manager, mapping_manager, ros_bridge
     loop = asyncio.get_event_loop()
     ws_manager.bind_loop(loop)
+    mapping_ws_manager.bind_loop(loop)
 
-    # RosBridge 的回调在 route_manager 构造完成前就注册了, 但回调只有等
-    # ros_bridge.start() 之后订阅到真实消息才会触发, 那时 route_manager
+    # RosBridge 的回调在 route_manager/mapping_manager 构造完成前就注册了, 但
+    # 回调只有等 ros_bridge.start() 之后订阅到真实消息才会触发, 那时这两个
     # (global) 早已赋值完毕, 所以这里用闭包引用全局变量是安全的。
     def _on_pose(x, y, z, yaw, cov, stamp):
         route_manager.on_pose(x, y, z, yaw, cov, stamp)
@@ -105,12 +114,24 @@ async def on_startup() -> None:
     def _on_planning_finished(status):
         route_manager.on_planning_finished(status)
 
+    def _on_mapping_pose(x, y, z, yaw, stamp):
+        mapping_manager.on_mapping_pose(x, y, z, yaw, stamp)
+
+    def _on_mapping_surround_cloud(points):
+        mapping_manager.on_mapping_surround_cloud(points)
+
+    def _on_mapping_surf_cloud(points):
+        mapping_manager.on_mapping_surf_cloud(points)
+
     ros_bridge = RosBridge(
         on_pose=_on_pose, on_optimal_traj=_on_optimal_traj, on_self_inflation=_on_self_inflation,
         on_inflation_map=_on_inflation_map, on_surf_cloud=_on_surf_cloud,
         on_planning_finished=_on_planning_finished,
+        on_mapping_pose=_on_mapping_pose, on_mapping_surround_cloud=_on_mapping_surround_cloud,
+        on_mapping_surf_cloud=_on_mapping_surf_cloud,
     )
     route_manager = RouteManager(ros_bridge, ws_manager)
+    mapping_manager = MappingManager(ros_bridge, mapping_ws_manager)
     ros_bridge.start()
     logger.info("navibot backend started")
 
@@ -316,6 +337,112 @@ async def delete_map(name: str):
         await run_in_threadpool(map_registry.delete_map, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@app.get("/api/services", response_model=List[ServiceInfo])
+async def list_services():
+    """系统管理页「服务状态」卡片: lidar/相机/导航定位/路线规划这几个固定的
+    systemd 单元, 列表见 config.SYSTEMD_SERVICES。"""
+    return await run_in_threadpool(service_manager.list_status)
+
+
+@app.post("/api/services/{service_id}/start", response_model=ServiceInfo)
+async def start_service(service_id: str):
+    """启动前会先自动启动它依赖的服务(没在跑才启动, 见
+    service_manager.start_with_dependencies), 比如启动"路线规划"会顺带确认
+    "导航定位"和"激光雷达"都在跑。"""
+    try:
+        return await run_in_threadpool(service_manager.start, service_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        # 最典型的是 sudoers 没配好(sudo -n 直接失败)——原样透给前端, 别只显示
+        # "启动失败"看不出是权限问题还是服务本身起不来(可能是这个服务自己, 也
+        # 可能是它依赖的某个服务)。
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/services/{service_id}/stop", response_model=ServiceInfo)
+async def stop_service(service_id: str):
+    """有其它正在运行的服务(直接或间接)依赖这个服务时拒绝停止(见
+    service_manager.find_blocking_dependents), 报错里列出需要先停哪些。"""
+    try:
+        return await run_in_threadpool(service_manager.stop, service_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except ServiceDependencyError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/mapping/modes", response_model=List[MappingModeInfo])
+async def list_mapping_modes():
+    """「新建地图」弹窗里的 4 个建图模式选项, 纯读配置(config.MAPPING_MODES),
+    不需要 run_in_threadpool。"""
+    return mapping_manager.list_modes()
+
+
+@app.get("/api/mapping/status", response_model=MappingStatus)
+async def get_mapping_status():
+    return mapping_manager.get_status()
+
+
+@app.post("/api/mapping/start", response_model=MappingStatus)
+async def start_mapping(req: StartMappingRequest):
+    try:
+        return await run_in_threadpool(mapping_manager.start, req.mode_id, req.map_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        # 最典型的是 sudoers 没配好(sudo -n 直接失败)——原样透给前端。
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/mapping/cancel", response_model=MappingStatus)
+async def cancel_mapping():
+    """「返回」确认丢弃后调用: 停止建图服务、回到 idle。"""
+    try:
+        return await run_in_threadpool(mapping_manager.cancel)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/mapping/save", response_model=MappingStatus)
+async def save_mapping():
+    """立即返回 saving, 真正的保存(跑 start_save_map.bash + mv)在后台线程里
+    进行, 结果通过 /ws/mapping 的 mapping_status 消息推送。"""
+    try:
+        return await run_in_threadpool(mapping_manager.save)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.websocket("/ws/mapping")
+async def ws_mapping(ws: WebSocket):
+    await mapping_ws_manager.connect(ws)
+    try:
+        status = mapping_manager.get_status()
+        await ws.send_json({"type": "mapping_status", "data": status.model_dump()})
+        snapshot = mapping_manager.get_snapshot()
+        if snapshot["pose"] is not None:
+            await ws.send_json({"type": "mapping_pose", "data": snapshot["pose"]})
+        if snapshot["surround_cloud"] is not None:
+            await ws.send_json({
+                "type": "mapping_surround_cloud", "data": {"points": snapshot["surround_cloud"]},
+            })
+        if snapshot["surf_cloud"] is not None:
+            await ws.send_json({
+                "type": "mapping_surf_cloud", "data": {"points": snapshot["surf_cloud"]},
+            })
+        while True:
+            # 跟 /ws/nav 一样, 前端不需要往这条连接发消息, 只是保持连接存活/
+            # 感知断开。
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        mapping_ws_manager.disconnect(ws)
 
 
 @app.websocket("/ws/nav")

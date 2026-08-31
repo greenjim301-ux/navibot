@@ -159,3 +159,57 @@ class MapInfo(BaseModel):
     activate_map/deactivate_map)。地图预览页只在预览的是激活地图时才显示
     "图层"/"导航控制"这类跟机器狗实时状态挂钩的面板——机器狗的定位/传感器
     数据不区分地图, 只有明确"当前就是在这张图上跑"时叠加上去才有意义。"""
+
+
+class ServiceInfo(BaseModel):
+    """系统管理页「服务状态」卡片的一个 systemd 单元(见
+    backend/app/config.py 的 SYSTEMD_SERVICES), 只有固定这几个, id 不接受任意
+    unit 名——见 service_manager.py。"""
+    id: str
+    label: str
+    unit: str
+    active_state: str
+    """systemctl 的 ActiveState: active/inactive/failed/activating/deactivating,
+    查询失败(比如单元不存在、systemctl 调用出错)时是 unknown。"""
+    sub_state: str
+    """systemctl 的 SubState, 比 active_state 更细(比如 active 下的
+    running/exited)。"""
+    enabled: str
+    """systemctl 的 UnitFileState: enabled/disabled/static/..., 开机是否自启。"""
+
+
+class MappingModeInfo(BaseModel):
+    """「新建地图」建图页可选的一种建图模式(见 backend/app/config.py 的
+    MAPPING_MODES), 每种模式对应板子上一个互斥的 systemd 单元。"""
+    id: str
+    label: str
+    unit: str
+    area_desc: str
+
+
+class MappingState(str, Enum):
+    IDLE = "idle"
+    RUNNING = "running"
+    SAVING = "saving"
+    DONE = "done"
+    ERROR = "error"
+
+
+class MappingStatus(BaseModel):
+    """建图会话状态(见 mapping_manager.py), 通过 /ws/mapping 广播——跟
+    navi_mode=2 的 NavStatus 是两套完全独立的状态机, 一次只有一个全局建图
+    会话(不区分标签页, 所有连接看到的是同一个)。"""
+    state: MappingState
+    mode_id: Optional[str] = None
+    map_name: Optional[str] = None
+    unit: Optional[str] = None
+    message: Optional[str] = None
+    """ERROR 时是失败详情(比如保存脚本的 stderr); SAVING 时可以是进度提示;
+    其它状态通常是 None。"""
+    started_at: Optional[float] = None
+    updated_at: float = Field(default_factory=time.time)
+
+
+class StartMappingRequest(BaseModel):
+    mode_id: str
+    map_name: str

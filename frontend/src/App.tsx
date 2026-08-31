@@ -3,6 +3,7 @@ import { Layout } from "./components/Layout";
 import HomePage from "./pages/HomePage";
 import MapListPage from "./pages/MapListPage";
 import MapPreviewPage from "./pages/MapPreviewPage";
+import MappingPage from "./pages/MappingPage";
 import NavigatePage from "./pages/NavigatePage";
 import RouteListPage from "./pages/RouteListPage";
 import RouteEditorPage from "./pages/RouteEditorPage";
@@ -20,6 +21,7 @@ export default function App() {
             没有存在的必要。 */}
         <Route path="/maps/:name/preview" element={<MapPreviewPage />} />
         <Route path="/maps/:name/navigate" element={<NavigatePage />} />
+        <Route path="/mapping/:name" element={<MappingPage />} />
         <Route path="/playback/:name" element={<PlaybackWorkspacePage />} />
         <Route element={<Layout />}>
           <Route path="/" element={<HomePage />} />

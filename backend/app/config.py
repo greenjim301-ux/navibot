@@ -103,10 +103,14 @@ SELF_INFLATION_TOPIC = os.environ.get("NAVIBOT_SELF_INFLATION_TOPIC", "/scan_pla
 # (map_inf_pub_.getNumSubscribers() <= 0 时直接不发布), 我们只是把这个"按需"
 # 特性透到前端一个勾选框。
 INFLATION_MAP_TOPIC = os.environ.get("NAVIBOT_INFLATION_MAP_TOPIC", "/grid_map/occupancy_inflate")
-# hand-lio 侧 -> backend, sensor_msgs/PointCloud2 (见 hand-lio/hand-topic.csv):
-# "降采样后的激光点云,已进行降采样,经过畸变校正,转到地图坐标系下", 5Hz, 只有
-# x/y/z。跟 inflation_map 一样默认不订阅, 前端"雷达点云"勾选框打开才让后端订阅,
-# 每次整帧替换(不叠加历史帧)。
+# 地图预览页/导航页"雷达点云"勾选框用的话题。hand_lio 侧 -> backend,
+# sensor_msgs/PointCloud2, **没有降采样**——hand-topic.csv 里没有这条(不是
+# hand-lio 标准接口清单里的话题), 是特意选的: hand-topic.csv 里对应"降采样后
+# 的激光点云"的其实是 /surf_cloud_in_map(建图页用的是那条, 见
+# MAPPING_SURF_CLOUD_TOPIC), 但这两个页面对着比过, 没降采样的这条在地图预览页
+# 展示效果更好, 所以这两个页面故意用两个不同的话题, 不要合并成一个常量。跟
+# inflation_map 一样默认不订阅, 前端"雷达点云"勾选框打开才让后端订阅, 每次
+# 整帧替换(不叠加历史帧)。
 SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURF_CLOUD_TOPIC", "/hand_lio/clouds_lidar")
 
 # 对齐 fsm/waypoint_arrival_radius (advanced_param.xml 里配的 0.3): 途中点提前切
@@ -199,3 +203,100 @@ PIPELINE_SCRIPT = os.environ.get(
 )
 
 CORS_ALLOW_ORIGINS = os.environ.get("NAVIBOT_CORS_ALLOW_ORIGINS", "*").split(",")
+
+# 单独起个常量: map_registry.py 激活地图前要检查这个服务是否在跑(见
+# MapRegistry.activate_map), 需要跟下面 SYSTEMD_SERVICES 里那条用同一个值,
+# 不重复写字符串字面量。
+LOCALIZATION_SERVICE_UNIT = "localization.service"
+
+# 系统管理页面「服务状态」卡片管理的 systemd 单元: id 是前端调
+# /api/services/{id}/start|stop 时用的稳定标识符, 不直接把 unit 名暴露给请求参数——
+# 只放行这个固定列表里的几个单元, 挡掉"随便传个 unit 名"的口子(subprocess 传参
+# 不走 shell, 没有命令注入风险, 但"能控制任意 systemd 单元"本身就是个过大的权限面)。
+SYSTEMD_SERVICES = [
+    {"id": "lidar", "label": "激光雷达", "unit": "mid360.service"},
+    {"id": "camera", "label": "相机", "unit": "camera.service"},
+    {"id": "localization", "label": "导航定位", "unit": LOCALIZATION_SERVICE_UNIT},
+    {"id": "planner", "label": "路线规划", "unit": "ros-bringup.service"},
+]
+
+# 启动/停止服务需要特权, 用 sudo -n(非交互——没配免密的话直接报错, 不会卡在等
+# 密码输入上)包一层调用; 查状态(systemctl show)不需要特权, 不走这个前缀。
+# 部署时要给跑后端的用户配一条对应的 sudoers NOPASSWD 规则, 只放行这四个单元的
+# start/stop, 具体写法见 README「服务状态管理」一节。
+SYSTEMCTL_SUDO_CMD = os.environ.get("NAVIBOT_SYSTEMCTL_SUDO_CMD", "sudo -n systemctl").split()
+
+# 「新建地图」建图页管理的 4 个互斥的建图模式, 分别对应板子上一个 systemd 单元。
+# id 是前端调 /api/mapping/start 时用的稳定标识符——跟 SYSTEMD_SERVICES 是两个
+# 独立的允许列表, 互不越界(mapping_manager.py 只认这里列出的 id)。
+MAPPING_MODES = [
+    {
+        "id": "cloud_small", "label": "点云建图 · 室内小尺度",
+        "unit": "cloud_mapping_small.service", "area_desc": "面积 < 5000 ㎡",
+    },
+    {
+        "id": "cloud_large", "label": "点云建图 · 室外大尺度",
+        "unit": "cloud_mapping_large.service", "area_desc": "面积 ≥ 5000 ㎡",
+    },
+    {
+        "id": "color_small", "label": "彩色点云建图 · 室内小尺度",
+        "unit": "color_mapping_small.service", "area_desc": "面积 < 5000 ㎡",
+    },
+    {
+        "id": "color_large", "label": "彩色点云建图 · 室外大尺度",
+        "unit": "color_mapping_large.service", "area_desc": "面积 ≥ 5000 ㎡",
+    },
+]
+
+# 服务依赖关系(单元名 -> 它直接依赖的单元名列表): 启动一个服务前必须先保证
+# 它依赖的服务都在跑, 没在跑就自动启动(见 service_manager.start_with_dependencies);
+# 停止一个服务前必须先确认没有(直接或间接)依赖它、且仍在运行的服务(见
+# service_manager.find_blocking_dependents), 有就拒绝, 报错列出是哪些服务,
+# 提示用户先停那些。只列直接依赖就够——间接依赖(比如 ros-bringup.service 通过
+# localization.service 间接依赖 mid360.service)靠 service_manager 里的传递
+# 闭包算法推出来, 这里不用重复写。
+SERVICE_DEPENDENCIES = {
+    "mid360.service": [],
+    "camera.service": [],
+    "localization.service": ["mid360.service"],
+    "ros-bringup.service": ["localization.service"],
+}
+
+# 建图模式服务的依赖, 跟上面 SERVICE_DEPENDENCIES 是两张分开的表(对应两个独立
+# 的允许列表, 见 SYSTEMD_SERVICES/MAPPING_MODES 各自的说明), 但共用同一套
+# service_manager 里的依赖解析逻辑——建图服务依赖的是系统服务(mid360/camera),
+# 反过来系统服务不依赖建图服务, 两张表不会互相指向对方缺失的 key。
+MAPPING_MODE_DEPENDENCIES = {
+    "cloud_mapping_small.service": ["mid360.service"],
+    "cloud_mapping_large.service": ["mid360.service"],
+    "color_mapping_small.service": ["mid360.service", "camera.service"],
+    "color_mapping_large.service": ["mid360.service", "camera.service"],
+}
+
+SURROUND_MAP_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_TOPIC", "/surround_map_cloud")
+# 建图页当前帧扫描高亮用的话题, 跟地图预览页/导航页"雷达点云"勾选框用的
+# SURF_CLOUD_TOPIC(/hand_lio/clouds_lidar)是两个不同的话题, 不要混用——这条
+# 才是 hand-topic.csv 里真正标"降采样后的激光点云"的那条(hand-lio 侧已经做过
+# 降采样), 建图页选它是因为这里要的是"大致扫到哪里"的提示, 不需要
+# /hand_lio/clouds_lidar 那份没降采样、给地图预览页看细节用的精度。见
+# SURF_CLOUD_TOPIC 定义处的说明。
+MAPPING_SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_MAPPING_SURF_CLOUD_TOPIC", "/surf_cloud_in_map")
+# 建图页机器狗当前位置来自 /tf(map -> latest_lidar), 不是 ODOM_TOPIC——建图模式
+# 下 SCAN-Planner 不跑, /hand_lio/odom_vehicle 不一定有。帧名取自
+# HandBot-S1-view/ros1.rviz 里的 TF 树(map -> latest_lidar -> camera; map ->
+# livox_frame), 没有拿到实际建图 launch 文件核对过, 是从可视化配置反推的——如果
+# 帧名不对, 现场会一直查不到 TF、机器狗 marker 不出现, 但点云本身不受影响。
+MAPPING_TF_MAP_FRAME = os.environ.get("NAVIBOT_MAPPING_TF_MAP_FRAME", "map")
+MAPPING_TF_BODY_FRAME = os.environ.get("NAVIBOT_MAPPING_TF_BODY_FRAME", "latest_lidar")
+MAPPING_POSE_BROADCAST_HZ = float(os.environ.get("NAVIBOT_MAPPING_POSE_BROADCAST_HZ", "10.0"))
+SURROUND_MAP_CLOUD_BROADCAST_HZ = float(os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_BROADCAST_HZ", "5.0"))
+SURROUND_MAP_CLOUD_VOXEL_SIZE_M = float(os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_VOXEL_SIZE_M", "0.1"))
+
+# 「保存」按钮调的建图保存脚本, 只在板子上有 (/home/cat 是板子上的用户, 这个
+# 开发机上不存在, 没法本地验证)。
+SAVE_MAP_SCRIPT = os.environ.get("NAVIBOT_SAVE_MAP_SCRIPT", "/home/cat/start_save_map.bash")
+# 保存成功后整个目录(不只是 3d_map 子目录)会被 mv 到 map-data-dir/<name>/——
+# 复用上面已有的 HANDBOT_SLAM_MAP_DIR(.../save_map/3d_map)推出父目录, 保持
+# 单一数据源, 不再定义一个可能跟它对不上的新常量。
+SAVE_MAP_DIR = os.path.dirname(HANDBOT_SLAM_MAP_DIR)
+SAVE_MAP_TIMEOUT_S = float(os.environ.get("NAVIBOT_SAVE_MAP_TIMEOUT_S", "180.0"))

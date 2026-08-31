@@ -1,5 +1,7 @@
-import { useEffect, useState } from "react";
-import { Download } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Download, Loader2 } from "lucide-react";
+import { listServices, startService, stopService } from "../api";
+import type { ServiceActiveState, ServiceInfo } from "../types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,15 +16,26 @@ import {
   AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction,
 } from "@/components/ui/alert-dialog";
 
-// 系统管理页面目前是纯前端演示: 设备型号/固件版本/网络配置/安全策略都是假数据,
-// 保存/升级这些操作只在本地内存里生效, 不接真实设备——真要接后端(比如实际
-// 下发网络配置、触发 OTA 升级)是后续单独的活。
+// 系统管理页面里"设备信息"/"网络与连接"/"安全策略"这几块目前是纯前端演示:
+// 设备型号/固件版本/网络配置/安全策略都是假数据, 保存/升级这些操作只在本地
+// 内存里生效, 不接真实设备——真要接后端(比如实际下发网络配置、触发 OTA
+// 升级)是后续单独的活。"服务状态"这块是接了真实后端的(见 ../api 的
+// listServices/startService/stopService), 不在此列。
 
 const SAFETY_ITEMS = [
   { key: "lowBattery", label: "低电量自动返航" },
   { key: "obstacleBrake", label: "障碍物紧急制动" },
   { key: "autoCharge", label: "任务完成后自动充电" },
 ] as const;
+
+const SERVICE_STATE_DISPLAY: Record<ServiceActiveState, { text: string; className: string }> = {
+  active: { text: "● 运行中", className: "text-success" },
+  inactive: { text: "● 已停止", className: "text-muted-foreground" },
+  failed: { text: "● 异常", className: "text-destructive" },
+  activating: { text: "● 启动中…", className: "text-amber-500" },
+  deactivating: { text: "● 停止中…", className: "text-amber-500" },
+  unknown: { text: "● 未知", className: "text-muted-foreground" },
+};
 
 export default function SystemPage() {
   const [versionOpen, setVersionOpen] = useState(false);
@@ -38,11 +51,57 @@ export default function SystemPage() {
   });
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  const [services, setServices] = useState<ServiceInfo[] | null>(null);
+  const [servicesError, setServicesError] = useState<string | null>(null);
+  const [pendingServiceId, setPendingServiceId] = useState<string | null>(null);
+  const [stopConfirmId, setStopConfirmId] = useState<string | null>(null);
+
   useEffect(() => {
     if (!toastMessage) return;
     const t = window.setTimeout(() => setToastMessage(null), 2500);
     return () => window.clearTimeout(t);
   }, [toastMessage]);
+
+  const refreshServices = useCallback(async () => {
+    try {
+      const list = await listServices();
+      setServices(list);
+      setServicesError(null);
+    } catch (e) {
+      setServicesError(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshServices();
+    const timer = window.setInterval(refreshServices, 3000);
+    return () => window.clearInterval(timer);
+  }, [refreshServices]);
+
+  async function handleStartService(id: string) {
+    setPendingServiceId(id);
+    try {
+      await startService(id);
+      await refreshServices();
+    } catch (e) {
+      setToastMessage(String(e));
+    } finally {
+      setPendingServiceId(null);
+    }
+  }
+
+  async function handleStopService(id: string) {
+    setStopConfirmId(null);
+    setPendingServiceId(id);
+    try {
+      await stopService(id);
+      await refreshServices();
+    } catch (e) {
+      setToastMessage(String(e));
+    } finally {
+      setPendingServiceId(null);
+    }
+  }
 
   function handleSaveNetwork() {
     setNetworkOpen(false);
@@ -111,6 +170,73 @@ export default function SystemPage() {
             <dt className="text-muted-foreground">信号强度</dt>
             <dd className="text-foreground/80">−54 dBm（良好）</dd>
           </dl>
+        </Card>
+
+        <Card className="p-5 lg:col-span-2">
+          <div className="mb-1 flex items-center justify-between">
+            <h2 className="text-[15px] font-medium">服务状态</h2>
+            {servicesError && (
+              <span className="text-xs text-destructive">{servicesError}</span>
+            )}
+          </div>
+          <div className="divide-y">
+            {services === null && !servicesError && (
+              <div className="py-6 text-center text-xs text-muted-foreground">加载中…</div>
+            )}
+            {services?.map((svc) => {
+              const display = SERVICE_STATE_DISPLAY[svc.active_state] ?? SERVICE_STATE_DISPLAY.unknown;
+              const pending = pendingServiceId === svc.id;
+              const busy = pending || svc.active_state === "activating" || svc.active_state === "deactivating";
+              return (
+                <div key={svc.id} className="flex items-center justify-between py-3">
+                  <div>
+                    <div className="text-sm">{svc.label}</div>
+                    <div className="font-mono text-[11px] text-muted-foreground">{svc.unit}</div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className={`text-xs font-medium ${display.className}`}>{display.text}</span>
+                    {svc.active_state === "active" ? (
+                      <AlertDialog
+                        open={stopConfirmId === svc.id}
+                        onOpenChange={(open) => setStopConfirmId(open ? svc.id : null)}
+                      >
+                        <AlertDialogTrigger asChild>
+                          <Button variant="outline" size="sm" disabled={busy}>
+                            {pending && <Loader2 className="animate-spin" />}
+                            停止
+                          </Button>
+                        </AlertDialogTrigger>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>停止「{svc.label}」?</AlertDialogTitle>
+                            <AlertDialogDescription>
+                              {svc.unit} 将被停止, 依赖它的功能(比如导航)会跟着不可用, 确定继续吗？
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>取消</AlertDialogCancel>
+                            <AlertDialogAction onClick={() => handleStopService(svc.id)}>
+                              确认停止
+                            </AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => handleStartService(svc.id)}
+                      >
+                        {pending && <Loader2 className="animate-spin" />}
+                        启动
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </Card>
 
         <Card className="p-5 lg:col-span-2">

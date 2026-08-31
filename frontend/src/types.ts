@@ -171,6 +171,62 @@ export function pixelToWorld(meta: Topview2D, col: number, row: number) {
   };
 }
 
+export type ServiceActiveState =
+  | "active"
+  | "inactive"
+  | "failed"
+  | "activating"
+  | "deactivating"
+  | "unknown";
+
+/** 系统管理页「服务状态」卡片管理的一个 systemd 单元, 见
+ *  backend/app/config.py 的 SYSTEMD_SERVICES —— 只有固定这几个 id
+ *  (lidar/相机/导航定位/路线规划), 不接受任意 unit 名。 */
+export interface ServiceInfo {
+  id: string;
+  label: string;
+  unit: string;
+  active_state: ServiceActiveState;
+  sub_state: string;
+  /** systemctl 的 UnitFileState: enabled/disabled/static/..., 开机是否自启。 */
+  enabled: string;
+}
+
+/** 「新建地图」建图页可选的一种建图模式, 见 backend/app/config.py 的
+ *  MAPPING_MODES, 每种对应板子上一个互斥的 systemd 单元。 */
+export interface MappingModeInfo {
+  id: string;
+  label: string;
+  unit: string;
+  area_desc: string;
+}
+
+export type MappingState = "idle" | "running" | "saving" | "done" | "error";
+
+/** 建图会话状态, 通过 /ws/mapping 的 "mapping_status" 消息推送, 全局只有一个
+ *  会话(不区分标签页)。 */
+export interface MappingStatus {
+  state: MappingState;
+  mode_id: string | null;
+  map_name: string | null;
+  unit: string | null;
+  /** ERROR 时是失败详情(比如保存脚本的 stderr) */
+  message: string | null;
+  started_at: number | null;
+  updated_at: number;
+}
+
+/** 建图页机器狗当前位置, 来自 /tf(map -> latest_lidar), 没有 cov 字段——建图
+ *  模式下没有 EKF 融合出来的定位质量标量, 见 backend/app/ros_bridge.py 的
+ *  MappingPoseCallback。 */
+export interface MappingPose {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  stamp: number;
+}
+
 /** 定位是否已经不可信 (见 RobotPose.cov) */
 export const POSE_COV_BAD = 0.99;
 export function poseUnreliable(pose: RobotPose | null | undefined): boolean {

@@ -1,4 +1,6 @@
-import type { MapInfo, NavStatus, PlannedRoutePoint, Waypoint, XY } from "./types";
+import type {
+  MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint, ServiceInfo, Waypoint, XY,
+} from "./types";
 
 export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "http://localhost:8000";
 export const BACKEND_WS = import.meta.env.VITE_BACKEND_WS ?? "ws://localhost:8000";
@@ -149,4 +151,52 @@ export async function planPath(
   });
   const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
   return { points: data.points, published: data.published, publishError: data.publish_error };
+}
+
+/** 系统管理页「服务状态」卡片: lidar/相机/导航定位/路线规划这几个固定的
+ *  systemd 单元(见 backend/app/config.py 的 SYSTEMD_SERVICES)。 */
+export async function listServices(): Promise<ServiceInfo[]> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/services`));
+}
+
+export async function startService(id: string): Promise<ServiceInfo> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/services/${encodeURIComponent(id)}/start`, { method: "POST" }),
+  );
+}
+
+export async function stopService(id: string): Promise<ServiceInfo> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/services/${encodeURIComponent(id)}/stop`, { method: "POST" }),
+  );
+}
+
+/** 「新建地图」弹窗里的 4 个建图模式选项(见 backend/app/config.py 的
+ *  MAPPING_MODES)。 */
+export async function listMappingModes(): Promise<MappingModeInfo[]> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/mapping/modes`));
+}
+
+export async function getMappingStatus(): Promise<MappingStatus> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/mapping/status`));
+}
+
+export async function startMapping(modeId: string, mapName: string): Promise<MappingStatus> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/mapping/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode_id: modeId, map_name: mapName }),
+    }),
+  );
+}
+
+/** 建图页"返回"确认丢弃后调用: 停止建图服务、回到 idle。 */
+export async function cancelMapping(): Promise<MappingStatus> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/mapping/cancel`, { method: "POST" }));
+}
+
+/** 立即返回 saving, 真正的保存在后端跑, 结果通过 /ws/mapping 推送。 */
+export async function saveMapping(): Promise<MappingStatus> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/mapping/save`, { method: "POST" }));
 }

@@ -40,6 +40,16 @@ interface Props {
    *  降采样点云(每帧整体替换, 不叠加历史帧), 只在页面上的勾选框打开时后端才会
    *  有数据。 */
   surfCloud?: number[] | null;
+  /** 建图页专用: /surround_map_cloud 原样转发, 拍平的 [x0,y0,z0, ...], 建图模式
+   *  下是"当前位姿附近的局部地图点云"、随关键帧更新(不是每帧都变), 跟 surfCloud
+   *  一样每次整体替换, 渲染上是同一套持久 GPU 缓冲区复用手法, 只是换一个点
+   *  样式跟 surfCloud(当前帧扫描, 蓝色小点)区分开。 */
+  surroundCloud?: number[] | null;
+  /** 建图页(实时看点云, 没有预处理好的静态底图)专用: 跳过 mapName 对应的
+   *  pointcloud.bin 一次性抓取——那个地图这时候根本还不存在, 抓了也只是白白
+   *  404 一次。meta 依然要传(相机初始视角/裁剪平面还是要用到它), 但可以是
+   *  个跟真实预处理产物无关的固定合成值, 见 MappingPage 的用法。 */
+  liveOnly?: boolean;
   /** 是否支持"镜头跟随机器狗": 决定 updateFollow() 有没有意义(还得看
    *  status.robot_pose 有没有值), 跟下面 showFollowButton 是两件事——这个控制
    *  能力, 那个只控制"要不要画组件自带的那颗按钮"。 */
@@ -157,7 +167,8 @@ function createWaypointLabelSprite(text: string): THREE.Sprite {
 
 export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function PointCloudView({
   mapName, meta, pointcloudMeta = null, waypoints = [], showWaypointNumbers = true, status = null, trail = null,
-  optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, enableFollow = false,
+  optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, surroundCloud = null,
+  liveOnly = false, enableFollow = false,
   showFollowButton = true, onFollowingChange,
   heightLimit, controlMode = "orbit", onRecenterModeChange,
   routeEditMode = false, onChangeWaypoints,
@@ -232,6 +243,10 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // 雷达实时点云同样用持久 Points/缓冲区(见下面那个 effect), 不逐帧整个重建。
   const surfCloudPointsRef = useRef<THREE.Points | null>(null);
   const surfCloudCapacityRef = useRef(0);
+  // 建图页的 /surround_map_cloud, 同一套持久缓冲区复用手法(见下面那个 effect)。
+  const surroundCloudGroupRef = useRef<THREE.Group | null>(null);
+  const surroundCloudPointsRef = useRef<THREE.Points | null>(null);
+  const surroundCloudCapacityRef = useRef(0);
   // 按需渲染: 场景大多数时候是静止的(尤其点云可能有几百万个点), 不值得每帧都
   // 真跑一次 renderer.render()。这个 flag 由所有会改变画面的地方(相机交互/跟随
   // 动画/props 驱动的场景更新/resize)置位, animate() 里渲染完就清掉, 空闲时
@@ -505,42 +520,53 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     surfCloudPointsRef.current = null;
     surfCloudCapacityRef.current = 0;
 
+    const surroundCloudGroup = new THREE.Group();
+    scene.add(surroundCloudGroup);
+    surroundCloudGroupRef.current = surroundCloudGroup;
+    surroundCloudPointsRef.current = null;
+    surroundCloudCapacityRef.current = 0;
+
     let disposed = false;
     let points: THREE.Points | null = null;
     // 整图预览和分片共用同一个点大小(屏幕像素常量), 见下面材质创建处的说明。
     const POINT_PIXEL_SIZE = 0.7;
 
-    fetch(mapAssetUrl(mapName, "pointcloud.bin"))
-      .then((r) => r.arrayBuffer())
-      .then((buf) => {
-        if (disposed) return;
-        const { count, positions, colors } = parsePCW1(buf);
-        const geometry = new THREE.BufferGeometry();
-        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-        geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-        // 显式算一次包围球: 不算的话 three.js 会在每次视锥裁剪判断时按需现算,
-        // 对几百万点的几何体是笔不小的开销, 提前算好、之后就是只读缓存命中。
-        geometry.computeBoundingSphere();
-        // 点的大小固定按屏幕像素算(sizeAttenuation=false), 不随距离缩放 —— 之前用
-        // world-space 尺寸(sizeAttenuation 默认 true, 屏幕像素大小 ≈ size/distance),
-        // 按默认视距调好了跨度几公里的室外地图能看清(见下面, 曾经误判成"降采样降
-        // 太狠了", 实测同一份原始点云按目标点数降的采样反而比参照工具的 1m 体素密度
-        // 更高, 数据没问题), 但那只是"默认视角刚好合适"—— 一旦用户滚轮拉近, 固定的
-        // world-space 尺寸会随透视放大, 每个点从几毫米的小点糊成占满好几十像素的大块,
-        // 一堆点糊在一起完全看不出"点云"的颗粒感了(反馈: "拉近了都糊成一团")。
-        // 屏幕像素常量大小才是点云查看器的标准做法(参照的 PCD viewer 工具也是这样),
-        // 不管离多近多远, 每个点始终是那么大的一个小点, 近处才会因为点间距变大而露出
-        // 颗粒感, 这才是"点云"该有的样子。
-        const material = new THREE.PointsMaterial({
-          size: POINT_PIXEL_SIZE, sizeAttenuation: false,
-          vertexColors: true, clippingPlanes: [heightPlaneRef.current],
-        });
-        points = new THREE.Points(geometry, material);
-        scene.add(points);
-        needsRenderRef.current = true;
-        console.log(`point cloud loaded: ${count} points`);
-      })
-      .catch((err) => console.error("failed to load point cloud", err));
+    // liveOnly(建图页): 这张地图还没预处理产出 pointcloud.bin, 抓了也只是白白
+    // 404 一次, 直接跳过——建图页的点云全靠下面 surroundCloud/surfCloud 那两个
+    // 实时流 effect 画, 不需要这份静态底图。
+    if (!liveOnly) {
+      fetch(mapAssetUrl(mapName, "pointcloud.bin"))
+        .then((r) => r.arrayBuffer())
+        .then((buf) => {
+          if (disposed) return;
+          const { count, positions, colors } = parsePCW1(buf);
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+          geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+          // 显式算一次包围球: 不算的话 three.js 会在每次视锥裁剪判断时按需现算,
+          // 对几百万点的几何体是笔不小的开销, 提前算好、之后就是只读缓存命中。
+          geometry.computeBoundingSphere();
+          // 点的大小固定按屏幕像素算(sizeAttenuation=false), 不随距离缩放 —— 之前用
+          // world-space 尺寸(sizeAttenuation 默认 true, 屏幕像素大小 ≈ size/distance),
+          // 按默认视距调好了跨度几公里的室外地图能看清(见下面, 曾经误判成"降采样降
+          // 太狠了", 实测同一份原始点云按目标点数降的采样反而比参照工具的 1m 体素密度
+          // 更高, 数据没问题), 但那只是"默认视角刚好合适"—— 一旦用户滚轮拉近, 固定的
+          // world-space 尺寸会随透视放大, 每个点从几毫米的小点糊成占满好几十像素的大块,
+          // 一堆点糊在一起完全看不出"点云"的颗粒感了(反馈: "拉近了都糊成一团")。
+          // 屏幕像素常量大小才是点云查看器的标准做法(参照的 PCD viewer 工具也是这样),
+          // 不管离多近多远, 每个点始终是那么大的一个小点, 近处才会因为点间距变大而露出
+          // 颗粒感, 这才是"点云"该有的样子。
+          const material = new THREE.PointsMaterial({
+            size: POINT_PIXEL_SIZE, sizeAttenuation: false,
+            vertexColors: true, clippingPlanes: [heightPlaneRef.current],
+          });
+          points = new THREE.Points(geometry, material);
+          scene.add(points);
+          needsRenderRef.current = true;
+          console.log(`point cloud loaded: ${count} points`);
+        })
+        .catch((err) => console.error("failed to load point cloud", err));
+    }
 
     // 大地图分片(见 map_pipeline/generate_map_assets.py 的 export_tiles, 只有
     // 跨度超过阈值的地图才有): 上面那份整图预览受限于全图一个下采样点数预算,
@@ -895,12 +921,17 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         p.geometry.dispose();
         (p.material as THREE.Material).dispose();
       });
+      surroundCloudGroup.children.forEach((c) => {
+        const p = c as THREE.Points;
+        p.geometry.dispose();
+        (p.material as THREE.Material).dispose();
+      });
       renderer.dispose();
       container.removeChild(renderer.domElement);
       domElementRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta, mapName, pointcloudMeta]);
+  }, [meta, mapName, pointcloudMeta, liveOnly]);
 
   // 高度限制: heightLimit 本身就是世界系绝对 z(由页面把滑杆钉在
   // [world_bounds.z_min, z_max] 之间), 点云不会转, 直接赋值给裁剪平面就行。
@@ -1285,6 +1316,52 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     posAttr.needsUpdate = true;
     geometry.setDrawRange(0, count);
   }, [surfCloud]);
+
+  // 建图页专用: /surround_map_cloud, 建图模式下随关键帧更新的局部地图点云——
+  // 跟上面 surfCloud 那个 effect 是同一套持久缓冲区复用手法, 只换了点样式(更
+  // 大、浅色), 好跟 surfCloud(当前帧扫描, 蓝色小点, 只是个"正在扫哪里"的高亮
+  // 提示)区分开——surroundCloud 才是建图页真正在看的主体内容。
+  useEffect(() => {
+    const group = surroundCloudGroupRef.current;
+    if (!group) return;
+    needsRenderRef.current = true;
+
+    if (!surroundCloud || surroundCloud.length < 3) {
+      if (surroundCloudPointsRef.current) surroundCloudPointsRef.current.visible = false;
+      return;
+    }
+
+    const count = Math.floor(surroundCloud.length / 3);
+    let points = surroundCloudPointsRef.current;
+
+    if (!points || count > surroundCloudCapacityRef.current) {
+      if (points) {
+        points.geometry.dispose();
+        (points.material as THREE.Material).dispose();
+        group.remove(points);
+      }
+      const capacity = Math.ceil(count * 1.5);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(capacity * 3), 3));
+      const material = new THREE.PointsMaterial({
+        size: 0.03, color: 0xd8dee9, clippingPlanes: [heightPlaneRef.current],
+      });
+      points = new THREE.Points(geometry, material);
+      points.renderOrder = 7;
+      // 理由同 surfCloud 那个 effect: 局部地图点云, 不值得为它维护精确包围球。
+      points.frustumCulled = false;
+      group.add(points);
+      surroundCloudPointsRef.current = points;
+      surroundCloudCapacityRef.current = capacity;
+    }
+    points.visible = true;
+
+    const geometry = points.geometry;
+    const posAttr = geometry.getAttribute("position") as THREE.BufferAttribute;
+    (posAttr.array as Float32Array).set(surroundCloud);
+    posAttr.needsUpdate = true;
+    geometry.setDrawRange(0, count);
+  }, [surroundCloud]);
 
   const hasPose = Boolean(status?.robot_pose);
 
