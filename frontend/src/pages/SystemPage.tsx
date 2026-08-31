@@ -189,10 +189,7 @@ export default function SystemPage() {
               const busy = pending || svc.active_state === "activating" || svc.active_state === "deactivating";
               return (
                 <div key={svc.id} className="flex items-center justify-between py-3">
-                  <div>
-                    <div className="text-sm">{svc.label}</div>
-                    <div className="font-mono text-[11px] text-muted-foreground">{svc.unit}</div>
-                  </div>
+                  <div className="text-sm">{svc.label}</div>
                   <div className="flex items-center gap-3">
                     <span className={`text-xs font-medium ${display.className}`}>{display.text}</span>
                     {svc.active_state === "active" ? (
@@ -210,7 +207,7 @@ export default function SystemPage() {
                           <AlertDialogHeader>
                             <AlertDialogTitle>停止「{svc.label}」?</AlertDialogTitle>
                             <AlertDialogDescription>
-                              {svc.unit} 将被停止, 依赖它的功能(比如导航)会跟着不可用, 确定继续吗？
+                              「{svc.label}」将被停止, 依赖它的功能(比如导航)会跟着不可用, 确定继续吗？
                             </AlertDialogDescription>
                           </AlertDialogHeader>
                           <AlertDialogFooter>

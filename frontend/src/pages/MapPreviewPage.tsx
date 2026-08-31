@@ -729,19 +729,18 @@ export default function MapPreviewPage() {
                     用户先确认/启动这个服务。跟具体是哪张地图无关(机器狗层面的
                     服务), 顺带在这里管起停, 不用跳去系统管理页。 */}
                 {isActive && (
-                  <PanelSection title="路线规划服务">
-                    <div className="mb-2 flex items-center justify-between text-xs text-white/70">
-                      <span className="font-mono">ros-bringup.service</span>
-                      {plannerService && (
-                        <span className={cn(
-                          "font-medium",
-                          PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].className,
-                        )}
-                        >
-                          {PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].text}
-                        </span>
+                  <PanelSection
+                    title="路线规划服务"
+                    right={plannerService && (
+                      <span className={cn(
+                        "font-medium",
+                        PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].className,
                       )}
-                    </div>
+                      >
+                        {PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].text}
+                      </span>
+                    )}
+                  >
                     {plannerService?.active_state === "active" ? (
                       <PanelButton
                         icon={OctagonX}
@@ -886,10 +885,15 @@ function ToolbarButton({
   );
 }
 
-function PanelSection({ title, children }: { title: string; children: React.ReactNode }) {
+function PanelSection({
+  title, right, children,
+}: { title: string; right?: React.ReactNode; children: React.ReactNode }) {
   return (
     <div className="border-b border-white/10 px-4 py-4">
-      <div className="mb-2.5 text-xs font-medium text-white/50">{title}</div>
+      <div className="mb-2.5 flex items-center justify-between text-xs font-medium text-white/50">
+        <span>{title}</span>
+        {right}
+      </div>
       {children}
     </div>
   );
