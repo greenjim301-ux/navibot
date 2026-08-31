@@ -192,6 +192,7 @@ export default function MappingPage() {
         surfCloud={surfCloud}
         heightLimit={effectiveHeightLimit}
         controlMode="fixed"
+        robotMarkerStyle="tripod"
         enableFollow
         showFollowButton={false}
         onRecenterModeChange={setRecentering}

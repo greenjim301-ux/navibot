@@ -70,6 +70,12 @@ interface Props {
    *  要的是"视角不会被误拖走", 想换视角中心改用 PointCloudViewHandle.
    *  toggleRecenter() 点选。 */
   controlMode?: "orbit" | "fixed";
+  /** 机器狗当前位置标记的样式。"cone"(默认): 红色锥形, 跟着 yaw 转, 俯视时能
+   *  直接看出机器狗朝哪边——导航页/地图预览页在看机器狗实时导航状态, 朝向是
+   *  有用信息, 不要改。"tripod": 跟世界原点参照物一样的三叉轴(不跟着 yaw
+   *  转), 只有建图页在用——建图页要的是"机器狗回到原点附近时, 两个标记能不能
+   *  肉眼判断出位置重合了", 朝向反而是干扰(见 createAxesTripod 的说明)。 */
+  robotMarkerStyle?: "cone" | "tripod";
   /** "点选新中心点"模式是否开启(见 PointCloudViewHandle.toggleRecenter), 每次
    *  开关状态变化(手动切换 / 点选成功 / resetView 顺带取消)时回调一次, 给外部
    *  按钮同步高亮状态用。 */
@@ -165,12 +171,35 @@ function createWaypointLabelSprite(text: string): THREE.Sprite {
   return sprite;
 }
 
+// 世界坐标原点参照物(所有页面都用)、以及 robotMarkerStyle="tripod" 时机器狗
+// 当前位置标记(目前只有建图页选这个样式, 见 Props.robotMarkerStyle)用的是
+// 同一种"三叉轴"标记(X/Y/Z 三条线, 颜色跟 three.js AxesHelper 的默认约定一致:
+// 红/绿/蓝)。用同一个 size/材质画出来的两个三叉轴长得一模一样——机器狗回到
+// 原点附近时, 两个标记视觉上会重合成一个, 一眼就能判断坐标对没对上, 这也是
+// 建图页那份标记特意不跟着 yaw 旋转的原因(见下面机器狗位姿标记那个 effect):
+// 转了的话哪怕位置真的重合, 两个三叉轴的臂朝向也会不一样, 看起来就不像
+// "重合了"。用 Line2(fat line)而不是 THREE.AxesHelper 自带的细线, 是因为
+// AxesHelper 内部就是普通 LineSegments, 在大多数平台上线宽固定卡在 1px,
+// 加粗不了。
+function createAxesTripod(materials: [LineMaterial, LineMaterial, LineMaterial], size: number): THREE.Group {
+  const group = new THREE.Group();
+  const tips: [number, number, number][] = [[size, 0, 0], [0, size, 0], [0, 0, size]];
+  tips.forEach((tip, i) => {
+    const geometry = new LineGeometry();
+    geometry.setPositions([0, 0, 0, ...tip]);
+    const line = new Line2(geometry, materials[i]);
+    line.computeLineDistances();
+    group.add(line);
+  });
+  return group;
+}
+
 export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function PointCloudView({
   mapName, meta, pointcloudMeta = null, waypoints = [], showWaypointNumbers = true, status = null, trail = null,
   optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, surroundCloud = null,
   liveOnly = false, enableFollow = false,
   showFollowButton = true, onFollowingChange,
-  heightLimit, controlMode = "orbit", onRecenterModeChange,
+  heightLimit, controlMode = "orbit", robotMarkerStyle = "cone", onRecenterModeChange,
   routeEditMode = false, onChangeWaypoints,
   startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
 }, ref) {
@@ -227,7 +256,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   const plannedRouteMaterialRef = useRef<LineMaterial | null>(null);
   const navRouteGroupRef = useRef<THREE.Group | null>(null);
   const navRouteMaterialRef = useRef<LineMaterial | null>(null);
-  const robotMeshRef = useRef<THREE.Mesh | null>(null);
+  const robotMeshRef = useRef<THREE.Group | null>(null);
   const pathGroupRef = useRef<THREE.Group | null>(null);
   const pathMarkersRef = useRef<THREE.Group | null>(null);
   const pathMaterialsRef = useRef<LineMaterial | null>(null);
@@ -425,9 +454,18 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       needsRenderRef.current = true;
     };
 
-    // 世界坐标轴参照物, 固定标世界系的 x/y/z, 点云本身不转, 这个参照物也就不用
-    // 跟着挂在什么组下面。
-    const origin = new THREE.AxesHelper(0.6);
+    // 世界坐标原点参照物 + 机器狗当前位置标记, 用同一套三叉轴材质画(见
+    // createAxesTripod 的说明)——加粗到 4.0(其它线普遍是 2.0~2.5), 一眼能
+    // 跟点云区分开, 也是"加粗一点"这个要求本身要的效果。三个材质分别对应
+    // X(红)/Y(绿)/Z(蓝), 两个三叉轴共用, resize 时只需要更新这一份。
+    const axisXMaterial = new LineMaterial({ color: 0xff0000, linewidth: 4.0, depthTest: false });
+    const axisYMaterial = new LineMaterial({ color: 0x00ff00, linewidth: 4.0, depthTest: false });
+    const axisZMaterial = new LineMaterial({ color: 0x0000ff, linewidth: 4.0, depthTest: false });
+    const axisMaterials: [LineMaterial, LineMaterial, LineMaterial] = [axisXMaterial, axisYMaterial, axisZMaterial];
+    axisMaterials.forEach((m) => m.resolution.set(width, height));
+
+    // 固定在世界原点, 点云本身不转, 这个参照物也就不用跟着挂在什么组下面。
+    const origin = createAxesTripod(axisMaterials, 0.6);
     scene.add(origin);
 
     const markersGroup = new THREE.Group();
@@ -465,13 +503,23 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     scene.add(navRouteGroup);
     navRouteGroupRef.current = navRouteGroup;
 
-    const robotMesh = new THREE.Mesh(
-      new THREE.ConeGeometry(0.18, 0.4, 12),
-      new THREE.MeshBasicMaterial({ color: 0xd74747 }),
-    );
-    // 朝向标记平躺在地面上(不是朝天竖着), 这样俯视时能直接看出机器狗朝哪边。
-    // 之前是 rotation.x=PI/2 让圆锥指向 +Z, 再 rotation.z=yaw 只是绕自身轴自转,
-    // 朝向根本没画出来。
+    // 机器狗当前位置标记。默认(cone)是红色锥形, 跟着 yaw 转, 导航页/地图预览页
+    // 用这个看机器狗实时朝向。建图页传 robotMarkerStyle="tripod", 换成大小/
+    // 材质跟原点参照物完全一样的三叉轴(同一个 size=0.6、同一份 axisMaterials),
+    // 且不跟着 yaw 转——两个三叉轴长得一模一样是特意的(见 createAxesTripod 的
+    // 说明), 建图页要的是"机器狗回到原点附近时能直接看出两个标记是不是重合到
+    // 一块了", 不是朝向。统一包一层 Group, 不管哪种样式 robotMeshRef 的类型、
+    // 下面位姿 effect 的 position/visible 操作都一样, 只有要不要转 yaw 不同。
+    let robotMesh: THREE.Group;
+    if (robotMarkerStyle === "tripod") {
+      robotMesh = createAxesTripod(axisMaterials, 0.6);
+    } else {
+      robotMesh = new THREE.Group();
+      robotMesh.add(new THREE.Mesh(
+        new THREE.ConeGeometry(0.18, 0.4, 12),
+        new THREE.MeshBasicMaterial({ color: 0xd74747 }),
+      ));
+    }
     robotMesh.visible = false;
     scene.add(robotMesh);
     robotMeshRef.current = robotMesh;
@@ -880,6 +928,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       optimalMaterial.resolution.set(w, h);
       plannedRouteMaterial.resolution.set(w, h);
       navRouteMaterial.resolution.set(w, h);
+      axisMaterials.forEach((m) => m.resolution.set(w, h));
     }
     window.addEventListener("resize", handleResize);
 
@@ -906,6 +955,17 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       plannedRouteMaterial.dispose();
       navRouteGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       navRouteMaterial.dispose();
+      origin.children.forEach((c) => (c as Line2).geometry.dispose());
+      axisMaterials.forEach((m) => m.dispose());
+      if (robotMarkerStyle === "tripod") {
+        robotMesh.children.forEach((c) => (c as Line2).geometry.dispose());
+      } else {
+        robotMesh.children.forEach((c) => {
+          const m = c as THREE.Mesh;
+          m.geometry.dispose();
+          (m.material as THREE.Material).dispose();
+        });
+      }
       selfInflationGroup.children.forEach((c) => {
         const m = c as THREE.Mesh;
         m.geometry.dispose();
@@ -931,7 +991,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       domElementRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta, mapName, pointcloudMeta, liveOnly]);
+  }, [meta, mapName, pointcloudMeta, liveOnly, robotMarkerStyle]);
 
   // 高度限制: heightLimit 本身就是世界系绝对 z(由页面把滑杆钉在
   // [world_bounds.z_min, z_max] 之间), 点云不会转, 直接赋值给裁剪平面就行。
@@ -1080,9 +1140,13 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 直接用 odom 的 z: 它就是机体中心在世界系里的高度, 上下楼梯时这个标记会
     // 跟着升降。
     mesh.position.set(pose.x, pose.y, pose.z);
-    // ConeGeometry 的轴默认沿 +Y, 绕 Z 转 (yaw - 90°) 正好让锥尖指向 yaw 方向
-    mesh.rotation.z = pose.yaw - Math.PI / 2;
-  }, [status]);
+    if (robotMarkerStyle === "cone") {
+      // ConeGeometry 的轴默认沿 +Y, 绕 Z 转 (yaw - 90°) 正好让锥尖指向 yaw 方向
+      mesh.rotation.z = pose.yaw - Math.PI / 2;
+    }
+    // tripod 样式不跟着 yaw 转——要跟原点参照物长得一模一样才方便建图页肉眼
+    // 判断"回没回到原点", 见 createAxesTripod 的说明。
+  }, [status, robotMarkerStyle]);
 
   // 参考路线: 每段单独一条 Line2 (规划成功的画青色实线, 不连通只能直连的画
   // 橙色虚线)。z 抬高到离地 20cm, 避免被地面点云"埋"住看不见。
