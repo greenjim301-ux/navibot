@@ -216,8 +216,9 @@ export interface MappingStatus {
   updated_at: number;
 }
 
-/** 建图页机器狗当前位置, 来自 /tf(map -> latest_lidar), 没有 cov 字段——建图
- *  模式下没有 EKF 融合出来的定位质量标量, 见 backend/app/ros_bridge.py 的
+/** 建图页机器狗当前位置, 来自 /tf(见 backend/app/config.py 的
+ *  MAPPING_TF_MAP_FRAME/MAPPING_TF_BODY_FRAME), 没有 cov 字段——建图模式下
+ *  没有 EKF 融合出来的定位质量标量, 见 backend/app/ros_bridge.py 的
  *  MappingPoseCallback。 */
 export interface MappingPose {
   x: number;

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, RefreshCw, Save, Target } from "lucide-react";
+import { ArrowLeft, Crosshair, RefreshCw, Save, Target } from "lucide-react";
 import { cancelMapping, getMappingStatus, saveMapping } from "../api";
 import { useMappingStatus } from "../useMappingStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
@@ -88,6 +88,7 @@ export default function MappingPage() {
   const effectiveHeightLimit = heightLimit ?? zRange.max;
 
   const [recentering, setRecentering] = useState(false);
+  const [following, setFollowing] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -191,8 +192,10 @@ export default function MappingPage() {
         surfCloud={surfCloud}
         heightLimit={effectiveHeightLimit}
         controlMode="fixed"
+        enableFollow
         showFollowButton={false}
         onRecenterModeChange={setRecentering}
+        onFollowingChange={setFollowing}
       />
 
       <div className="absolute top-0 right-0 z-10 flex h-full w-64 flex-col gap-4 border-l border-white/10 bg-neutral-900/90 p-4 text-white/90 backdrop-blur-md">
@@ -211,6 +214,21 @@ export default function MappingPage() {
         </div>
 
         <div className="flex flex-col gap-1.5">
+          <button
+            type="button"
+            onClick={() => pcRef.current?.toggleFollow()}
+            disabled={!pose}
+            title={pose ? undefined : "还没有收到机器狗位姿"}
+            className={cn(
+              "flex items-center gap-2.5 rounded-md border px-3 py-2 text-left text-sm transition-colors disabled:opacity-40",
+              following
+                ? "border-cyan-400/40 bg-cyan-500/20 text-cyan-100"
+                : "border-white/10 bg-white/5 text-white/80 hover:bg-white/10",
+            )}
+          >
+            <Crosshair className="size-4 shrink-0" />
+            {following ? "跟随中" : "跟随机器狗"}
+          </button>
           <button
             type="button"
             onClick={() => pcRef.current?.toggleRecenter()}

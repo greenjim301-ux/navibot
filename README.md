@@ -193,11 +193,15 @@ systemd 服务 → 跳到建图页实时看点云 → 取消（丢弃）或保�
 建图页看的三个数据源：
 
 - 位姿：`/tf`（`MAPPING_TF_MAP_FRAME`→`MAPPING_TF_BODY_FRAME`，默认
-  `map`→`latest_lidar`）——建图模式下 SCAN-Planner 不跑，没有
-  `/hand_lio/odom_vehicle`，只能查 TF。帧名取自
-  `HandBot-S1-view/ros1.rviz` 里的 TF 树，**没有拿到实际建图 launch 文件核对
-  过**，是从可视化配置反推的；如果帧名不对，现场会一直查不到 TF、机器狗
-  marker 不出现，但点云本身不受影响（见「已知缺口」）。
+  `map`→`livox_frame`）——建图模式下 SCAN-Planner 不跑，没有
+  `/hand_lio/odom_vehicle`，只能查 TF。帧名最初是从
+  `HandBot-S1-view/ros1.rviz` 里保存的 TF 树反推的（`latest_lidar`），后来
+  对着实际跑起来的 `cloud_mapping_small.service` 直接 `rostopic echo /tf`
+  核对过，发现纯点云（无相机）建图模式下 `/tf` 只广播 `map -> livox_frame`
+  这一条，没有 `latest_lidar`——推测 `latest_lidar` 是彩色建图模式才会挂出来
+  的额外相机锚点帧，rviz 那份配置大概率是彩色建图/带相机场景下截的。彩色
+  建图模式（`color_mapping_small`/`color_mapping_large`）下这个默认值有没有
+  问题还没现场核对过（见「已知缺口」）。
 - `/surround_map_cloud`：建图模式下是"当前位姿附近的局部地图点云"，随关键帧
   更新（见 `hand-lio/hand-topic.csv`），是建图页真正在看的主体内容。
 - `/surf_cloud_in_map`（`MAPPING_SURF_CLOUD_TOPIC`）：只是"当前这一帧扫到哪里"
@@ -330,12 +334,18 @@ keyframe_info_3d.txt}` + `2d_map/{map_2d.pgm,map_2d.yaml}`）跟
   `systemctl`/`sudo -n systemctl`，开发机没有 systemd/这几个单元，本地跑不了；
   见"服务状态管理"一节的 sudoers 规则也还没有在机器上实际配过——权限没配对时
   的报错文本是否真的可读、`sudo -n` 在目标机器上的确切失败提示，都还没实机验证。
-- **建图页/保存流程整体没有在真实机器上跑过。** 没有 board 访问权限，`/tf` 的
-  `map -> latest_lidar` 帧名是从 `HandBot-S1-view/ros1.rviz` 反推的，没有拿建图
-  模式实际的 launch 文件核对过；`start_save_map.bash` 产出的目录结构是否真的跟
-  `map_registry` 期望的一致也是推断，不是核对过的事实——见「建图」一节。这几处
-  只要有一处跟假设不符，现象都是"建图页看不到点云/机器狗位置"或者"保存失败"，
-  不是别的隐蔽 bug。
+- **建图页的保存流程还没在真实机器上跑过。** `start_save_map.bash` 产出的目录
+  结构是否真的跟 `map_registry` 期望的一致是推断，不是核对过的事实——见
+  「建图」一节。点云/机器狗位置这部分已经实机验证过（见下一条），保存这一步
+  没有 board 上的完整建图-保存流程可跑，仍然是假设，不符的话现象会是"保存
+  失败"，不是别的隐蔽 bug。
+- **`/tf` 的 `map -> livox_frame` 帧名只在纯点云建图模式下核对过。** 对着实际
+  跑起来的 `cloud_mapping_small.service` 直接连上机器人的 ROS master 读
+  `/tf` 确认过（见 `MAPPING_TF_BODY_FRAME` 的说明），彩色建图模式
+  （`color_mapping_small`/`color_mapping_large`）下 `/tf` 会不会额外发布/换成
+  别的帧名（比如 `HandBot-S1-view/ros1.rviz` 里截到的 `latest_lidar`）还没有
+  实机核对过，不符的话现象是"建图页（仅彩色建图模式下）看不到机器狗位置"，
+  点云本身不受影响。
 - **激活地图时创建软链接、检查 localization.service 状态，都没有实机验证过。**
   `map_registry.py` 的 `activate_map`/`clear_localization_link` 假定
   `localization.service` 只在启动时读一次 `config.SAVE_MAP_DIR`（之后不管软

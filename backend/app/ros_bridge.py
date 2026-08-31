@@ -37,9 +37,10 @@ InflationMapCallback = Callable[[np.ndarray], None]
 # 用的 MAPPING_SURF_CLOUD_TOPIC/surf_cloud_in_map 是两个不同的话题, 见 config.py
 # 里两个常量各自的说明), 同样拍平成 float32 一维数组, 每帧整体替换
 SurfCloudCallback = Callable[[np.ndarray], None]
-# 建图页专用: (x, y, z, yaw, stamp), 来自 /tf(map -> latest_lidar), 不是
-# ODOM_TOPIC——建图模式下 SCAN-Planner 不跑, 没有 cov 这个概念(不是 EKF 融合出
-# 来的, 没有对应的定位质量标量), 比 PoseCallback 少一个字段。
+# 建图页专用: (x, y, z, yaw, stamp), 来自 /tf(MAPPING_TF_MAP_FRAME ->
+# MAPPING_TF_BODY_FRAME, 见 config.py 里这两个常量的说明), 不是 ODOM_TOPIC——
+# 建图模式下 SCAN-Planner 不跑, 没有 cov 这个概念(不是 EKF 融合出来的, 没有
+# 对应的定位质量标量), 比 PoseCallback 少一个字段。
 MappingPoseCallback = Callable[[float, float, float, float, float], None]
 # 建图页的两路点云(/surround_map_cloud、建图页专用的 /surf_cloud_in_map 订阅),
 # 跟 SurfCloudCallback 同样的拍平数组约定, 单独起名只是为了在 __init__ 里跟

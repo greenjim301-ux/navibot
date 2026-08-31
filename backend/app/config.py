@@ -281,13 +281,19 @@ SURROUND_MAP_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_TOPIC", "/
 # /hand_lio/clouds_lidar 那份没降采样、给地图预览页看细节用的精度。见
 # SURF_CLOUD_TOPIC 定义处的说明。
 MAPPING_SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_MAPPING_SURF_CLOUD_TOPIC", "/surf_cloud_in_map")
-# 建图页机器狗当前位置来自 /tf(map -> latest_lidar), 不是 ODOM_TOPIC——建图模式
-# 下 SCAN-Planner 不跑, /hand_lio/odom_vehicle 不一定有。帧名取自
-# HandBot-S1-view/ros1.rviz 里的 TF 树(map -> latest_lidar -> camera; map ->
-# livox_frame), 没有拿到实际建图 launch 文件核对过, 是从可视化配置反推的——如果
-# 帧名不对, 现场会一直查不到 TF、机器狗 marker 不出现, 但点云本身不受影响。
+# 建图页机器狗当前位置来自 /tf(map -> livox_frame), 不是 ODOM_TOPIC——建图模式
+# 下 SCAN-Planner 不跑, /hand_lio/odom_vehicle 不一定有。帧名最初是从
+# HandBot-S1-view/ros1.rviz 保存的 TF 树反推的("latest_lidar", map -> latest_lidar
+# -> camera; map -> livox_frame 是并列的两支), 实机联调对着正在跑的
+# cloud_mapping_small.service 直接 rostopic echo /tf 核对过、发现不对: 当前这个
+# (纯点云, 无相机)建图模式下, /tf 里从头到尾只广播过 map -> livox_frame 这一条,
+# 压根没有 latest_lidar/camera 那支——推测 latest_lidar 是相机/彩色建图模式才会
+# 发布的额外挂载帧(rviz 那份配置大概率是彩色建图/带相机场景下截的), 纯点云建图
+# 时机体的实时位姿就是 livox_frame。如果以后彩色建图模式下这里反而查不到,
+# 大概率是彩色模式换回发布 latest_lidar 了, 需要按模式区分, 现在先按能验证到的
+# cloud 模式实测结果为准。
 MAPPING_TF_MAP_FRAME = os.environ.get("NAVIBOT_MAPPING_TF_MAP_FRAME", "map")
-MAPPING_TF_BODY_FRAME = os.environ.get("NAVIBOT_MAPPING_TF_BODY_FRAME", "latest_lidar")
+MAPPING_TF_BODY_FRAME = os.environ.get("NAVIBOT_MAPPING_TF_BODY_FRAME", "livox_frame")
 MAPPING_POSE_BROADCAST_HZ = float(os.environ.get("NAVIBOT_MAPPING_POSE_BROADCAST_HZ", "10.0"))
 SURROUND_MAP_CLOUD_BROADCAST_HZ = float(os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_BROADCAST_HZ", "5.0"))
 SURROUND_MAP_CLOUD_VOXEL_SIZE_M = float(os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_VOXEL_SIZE_M", "0.1"))
