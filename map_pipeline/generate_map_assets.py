@@ -12,6 +12,13 @@
                                   高度切片判占据, 漏掉切片高度之外的障碍;
                                   没有 keyframe_info_3d.txt 生成不了就沿用
                                   原文件, 都没有就跳过
+  2d_map/map_2d_raw.pgm + .yaml  handbot slam 实时建图时自己存的原图, 不会被
+                                  本脚本覆盖(文件名跟上面那个不同)。既用来当
+                                  2D 栅格图的物理边界(见 raw_map2d_xy_bounds),
+                                  也用来把它标"未知"的格子在新图里改判 occupied
+                                  (见 --block-unscanned/raw_map2d_unknown_mask)
+                                  ——它是 SLAM 自己做过 ray casting 的结果, 比
+                                  事后从点云猜"扫没扫到"靠谱。没有就都跳过
 输出 (web_assets/map/<room>/ 下):
   topview_meta.json       地图基础几何信息: world_bounds(含 z_min/z_max, 从点云
                            算, 3D 预览用) + topview2d(2D 栅格图的分辨率/像素尺寸/
@@ -246,6 +253,62 @@ def raw_map2d_xy_bounds(map2d_dir: Path) -> tuple[float, float, float, float] | 
     x_max = x_min + width * info["resolution"]
     y_max = y_min + height * info["resolution"]
     return x_min, x_max, y_min, y_max
+
+
+def raw_map2d_unknown_mask(
+    map2d_dir: Path,
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+) -> np.ndarray | None:
+    """读 handbot slam 自己存的 map_2d_raw.pgm(+.yaml), 把它标"未知"(205,
+    map_server 灰度约定)的格子重採样到 (bounds, resolution) 描述的输出网格上,
+    返回布尔数组(True=未知)。跟 raw_map2d_xy_bounds 读的是同一份文件, 但那边
+    只要 yaml 里的分辨率/原点算物理边界, 这里要把像素值真的读出来。
+
+    map_2d_raw.pgm 是 handbot slam 实时建图时自己跑占据栅格算法(真正做过
+    ray casting)算出来的, 它标的"未知"就是雷达确实没照到过的地方——直接拿来用,
+    比事后从合并点云猜"扫没扫到过"靠谱得多。两条更直接的路都试过、都不准:
+    逐格点云密度会被地面稀疏採样坑(地面是全场覆盖最差的面, 雷达 0.8m 盲区 +
+    掠射角, 见 elevation.ElevationParams.resolution 的实测), 离轨迹距离在任何
+    真实地图上又太常见(整个房间除了机器人踩过的窄带全会被算"离轨迹远", 而这跟
+    "扫没扫到"根本是两回事)。SLAM 自己实时建图时做的 ray casting 才是真正
+    第一手的"扫没扫到"信息, 不用再猜。
+
+    重採样用最近邻(每个输出格子左上角点的世界坐标, 换算成 map_2d_raw 自己的
+    像素坐标去取值), 用左上角而不是格子中心是为了跟 clear_trajectory/
+    mark_known_region/detect_structure 等其它步骤统一的"floor((坐标-原点)/
+    分辨率)"取整方式保持一致。两张图分辨率不一定相同(这条流水线的输出分辨率
+    按地图跨度自动选, 见 _auto_map2d_resolution; raw 图固定是 SLAM 自己存图
+    时用的分辨率), 所以要按世界坐标对齐, 不能假设两边网格一一对应。
+
+    没有 map_2d_raw.pgm(+.yaml)就返回 None, 调用方自己决定跳过这一步。
+    """
+    raw_pgm, raw_yaml = map2d_dir / "map_2d_raw.pgm", map2d_dir / "map_2d_raw.yaml"
+    if not (raw_pgm.is_file() and raw_yaml.is_file()):
+        return None
+
+    info = _parse_map2d_yaml(raw_yaml)
+    raw_res = info["resolution"]
+    raw_x_min, raw_y_min = info["origin_x"], info["origin_y"]
+    raw_arr = np.array(Image.open(raw_pgm))
+    raw_h, raw_w = raw_arr.shape
+    raw_y_max = raw_y_min + raw_h * raw_res
+
+    x_min, x_max, y_min, y_max = bounds
+    width = int(np.ceil((x_max - x_min) / resolution))
+    height = int(np.ceil((y_max - y_min) / resolution))
+
+    row, col = np.mgrid[0:height, 0:width]
+    world_x = x_min + col * resolution
+    world_y = y_max - row * resolution
+
+    raw_col = np.floor((world_x - raw_x_min) / raw_res).astype(np.int64)
+    raw_row = np.floor((raw_y_max - world_y) / raw_res).astype(np.int64)
+
+    inb = (raw_col >= 0) & (raw_col < raw_w) & (raw_row >= 0) & (raw_row < raw_h)
+    unknown = np.zeros((height, width), dtype=bool)
+    unknown[inb] = raw_arr[raw_row[inb], raw_col[inb]] == 205
+    return unknown
 
 
 def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
@@ -499,6 +562,12 @@ def main():
                           "(global_planner.py)只有明确占据才会挡, 未知区域只是规划代价更高,"
                           "见 mark_known_region 说明。跟 --map2d-trajectory-clear-radius"
                           "不是同一件事, 不要混用")
+    ap.add_argument("--block-unscanned", action=_BooleanOptionalAction, default=True,
+                     help="把 map_2d_raw.pgm(handbot slam 自己建图时跑 ray casting 算出"
+                          "的原图)里标'未知'的格子, 在新图里也标 occupied(0), 不让全局"
+                          "规划器把这些雷达确认没照到过的地方当能走的空地穿过去。见"
+                          "raw_map2d_unknown_mask 的说明。没有 map_2d_raw.pgm(+.yaml)"
+                          "就跳过(默认开)")
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -582,6 +651,22 @@ def main():
             )
             print(f"      detect_structure: 从点云密度现算出 min_support={min_support}")
             grid = elevation.classify_occupancy(structure)
+            if args.block_unscanned:
+                # 放在 clear_trajectory 之前跑, 让轨迹"我确实站过这"的判断始终
+                # 有最终否决权, 不会被这一步误伤(见 raw_map2d_unknown_mask 的
+                # 说明——它标的未知只跟雷达照没照到有关, 跟轨迹是两套独立证据)。
+                raw_unknown = raw_map2d_unknown_mask(
+                    map2d_dir, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max),
+                    map2d_resolution,
+                )
+                if raw_unknown is None:
+                    print("      没有 map_2d_raw.pgm(+.yaml), 跳过'未知区域改判 occupied'")
+                else:
+                    n_before = int((grid == 0).sum())
+                    grid[raw_unknown] = 0
+                    print(f"      map_2d_raw.pgm 未知区域改判 occupied: "
+                          f"{int(raw_unknown.sum())} 格未知, occupied 格子数 "
+                          f"{n_before} -> {int((grid == 0).sum())}")
             # 狗真的走过的地方不可能有障碍, 用这个压过点云侧的误判(见
             # clear_trajectory 说明)。0.25 跟 backend/app/config.py 的
             # GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致——全局规划器规划
