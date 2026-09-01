@@ -204,14 +204,14 @@ systemd 服务 → 跳到建图页实时看点云 → 取消（丢弃）或保�
   问题还没现场核对过（见「已知缺口」）。
 - `/surround_map_cloud`：建图模式下是"当前位姿附近的局部地图点云"，随关键帧
   更新（见 `hand-lio/hand-topic.csv`），是建图页真正在看的主体内容。
-- `/surf_cloud_in_map`（`MAPPING_SURF_CLOUD_TOPIC`）：只是"当前这一帧扫到哪里"
-  的高亮提示，**不是**导航页/地图预览页"实时点云"勾选框订阅的那个话题——那个
-  用的是 `SURF_CLOUD_TOPIC`（默认 `/hand_lio/clouds_lidar`，hand_lio 侧**没有
-  降采样**的版本，特意选的：地图预览页对比过，展示效果比这条降采样版好）。
-  `/surf_cloud_in_map` 才是 `hand-topic.csv` 里真正标"降采样后的激光点云"的
-  那条，建图页要的只是个大致位置提示，用不着地图预览页那份精度，两个页面
-  故意订阅两个不同的话题，不要合并成一个常量（见 `config.py` 里
-  `SURF_CLOUD_TOPIC`/`MAPPING_SURF_CLOUD_TOPIC` 各自的说明）。
+- `/surf_cloud_in_map`（`SURF_CLOUD_TOPIC`）：建图页当前这一帧扫描位置的高亮
+  提示，跟导航页/地图预览页"实时点云"勾选框订阅的是**同一个话题**——以前这
+  两个页面故意分开订阅两个不同话题（地图预览页用未降采样的
+  `/hand_lio/clouds_lidar`，展示细节更好），现在统一合并成这一个话题/常量。
+  两边各自还是独立的 `rospy.Subscriber`（开关生命周期不一样：地图预览页是
+  勾选框，建图页是整页一次性开关，见 `ros_bridge.set_mapping_enabled` 的
+  说明），只是不再各自配一份话题名（见 `config.py` 里 `SURF_CLOUD_TOPIC`
+  的说明）。
 
 保存（`POST /api/mapping/save`）立即返回 `saving`，真正的工作在后台线程里跑：
 

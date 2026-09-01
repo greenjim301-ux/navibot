@@ -103,15 +103,16 @@ SELF_INFLATION_TOPIC = os.environ.get("NAVIBOT_SELF_INFLATION_TOPIC", "/scan_pla
 # (map_inf_pub_.getNumSubscribers() <= 0 时直接不发布), 我们只是把这个"按需"
 # 特性透到前端一个勾选框。
 INFLATION_MAP_TOPIC = os.environ.get("NAVIBOT_INFLATION_MAP_TOPIC", "/grid_map/occupancy_inflate")
-# 地图预览页/导航页"雷达点云"勾选框用的话题。hand_lio 侧 -> backend,
-# sensor_msgs/PointCloud2, **没有降采样**——hand-topic.csv 里没有这条(不是
-# hand-lio 标准接口清单里的话题), 是特意选的: hand-topic.csv 里对应"降采样后
-# 的激光点云"的其实是 /surf_cloud_in_map(建图页用的是那条, 见
-# MAPPING_SURF_CLOUD_TOPIC), 但这两个页面对着比过, 没降采样的这条在地图预览页
-# 展示效果更好, 所以这两个页面故意用两个不同的话题, 不要合并成一个常量。跟
-# inflation_map 一样默认不订阅, 前端"雷达点云"勾选框打开才让后端订阅, 每次
-# 整帧替换(不叠加历史帧)。
-SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURF_CLOUD_TOPIC", "/hand_lio/clouds_lidar")
+# 地图预览页/导航页"雷达点云"勾选框、建图页当前帧扫描高亮共用的话题。hand_lio
+# 侧 -> backend, sensor_msgs/PointCloud2, hand-topic.csv 里标"降采样后的激光
+# 点云"的那条(hand-lio 侧已经做过降采样)。以前这两个页面故意分开订阅两个不同
+# 话题(地图预览页用未降采样的 /hand_lio/clouds_lidar, 展示细节更好), 现在
+# 统一合并成这一个话题/常量——两边各自还是独立的 rospy.Subscriber(开关生命
+# 周期不一样: 这边是勾选框, 建图页是整页一次性开关, 见 ros_bridge.py
+# set_mapping_enabled 的说明), 只是不再各自配一份话题名。跟 inflation_map
+# 一样默认不订阅, 前端"雷达点云"勾选框打开才让后端订阅, 每次整帧替换(不叠加
+# 历史帧)。
+SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURF_CLOUD_TOPIC", "/surf_cloud_in_map")
 
 # 对齐 fsm/waypoint_arrival_radius (advanced_param.xml 里配的 0.3): 途中点提前切
 # 下一个的半径, 不是到达判据本身; 最后一个点没有这条, 精度比这个值高得多——见上面
@@ -274,13 +275,8 @@ MAPPING_MODE_DEPENDENCIES = {
 }
 
 SURROUND_MAP_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_TOPIC", "/surround_map_cloud")
-# 建图页当前帧扫描高亮用的话题, 跟地图预览页/导航页"雷达点云"勾选框用的
-# SURF_CLOUD_TOPIC(/hand_lio/clouds_lidar)是两个不同的话题, 不要混用——这条
-# 才是 hand-topic.csv 里真正标"降采样后的激光点云"的那条(hand-lio 侧已经做过
-# 降采样), 建图页选它是因为这里要的是"大致扫到哪里"的提示, 不需要
-# /hand_lio/clouds_lidar 那份没降采样、给地图预览页看细节用的精度。见
-# SURF_CLOUD_TOPIC 定义处的说明。
-MAPPING_SURF_CLOUD_TOPIC = os.environ.get("NAVIBOT_MAPPING_SURF_CLOUD_TOPIC", "/surf_cloud_in_map")
+# 建图页当前帧扫描高亮用的话题——直接复用 SURF_CLOUD_TOPIC(建图页/地图预览页
+# "雷达点云"合并成同一个话题订阅, 见该常量定义处的说明), 不再单独定义一份。
 # 建图页机器狗当前位置来自 /tf(map -> livox_frame), 不是 ODOM_TOPIC——建图模式
 # 下 SCAN-Planner 不跑, /hand_lio/odom_vehicle 不一定有。帧名最初是从
 # HandBot-S1-view/ros1.rviz 保存的 TF 树反推的("latest_lidar", map -> latest_lidar

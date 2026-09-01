@@ -33,16 +33,16 @@ SelfInflationCallback = Callable[[dict], None]
 # 膨胀地图整片点云, 拍平成 float32 一维数组 [x0,y0,z0, x1,y1,z1, ...] (每次整片
 # 替换, 不是增量) —— 见 _decode_xyz_flat, 不再是 Python list。
 InflationMapCallback = Callable[[np.ndarray], None]
-# 雷达实时点云 (SURF_CLOUD_TOPIC, 默认 /hand_lio/clouds_lidar, 未降采样——跟建图页
-# 用的 MAPPING_SURF_CLOUD_TOPIC/surf_cloud_in_map 是两个不同的话题, 见 config.py
-# 里两个常量各自的说明), 同样拍平成 float32 一维数组, 每帧整体替换
+# 雷达实时点云 (SURF_CLOUD_TOPIC, 默认 /surf_cloud_in_map, 建图页/地图预览页
+# "雷达点云"共用同一个话题, 见 config.py 里这个常量的说明), 拍平成 float32
+# 一维数组, 每帧整体替换
 SurfCloudCallback = Callable[[np.ndarray], None]
 # 建图页专用: (x, y, z, yaw, stamp), 来自 /tf(MAPPING_TF_MAP_FRAME ->
 # MAPPING_TF_BODY_FRAME, 见 config.py 里这两个常量的说明), 不是 ODOM_TOPIC——
 # 建图模式下 SCAN-Planner 不跑, 没有 cov 这个概念(不是 EKF 融合出来的, 没有
 # 对应的定位质量标量), 比 PoseCallback 少一个字段。
 MappingPoseCallback = Callable[[float, float, float, float, float], None]
-# 建图页的两路点云(/surround_map_cloud、建图页专用的 /surf_cloud_in_map 订阅),
+# 建图页的两路点云(/surround_map_cloud、建图页专用的 SURF_CLOUD_TOPIC 订阅),
 # 跟 SurfCloudCallback 同样的拍平数组约定, 单独起名只是为了在 __init__ 里跟
 # 导航页那几个参数区分开, 不是不同的数据形状。
 MappingCloudCallback = Callable[[np.ndarray], None]
@@ -349,13 +349,13 @@ class RosBridge:
                 self._inflation_map_sub = None
 
     def _handle_surf_cloud(self, msg: PointCloud2) -> None:
-        """SURF_CLOUD_TOPIC(默认 /hand_lio/clouds_lidar): hand_lio 侧当前帧激光
-        点云, 已转到 map 系, **没有降采样**——特意选的未降采样版本, 地图预览页
-        对比过, 展示效果比 hand-topic.csv 里标"降采样后"的 /surf_cloud_in_map
-        更好(那条是建图页用的 MAPPING_SURF_CLOUD_TOPIC, 见 config.py), 两个
-        话题不要混用。只取 x/y/z, 解码完按 SURF_CLOUD_VOXEL_SIZE_M 做体素
-        去重降采样(理由同 _handle_inflation_map, 这一步降采样是我们自己做的,
-        跟话题本身有没有降采样是两回事)——每帧整体替换, 不在这里做叠加。
+        """SURF_CLOUD_TOPIC(默认 /surf_cloud_in_map): hand_lio 侧当前帧激光
+        点云, 已转到 map 系, hand-lio 侧已经做过降采样——建图页当前帧扫描高亮
+        用的也是这同一个话题(见 config.py 里 SURF_CLOUD_TOPIC 的说明), 但走的
+        是各自独立的 rospy.Subscriber(见 set_mapping_enabled 的说明)。只取
+        x/y/z, 解码完按 SURF_CLOUD_VOXEL_SIZE_M 做体素去重降采样(理由同
+        _handle_inflation_map, 这一步降采样是我们自己做的, 跟话题本身有没有
+        降采样是两回事)——每帧整体替换, 不在这里做叠加。
 
         按 SURF_CLOUD_BROADCAST_HZ 限流, 同样挡在解码之前, 理由同
         _handle_inflation_map。"""
@@ -398,15 +398,13 @@ class RosBridge:
         self._on_mapping_surround_cloud(points)
 
     def _handle_mapping_surf_cloud(self, msg: PointCloud2) -> None:
-        """建图页专属的 MAPPING_SURF_CLOUD_TOPIC(/surf_cloud_in_map)订阅——
-        注意这跟导航页"雷达点云"勾选框订阅的 SURF_CLOUD_TOPIC
-        (/hand_lio/clouds_lidar)是两个不同的话题, 不是同一个话题开两个订阅者:
-        /surf_cloud_in_map 是 hand-lio 已经降采样过的版本, 建图页只要"大致扫到
-        哪里"的提示, 没必要用导航页那份为了展示细节特意选的未降采样点云。见
-        config.py 里 MAPPING_SURF_CLOUD_TOPIC 的说明。限流/降采样复用同一套
-        SURF_CLOUD_BROADCAST_HZ/SURF_CLOUD_VOXEL_SIZE_M 常量(这两个只是"多快
-        转发一次""降采样格子多大", 跟具体是哪个话题无关, 没必要为建图页单独
-        定义一份)。"""
+        """建图页专属的 SURF_CLOUD_TOPIC(/surf_cloud_in_map)订阅——注意这跟
+        导航页/地图预览页"雷达点云"勾选框订阅的是同一个话题, 但不是同一个
+        rospy.Subscriber 实例: 两边开关生命周期不一样(那边是勾选框, 这边是
+        建图页整页一次性开关, 见 set_mapping_enabled 的说明), 各自订阅、各自
+        限流/转发, 互不影响。限流/降采样复用同一套 SURF_CLOUD_BROADCAST_HZ/
+        SURF_CLOUD_VOXEL_SIZE_M 常量(这两个只是"多快转发一次""降采样格子多
+        大", 跟订阅者是谁无关, 没必要为建图页单独定义一份)。"""
         now = time.time()
         if now - self._last_mapping_surf_cloud_emit_at < 1.0 / config.SURF_CLOUD_BROADCAST_HZ:
             return
@@ -433,9 +431,10 @@ class RosBridge:
 
     def set_mapping_enabled(self, enabled: bool) -> None:
         """建图页整页一次性开关: /surround_map_cloud + 建图页专用的
-        /surf_cloud_in_map 订阅 + TF 位姿轮询定时器, 三个一起开一起关——建图页
-        不像导航页那样有"分别勾选"的粒度, 进页面就是要看全部, 离开/建图结束
-        就都不需要了。"""
+        SURF_CLOUD_TOPIC 订阅(跟导航页/地图预览页"雷达点云"是同一个话题, 不同
+        订阅者, 见 _handle_mapping_surf_cloud 的说明) + TF 位姿轮询定时器,
+        三个一起开一起关——建图页不像导航页那样有"分别勾选"的粒度, 进页面就是
+        要看全部, 离开/建图结束就都不需要了。"""
         if not self._started:
             raise RuntimeError("ROS bridge 尚未启动")
         if enabled:
@@ -446,7 +445,7 @@ class RosBridge:
                 )
             if self._mapping_surf_cloud_sub is None:
                 self._mapping_surf_cloud_sub = rospy.Subscriber(
-                    config.MAPPING_SURF_CLOUD_TOPIC, PointCloud2, self._handle_mapping_surf_cloud, queue_size=2,
+                    config.SURF_CLOUD_TOPIC, PointCloud2, self._handle_mapping_surf_cloud, queue_size=2,
                 )
             if self._mapping_tf_timer is None and self._tf_listener is not None:
                 self._mapping_tf_timer = rospy.Timer(
