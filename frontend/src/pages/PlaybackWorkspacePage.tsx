@@ -63,7 +63,7 @@ export default function PlaybackWorkspacePage() {
   const progress = total > 1 ? Math.round((frame / (total - 1)) * 100) : 0;
 
   return (
-    // 这页不走 Layout(没有侧边栏/顶部应用栏), 跟 MapPreviewPage/NavigatePage
+    // 这页不走 Layout(没有侧边栏/顶部应用栏), 跟 MapPreviewPage/MappingPage
     // 一样撑满整个视口——参考项目里数据回放工作台也是独立全屏, 不带 shell()。
     <div className="flex h-svh flex-col overflow-hidden bg-[#06101a] text-[#dbe6ef]">
       <header className="flex h-[58px] shrink-0 items-center gap-3.5 border-b border-[#294154] bg-[#102132] px-4">

@@ -342,7 +342,7 @@ export default function RouteEditorPage() {
 
 // 演示用的可拖拽栅格路线编辑器: 跟 HomePage 的 MiniMapPreview 一样是纯装饰性
 // 网格背景, 不接真实栅格图——导航点位置只是 0~100 的百分比坐标, 不是世界坐标。
-// 真要在实际地图上摆点用 TopView(见 NavigatePage "设置路线"), 那个需要真实
+// 真要在实际地图上摆点用 TopView(见 MapPreviewPage "设置路线"), 那个需要真实
 // 后端地图数据, 这里数据全是假的所以没接。
 function RouteGridEditor({
   points, selectedIndex, onSelect, onMove,

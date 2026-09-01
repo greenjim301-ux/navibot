@@ -55,7 +55,7 @@ function genPoints(seed: string, count: number): FakePoint[] {
 /**
  * 演示用的"点云回放"画面: 没有真实 PKL/PCD 数据, 用一份按数据集名确定性生成的
  * 假点云在 canvas 上画, frame 只用来给点做点相位抖动模拟"在播放", 不代表真实
- * 逐帧内容。真要看真实点云用 PointCloudView(见 NavigatePage), 那个需要真实
+ * 逐帧内容。真要看真实点云用 PointCloudView(见 MapPreviewPage), 那个需要真实
  * 后端地图数据, 这里数据全是假的所以没接。
  */
 export function ReplayCloudStage({

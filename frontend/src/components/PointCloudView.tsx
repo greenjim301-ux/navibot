@@ -54,8 +54,8 @@ interface Props {
    *  status.robot_pose 有没有值), 跟下面 showFollowButton 是两件事——这个控制
    *  能力, 那个只控制"要不要画组件自带的那颗按钮"。 */
   enableFollow?: boolean;
-  /** 组件自己要不要画那颗固定在右上角的"跟随机器狗"按钮。默认 true(跟以前
-   *  行为一样, NavigatePage 用的就是这颗)。传 false 时按钮不画, 但 toggleFollow
+  /** 组件自己要不要画那颗固定在右上角的"跟随机器狗"按钮。默认 true(组件
+   *  内置的默认样式)。传 false 时按钮不画, 但 toggleFollow
    *  handle 和 onFollowingChange 回调照样有效——地图预览页把它放进右侧面板的
    *  "视角"栏, 自己画按钮, 不要组件内置这颗跟已有面板重复。 */
   showFollowButton?: boolean;
@@ -65,7 +65,7 @@ interface Props {
   /** 高度限制(世界系绝对 z, 米): 只渲染 z <= heightLimit 的点, 用 GPU 裁剪平面
    *  实现, 不重建几何体。不传则不裁剪。 */
   heightLimit?: number;
-  /** "orbit"(默认): 鼠标左键拖拽自由旋转 + 右键拖拽平移, 跟 NavigatePage 一样。
+  /** "orbit"(默认): 鼠标左键拖拽自由旋转 + 右键拖拽平移。
    *  "fixed": 保留鼠标旋转(左键拖拽)和缩放(滚轮), 但关掉拖拽平移 —— 地图预览页
    *  要的是"视角不会被误拖走", 想换视角中心改用 PointCloudViewHandle.
    *  toggleRecenter() 点选。 */

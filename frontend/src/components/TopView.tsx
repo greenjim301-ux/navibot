@@ -13,9 +13,9 @@ interface Props {
   waypoints: Waypoint[];
   onChangeWaypoints: (wps: Waypoint[]) => void;
   editable: boolean;
-  /** 途经点圆点上要不要画编号(1, 2, 3...)。默认 true——多途经点路线(如
-   *  NavigatePage)靠这个看顺序; 只有一个目标点的场景(如 MapPreviewPage 的
-   *  "设置目标点")传 false, 一个点标个"1"没有意义, 纯干扰。 */
+  /** 途经点圆点上要不要画编号(1, 2, 3...)。默认 true, 给多途经点路线场景看
+   *  顺序用; 只有一个目标点的场景(如 MapPreviewPage 的"设置目标点")传 false,
+   *  一个点标个"1"没有意义, 纯干扰。 */
   showWaypointNumbers?: boolean;
   /** "设置起终点"(路线预览)模式, 跟 editable(设置路线) 互斥, 用法/手势跟
    *  PointCloudView 的同名 prop 完全一致: 左键先设起点再设终点, 两个都设好了

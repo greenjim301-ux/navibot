@@ -18,7 +18,7 @@ export function AppSidebar() {
   const isResults = location.pathname.startsWith("/results");
   const isSystem = location.pathname.startsWith("/system");
   const isPlayback = location.pathname.startsWith("/playback");
-  // 连接状态卡片用的数据源就是 /ws/nav 本身(跟 NavigatePage 用的是同一套,
+  // 连接状态卡片用的数据源就是 /ws/nav 本身(跟 MapPreviewPage 用的是同一套,
   // 各页各开一条连接, 后端 WebSocketManager 本来就是广播给所有连接的)。
   // connected = 浏览器到后端的 ws 是否通; robot_pose 有值 = 后端启动以来
   // 至少收到过一帧 /hand_lio/odom_vehicle —— 没有单独的"机器狗心跳/离线"

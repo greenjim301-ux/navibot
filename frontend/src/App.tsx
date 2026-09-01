@@ -4,7 +4,6 @@ import HomePage from "./pages/HomePage";
 import MapListPage from "./pages/MapListPage";
 import MapPreviewPage from "./pages/MapPreviewPage";
 import MappingPage from "./pages/MappingPage";
-import NavigatePage from "./pages/NavigatePage";
 import RouteListPage from "./pages/RouteListPage";
 import RouteEditorPage from "./pages/RouteEditorPage";
 import ResultsPage from "./pages/ResultsPage";
@@ -16,11 +15,10 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* 地图预览页 / 导航页 / 数据回放工作台故意不挂在 Layout 下面: 它们要的是
+        {/* 地图预览页 / 建图页 / 数据回放工作台故意不挂在 Layout 下面: 它们要的是
             头栏+可视化区占满整个页面, Layout 自带的侧边栏/顶部应用栏在这几页
             没有存在的必要。 */}
         <Route path="/maps/:name/preview" element={<MapPreviewPage />} />
-        <Route path="/maps/:name/navigate" element={<NavigatePage />} />
         <Route path="/mapping/:name" element={<MappingPage />} />
         <Route path="/playback/:name" element={<PlaybackWorkspacePage />} />
         <Route element={<Layout />}>

@@ -227,9 +227,3 @@ export interface MappingPose {
   yaw: number;
   stamp: number;
 }
-
-/** 定位是否已经不可信 (见 RobotPose.cov) */
-export const POSE_COV_BAD = 0.99;
-export function poseUnreliable(pose: RobotPose | null | undefined): boolean {
-  return Boolean(pose && pose.cov >= POSE_COV_BAD);
-}
