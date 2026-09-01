@@ -311,7 +311,8 @@ def raw_map2d_unknown_mask(
     return unknown
 
 
-def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
+def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path,
+                        override_grid: np.ndarray | None = None) -> dict:
     """把 map_server 格式的 2D 占据栅格图 (pgm+yaml) 转成前端"设置路线"页面
     展示用的 topview.png。
 
@@ -321,6 +322,13 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
     降采样精度。不做 free/occupied/unknown 的阈值解读或重新配色: negate=0
     时 pgm 原始灰度本来就是"黑占据/白空闲/灰未知", 直接展示即可, 这里只是
     看图选点, 不需要真的按 occupied_thresh/free_thresh 二值化。
+
+    override_grid: 传了就直接用这个数组渲染 PNG, 不读 pgm_path 本身——用于
+    展示用的栅格跟写盘给 global_planner.py 用的栅格需要不同像素值的场合(见
+    main() 里 --block-unscanned 分支: 那些格子为了让规划器硬挡而写成 occupied,
+    但展示给用户看的话应该还是"未知"灰, 不然会被误认成探测到的真实障碍物)。
+    分辨率/origin 仍然从 yaml_path 读, 因为两份栅格的物理网格是同一套, 只有
+    像素取值不同。
 
     pgm 的 (row, col) 像素网格跟 world_bounds 的对应关系是 ROS map_server 的
     约定: yaml 的 origin 是图像左下角像素的世界坐标, 而 pgm 文件本身是按常规
@@ -337,8 +345,12 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
     resolution = yaml_info["resolution"]
     origin_x, origin_y = yaml_info["origin_x"], yaml_info["origin_y"]
 
-    img = Image.open(pgm_path)
-    orig_w, orig_h = img.size
+    if override_grid is not None:
+        img = Image.fromarray(override_grid, mode="L")
+        orig_w, orig_h = img.size
+    else:
+        img = Image.open(pgm_path)
+        orig_w, orig_h = img.size
     img.save(out_path)
 
     return {
@@ -624,6 +636,11 @@ def main():
         map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max = x_min, x_max, y_min, y_max
         print("      没有 map_2d_raw.pgm(+.yaml), 2D 栅格图边界退回点云统计 (robust_xy_bounds)")
 
+    # 只有走到下面"重新生成 grid"这条路径、且 --block-unscanned 真的改判过
+    # 格子时才会被填成非 None(见下面), 其它路径(开关关了/没有 raw pgm/
+    # 沿用已有文件/这次没重新生成)展示图跟规划图没有分叉, export_topview_png
+    # 直接读写盘的 map_2d.pgm 即可, 不用传 override_grid。
+    display_grid = None
     if args.gen_2d_map:
         trajectory = elevation.load_trajectory(in_path.parent)
         if trajectory is None:
@@ -651,6 +668,7 @@ def main():
             )
             print(f"      detect_structure: 从点云密度现算出 min_support={min_support}")
             grid = elevation.classify_occupancy(structure)
+            block_unscanned_only = None
             if args.block_unscanned:
                 # 放在 clear_trajectory 之前跑, 让轨迹"我确实站过这"的判断始终
                 # 有最终否决权, 不会被这一步误伤(见 raw_map2d_unknown_mask 的
@@ -662,6 +680,11 @@ def main():
                 if raw_unknown is None:
                     print("      没有 map_2d_raw.pgm(+.yaml), 跳过'未知区域改判 occupied'")
                 else:
+                    # detect_structure 本来就判成 occupied 的格子(真实探测到的
+                    # 障碍)不算在内——那些不管有没有这个开关都该显示成黑色,
+                    # 只有"纯粹因为这个开关才变 occupied"的格子才需要在展示图
+                    # 上还原成"未知"灰, 见下面 export 前的说明。
+                    block_unscanned_only = raw_unknown & (grid != 0)
                     n_before = int((grid == 0).sum())
                     grid[raw_unknown] = 0
                     print(f"      map_2d_raw.pgm 未知区域改判 occupied: "
@@ -689,6 +712,16 @@ def main():
             n_free, n_occ, n_unk = int((grid == 254).sum()), int((grid == 0).sum()), int((grid == 205).sum())
             print(f"      生成 {pgm_path}: {grid.shape[1]}x{grid.shape[0]}px, {map2d_resolution}m/px, "
                   f"free={n_free} occupied={n_occ} unknown={n_unk}")
+            # --block-unscanned 是为了让全局规划器硬挡这些格子(见上面),
+            # 不是说这些地方真的探测到了障碍——展示给用户看的 topview.png
+            # 应该还原成"未知"灰(205), 不然会跟 detect_structure 真正探测到
+            # 的墙/柱子看起来一样黑, 用户在"设置路线"页面没法分辨哪些是真障碍、
+            # 哪些只是没扫到。只处理"纯粹因为这个开关才 occupied"的格子
+            # (block_unscanned_only); 如果之后被 clear_trajectory 又改判成
+            # free(狗确实走过), 两份图本来就该一致, 不用管。
+            if block_unscanned_only is not None:
+                display_grid = grid.copy()
+                display_grid[block_unscanned_only & (grid == 0)] = 205
     else:
         print("      --no-gen-2d-map, 跳过生成, 沿用已有文件(如果有)")
 
@@ -697,7 +730,8 @@ def main():
     # 情况, 不能假设它总存在。
     topview2d = None
     if pgm_path.is_file() and yaml_path.is_file():
-        topview2d = export_topview_png(pgm_path, yaml_path, out_dir / "topview.png")
+        topview2d = export_topview_png(pgm_path, yaml_path, out_dir / "topview.png",
+                                        override_grid=display_grid)
         print(f"      {pgm_path} -> topview.png: {topview2d['width']}x{topview2d['height']}px, "
               f"分辨率 {topview2d['resolution_m_per_px']:.4f}m/px")
     else:
