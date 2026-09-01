@@ -21,10 +21,13 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 
 const HEIGHT_LIMIT_STEP = 0.25;
+// 「自身膨胀」「膨胀地图」这两个图层开关先隐藏入口(订阅/渲染逻辑不动, 保留
+// 随时切回来的能力), 不是删掉功能。
+const SHOW_INFLATION_TOGGLES = false;
 
-// 轨迹采样阈值/上限, 跟 NavigatePage 保持一致(见该文件同名常量的说明): odom
-// 是 200Hz 的, 每帧都记会瞬间堆出几万个点且肉眼看不出区别; 按位移采样,
-// 0.05m 一个点在 3D 里已经是平滑曲线了, 上限防止长时间挂着页面把内存吃掉。
+// 轨迹采样阈值/上限: odom 是 200Hz 的, 每帧都记会瞬间堆出几万个点且肉眼看不出
+// 区别; 按位移采样, 0.05m 一个点在 3D 里已经是平滑曲线了, 上限防止长时间挂着
+// 页面把内存吃掉。
 const TRAIL_MIN_STEP_M = 0.05;
 const TRAIL_MAX_POINTS = 5000;
 
@@ -68,8 +71,8 @@ export default function MapPreviewPage() {
   // 整个依赖这份实时状态, 因此也只在激活地图上显示(见下面 PanelSection 的
   // isActive 条件)。
   const isActive = info?.active === true;
-  // self_inflation/膨胀地图/雷达点云这三个是后端的全局订阅开关(不区分地图,
-  // 跟 NavigatePage 用法一致), 不用像 status 那样按地图过滤。
+  // self_inflation/膨胀地图/雷达点云这三个是后端的全局订阅开关(不区分地图),
+  // 不用像 status 那样按地图过滤。
   const {
     status, optimalTraj, selfInflationEnabled, selfInflation,
     inflationMapEnabled, inflationMap, surfCloudEnabled, surfCloud,
@@ -93,11 +96,11 @@ export default function MapPreviewPage() {
   // 终点还远。这颗小球只表达"用户点的目标在哪", 不表达导航进度。
   const goalMarkerStatus = displayStatus ? { ...displayStatus, current_index: -1 } : null;
 
-  // 机器狗实际走过的轨迹, 做法照抄 NavigatePage(见该文件同名 effect 的说明):
-  // 一直记(不限于导航进行中), 这样跑完之后那条线还留在图上能回看; 换地图/
-  // 开始新一趟导航时清空(见下面 [name] 那个 effect 和 handleStartNav)。用
-  // displayStatus 而不是原始 status——只有 isActive 时才有意义, 见 hasPose
-  // 声明处的注释, 不激活时 displayStatus 恒为 null, 这里自然不会累积。
+  // 机器狗实际走过的轨迹: 一直记(不限于导航进行中), 这样跑完之后那条线还留在
+  // 图上能回看; 换地图/开始新一趟导航时清空(见下面 [name] 那个 effect 和
+  // handleStartNav)。用 displayStatus 而不是原始 status——只有 isActive 时
+  // 才有意义, 见 hasPose 声明处的注释, 不激活时 displayStatus 恒为 null,
+  // 这里自然不会累积。
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const pose = displayStatus?.robot_pose;
   useEffect(() => {
@@ -114,14 +117,14 @@ export default function MapPreviewPage() {
 
   // "清空目标点" 也要把 planner 局部轨迹线(optimalTraj)擦掉, 但那条线是 ws
   // 推来的、页面并不持有它的数据, 只能记一个"擦掉了"标记, 下一条新轨迹
-  // (重规划)推过来时自动恢复显示——做法照抄 NavigatePage 的 optimalTrajHidden。
+  // (重规划)推过来时自动恢复显示。
   const [optimalTrajHidden, setOptimalTrajHidden] = useState(false);
   useEffect(() => {
     setOptimalTrajHidden(false);
   }, [optimalTraj]);
 
-  // 三个显示图层开关跟 NavigatePage 一样是全局后端订阅(默认不订阅, 话题很吵),
-  // 勾选框只提交开关状态, 真正的 enabled/数据都是从 ws 推回来的。
+  // 三个显示图层开关是全局后端订阅(默认不订阅, 话题很吵), 勾选框只提交开关
+  // 状态, 真正的 enabled/数据都是从 ws 推回来的。
   const [selfInflationBusy, setSelfInflationBusy] = useState(false);
   async function handleToggleSelfInflation(checked: boolean) {
     setSelfInflationBusy(true);
@@ -266,8 +269,8 @@ export default function MapPreviewPage() {
   // plan_path(publish=false)规划出来、再通过 submit_route(navi_mode=2)下发
   // 下去的那条参考路线, 单纯用来在地图上画出来(跟"是不是正在跑"是两回事,
   // 那个用上面的 navRunning)——完成/失败之后仍然留着当"最近一次下发的路线"看,
-  // 不跟着自动清空; 只有换地图、点"停止导航"或"清空目标点"才清, 参考
-  // NavigatePage 的 trail(跑完了也留着能回看)。
+  // 不跟着自动清空; 只有换地图、点"停止导航"或"清空目标点"才清, 做法跟上面的
+  // trail 一致(跑完了也留着能回看)。
   const [dispatchedRoute, setDispatchedRoute] = useState<PlannedRoutePoint[] | null>(null);
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
@@ -655,24 +658,28 @@ export default function MapPreviewPage() {
                 {isActive && (
                   <PanelSection title="图层">
                     <div className={cn("flex flex-col gap-2.5 transition-opacity", viewMode === "2d" && "pointer-events-none opacity-40")}>
-                      <label className="flex items-center justify-between text-xs text-white/70">
-                        自身膨胀
-                        <Switch
-                          className={PANEL_SWITCH_CLASS}
-                          checked={selfInflationEnabled}
-                          disabled={viewMode === "2d" || selfInflationBusy}
-                          onCheckedChange={handleToggleSelfInflation}
-                        />
-                      </label>
-                      <label className="flex items-center justify-between text-xs text-white/70">
-                        膨胀地图
-                        <Switch
-                          className={PANEL_SWITCH_CLASS}
-                          checked={inflationMapEnabled}
-                          disabled={viewMode === "2d" || inflationMapBusy}
-                          onCheckedChange={handleToggleInflationMap}
-                        />
-                      </label>
+                      {SHOW_INFLATION_TOGGLES && (
+                        <>
+                          <label className="flex items-center justify-between text-xs text-white/70">
+                            自身膨胀
+                            <Switch
+                              className={PANEL_SWITCH_CLASS}
+                              checked={selfInflationEnabled}
+                              disabled={viewMode === "2d" || selfInflationBusy}
+                              onCheckedChange={handleToggleSelfInflation}
+                            />
+                          </label>
+                          <label className="flex items-center justify-between text-xs text-white/70">
+                            膨胀地图
+                            <Switch
+                              className={PANEL_SWITCH_CLASS}
+                              checked={inflationMapEnabled}
+                              disabled={viewMode === "2d" || inflationMapBusy}
+                              onCheckedChange={handleToggleInflationMap}
+                            />
+                          </label>
+                        </>
+                      )}
                       <label className="flex items-center justify-between text-xs text-white/70">
                         实时点云
                         <Switch
