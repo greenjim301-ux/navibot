@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Crosshair, RefreshCw, Save, Target } from "lucide-react";
-import { cancelMapping, getMappingStatus, saveMapping } from "../api";
+import { cancelMapping, getMappingStatus, preprocessMap, saveMapping } from "../api";
 import { useMappingStatus } from "../useMappingStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import type { NavStatus, TopviewMeta } from "../types";
@@ -11,6 +11,9 @@ import {
   AlertDialog, AlertDialogTrigger, AlertDialogContent, AlertDialogHeader,
   AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction,
 } from "@/components/ui/alert-dialog";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 
 const HEIGHT_LIMIT_STEP = 0.25;
@@ -34,6 +37,10 @@ export default function MappingPage() {
   const navigate = useNavigate();
   const pcRef = useRef<PointCloudViewHandle>(null);
   const { status, pose, surroundCloud, surfCloud } = useMappingStatus();
+  // 保存对话框里选了"保存并自动预处理"的话, 这个意图要一直留到保存真正成功
+  // (state 变 done)才用得上, 中间隔着一段后台保存耗时——用 ref 不用 state,
+  // 纯粹是给下面那个"离开页面"effect 读的, 值变化不需要触发重渲染。
+  const autoPreprocessRef = useRef(false);
 
   // 挂载时校验后端当前是不是真的有这次 name 对应的建图会话在跑——直接刷新
   // 页面、或者后端重启导致内存态丢了都会落到"没有"这个分支(RouteManager/
@@ -62,13 +69,22 @@ export default function MappingPage() {
 
   // 会话状态变化: 保存完成 / (另一处)取消了建图, 这个页面都没有继续存在的
   // 意义, 退回地图列表——跟 checked 门槛一样, 校验通过前不看这个状态变化,
-  // 避免 WS 快照还没到、status 还是初始 null 时被误判。
+  // 避免 WS 快照还没到、status 还是初始 null 时被误判。autoPreprocessRef 的
+  // 意图在保存成功(map-data-dir 下的数据这时已经落盘完毕)这一刻兑现, 不等
+  // 预处理跑完就直接离开页面(预处理跟建图会话本来就是两件独立的事, 地图
+  // 列表页自己会显示"处理中", 不用建图页等在这里)。
   useEffect(() => {
     if (!checked || checkError) return;
-    if (status?.state === "done" || status?.state === "idle") {
+    if (status?.state === "done") {
+      if (autoPreprocessRef.current) {
+        // 失败(比如已经在处理中)只是没触发成功, 不阻止离开这页, 见上面的说明。
+        preprocessMap(name).catch(() => {});
+      }
+      navigate("/maps");
+    } else if (status?.state === "idle") {
       navigate("/maps");
     }
-  }, [status?.state, checked, checkError, navigate]);
+  }, [status?.state, checked, checkError, navigate, name]);
 
   const [heightLimit, setHeightLimit] = useState<number | null>(null);
   const [zRange, setZRange] = useState({ min: DEFAULT_Z_MIN, max: DEFAULT_Z_MAX });
@@ -91,6 +107,7 @@ export default function MappingPage() {
   const [following, setFollowing] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
 
   // 把 /tf 来的位姿包成 PointCloudView 认识的 NavStatus 形状, 好复用它已有的
   // 机器狗 marker 渲染逻辑——那段逻辑只读 status.robot_pose, 其余字段填中性值
@@ -117,7 +134,9 @@ export default function MappingPage() {
     }
   }
 
-  async function handleSave() {
+  async function handleSave(autoPreprocess: boolean) {
+    autoPreprocessRef.current = autoPreprocess;
+    setSaveDialogOpen(false);
     setSaveError(null);
     try {
       await saveMapping();
@@ -253,11 +272,34 @@ export default function MappingPage() {
           </button>
         </div>
 
-        <Button className="mt-auto" onClick={handleSave} disabled={saving}>
+        <Button className="mt-auto" onClick={() => setSaveDialogOpen(true)} disabled={saving}>
           <Save />
           {saving ? "保存中…" : "保存"}
         </Button>
       </div>
+
+      <Dialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>保存地图</DialogTitle>
+            <DialogDescription>
+              保存成功后要不要自动开始预处理? 预处理完成前, 这张地图还不能在地图预览页/导航页使用,
+              也可以先只保存, 之后去地图列表页手动触发。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSaveDialogOpen(false)}>
+              取消
+            </Button>
+            <Button variant="outline" onClick={() => handleSave(false)}>
+              仅保存
+            </Button>
+            <Button onClick={() => handleSave(true)}>
+              保存并自动预处理
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
