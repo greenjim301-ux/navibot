@@ -230,6 +230,13 @@ class MapRegistry:
         self._save_active(name)
         logger.info("activated map=%s, relinked %s -> %s", name, link_path, self._map_dir(name))
 
+    def get_active(self) -> Optional[str]:
+        """当前激活的地图名, 没有就是 None——mapping_manager.start() 用这个
+        记住"开始建图前激活的是哪张", 好在建图会话结束后恢复(见它自己的
+        _restore_previous_active_map)。"""
+        with self._lock:
+            return self._active
+
     def deactivate_map(self, name: str) -> None:
         """取消激活。只有 name 确实是当前激活的那张才会真的清掉——不是就当
         no-op, 不报错(前端"取消激活"按钮不用先查一遍当前激活的是不是自己)。

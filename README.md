@@ -263,6 +263,20 @@ keyframe_info_3d.txt}` + `2d_map/{map_2d.pgm,map_2d.yaml}`）跟
 的，不特意同步一次的话，`GET /api/maps` 会在整个建图会话期间一直显示一张其实
 已经不再激活的旧地图（因为它的软链接已经被上面这行摘掉了）。
 
+`mapping_manager.start` 清空前会先记一笔"开始建图前激活的是哪张图"
+（`MappingManager._prev_active_map`），建图会话结束时尽力把它恢复回去
+（`_restore_previous_active_map`，内部就是再调一次 `MapRegistry.activate_map`）：
+
+- **取消（放弃）建图**、**保存成功**（状态转 `done`）都会恢复。
+- **保存失败**（状态转 `error`）**不会**恢复——`_run_save` 的 `error` 分支故意
+  不清理 `config.SAVE_MAP_DIR`（留着现场给用户重试），这时候恢复会撞上"目标
+  已存在"；等用户放弃、真正调用取消时再恢复。
+- 启动服务本身失败（`start_with_dependencies` 抛错，典型是 sudoers 没配好）
+  也会恢复——这种情况下建图会话根本没有真正开始过。
+- 恢复动作失败（比如那张图这期间被删了、`localization.service` 这期间被手动
+  启动了）只记日志，不会让取消/保存这个动作本身也跟着报错——用户可以去地图
+  预览页手动重新激活。
+
 **部署时需要额外配一条 `rm` 的 sudoers 规则**（跟「服务状态管理」那节的
 `systemctl` 规则是分开的两条），默认命令是 `sudo -n rm -rf`（`NAVIBOT_RM_SUDO_CMD`
 可覆盖），只放行对 `config.SAVE_MAP_DIR` 这一个固定路径执行，例如：
