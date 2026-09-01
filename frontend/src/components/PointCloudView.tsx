@@ -72,9 +72,10 @@ interface Props {
   controlMode?: "orbit" | "fixed";
   /** 机器狗当前位置标记的样式。"cone"(默认): 红色锥形, 跟着 yaw 转, 俯视时能
    *  直接看出机器狗朝哪边——导航页/地图预览页在看机器狗实时导航状态, 朝向是
-   *  有用信息, 不要改。"tripod": 跟世界原点参照物一样的三叉轴(不跟着 yaw
-   *  转), 只有建图页在用——建图页要的是"机器狗回到原点附近时, 两个标记能不能
-   *  肉眼判断出位置重合了", 朝向反而是干扰(见 createAxesTripod 的说明)。 */
+   *  有用信息, 不要改。"tripod": 跟世界原点参照物一样大小/材质的三叉轴, 也跟着
+   *  yaw 转(behavior 跟 rviz 里 TF 位姿的 Axes 显示一致), 只有建图页在用——
+   *  建图页要的是"机器狗回到原点附近时, 两个标记能不能肉眼判断出位置(以及
+   *  朝向)重合了"。 */
   robotMarkerStyle?: "cone" | "tripod";
   /** "点选新中心点"模式是否开启(见 PointCloudViewHandle.toggleRecenter), 每次
    *  开关状态变化(手动切换 / 点选成功 / resetView 顺带取消)时回调一次, 给外部
@@ -174,13 +175,12 @@ function createWaypointLabelSprite(text: string): THREE.Sprite {
 // 世界坐标原点参照物(所有页面都用)、以及 robotMarkerStyle="tripod" 时机器狗
 // 当前位置标记(目前只有建图页选这个样式, 见 Props.robotMarkerStyle)用的是
 // 同一种"三叉轴"标记(X/Y/Z 三条线, 颜色跟 three.js AxesHelper 的默认约定一致:
-// 红/绿/蓝)。用同一个 size/材质画出来的两个三叉轴长得一模一样——机器狗回到
-// 原点附近时, 两个标记视觉上会重合成一个, 一眼就能判断坐标对没对上, 这也是
-// 建图页那份标记特意不跟着 yaw 旋转的原因(见下面机器狗位姿标记那个 effect):
-// 转了的话哪怕位置真的重合, 两个三叉轴的臂朝向也会不一样, 看起来就不像
-// "重合了"。用 Line2(fat line)而不是 THREE.AxesHelper 自带的细线, 是因为
-// AxesHelper 内部就是普通 LineSegments, 在大多数平台上线宽固定卡在 1px,
-// 加粗不了。
+// 红/绿/蓝, 用法/跟着朝向转这点也仿 rviz 里 TF 位姿的 Axes 显示)。用同一个
+// size/材质画出来的两个三叉轴长得一模一样——机器狗回到原点、朝向也对上时,
+// 两个标记视觉上会重合成一个, 一眼就能判断坐标(和朝向)对没对上(见下面机器狗
+// 位姿标记那个 effect)。用 Line2(fat line)而不是 THREE.AxesHelper 自带的
+// 细线, 是因为 AxesHelper 内部就是普通 LineSegments, 在大多数平台上线宽
+// 固定卡在 1px, 加粗不了。
 function createAxesTripod(materials: [LineMaterial, LineMaterial, LineMaterial], size: number): THREE.Group {
   const group = new THREE.Group();
   const tips: [number, number, number][] = [[size, 0, 0], [0, size, 0], [0, 0, size]];
@@ -506,10 +506,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 机器狗当前位置标记。默认(cone)是红色锥形, 跟着 yaw 转, 导航页/地图预览页
     // 用这个看机器狗实时朝向。建图页传 robotMarkerStyle="tripod", 换成大小/
     // 材质跟原点参照物完全一样的三叉轴(同一个 size=0.6、同一份 axisMaterials),
-    // 且不跟着 yaw 转——两个三叉轴长得一模一样是特意的(见 createAxesTripod 的
-    // 说明), 建图页要的是"机器狗回到原点附近时能直接看出两个标记是不是重合到
-    // 一块了", 不是朝向。统一包一层 Group, 不管哪种样式 robotMeshRef 的类型、
-    // 下面位姿 effect 的 position/visible 操作都一样, 只有要不要转 yaw 不同。
+    // 同样跟着 yaw 转(见下面位姿 effect, 跟 rviz 里 TF 位姿的 Axes 显示行为
+    // 一致)——建图页要的是"机器狗回到原点附近时能直接看出两个标记是不是位置/
+    // 朝向都重合到一块了"。统一包一层 Group, 不管哪种样式 robotMeshRef 的
+    // 类型、下面位姿 effect 的 position/visible 操作都一样, 只有转 yaw 时
+    // 的角度偏移不同(见该 effect 的说明)。
     let robotMesh: THREE.Group;
     if (robotMarkerStyle === "tripod") {
       robotMesh = createAxesTripod(axisMaterials, 0.6);
@@ -1141,11 +1142,15 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 跟着升降。
     mesh.position.set(pose.x, pose.y, pose.z);
     if (robotMarkerStyle === "cone") {
-      // ConeGeometry 的轴默认沿 +Y, 绕 Z 转 (yaw - 90°) 正好让锥尖指向 yaw 方向
+      // ConeGeometry 的轴默认沿 +Y, 绕 Z 转 (yaw - 90°) 正好让锥尖指向 yaw 方向。
       mesh.rotation.z = pose.yaw - Math.PI / 2;
+    } else {
+      // tripod 的局部 +X(红轴)本来就是 createAxesTripod 画出来的第一根轴,
+      // 不用像 cone 那样减 90°——yaw=0 时红轴直接对齐世界 +X, 跟 rviz 里
+      // TF 位姿的 Axes 显示一样跟着实际朝向转(不是只显示位置的静态参照物),
+      // 这样除了能看"回没回到原点"的位置, 也能看朝向有没有对上。
+      mesh.rotation.z = pose.yaw;
     }
-    // tripod 样式不跟着 yaw 转——要跟原点参照物长得一模一样才方便建图页肉眼
-    // 判断"回没回到原点", 见 createAxesTripod 的说明。
   }, [status, robotMarkerStyle]);
 
   // 参考路线: 每段单独一条 Line2 (规划成功的画青色实线, 不连通只能直连的画
