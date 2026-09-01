@@ -51,7 +51,7 @@ RESAMPLE_STEP_M = 0.2
 # 查询某个 (x, y) 时, 往外找多远的轨迹点算"附近"。超出这个半径就认为没有轨迹
 # 经过(狗没走过那里), 不给近似值——跟旧版 elevation 查询"未观测就不给"的设计
 # 一致, 只是数据源换了。
-QUERY_RADIUS_M = 1.0
+QUERY_RADIUS_M = 2.0
 
 
 def _resample_polyline(pts: np.ndarray, step: float) -> np.ndarray:
@@ -91,7 +91,14 @@ def _load_trajectory(map_name: str) -> Optional[np.ndarray]:
 
 def ground_elevation(map_name: Optional[str], x: float, y: float) -> Optional[float]:
     """(x, y) 附近建图轨迹的高度, 当作该点的地面高度近似(不区分楼层/不做多值
-    检测, 见模块 docstring)。附近没有轨迹经过时返回 None。"""
+    检测, 见模块 docstring)。QUERY_RADIUS_M 内有轨迹经过就取这些点的中位数
+    (局部多点平均, 更抗噪); 半径内没有的话退到"离得最近的那一个轨迹点"
+    (不设距离上限)——途经点很少正好落在机器狗走过的 QUERY_RADIUS_M 范围内
+    (常常点在房间中间、过道一侧), 严格按半径"没有就不给"会导致这个函数经常
+    返回 None; 单层
+    平面图上再远一点的地面高度基本不变, 给个"最近处"的近似值远比什么都不给
+    有用。只有这张图压根没有建图轨迹数据(地图不存在/keyframe 文件是空的)才
+    真的返回 None。"""
     if not map_name:
         return None
     traj = _load_trajectory(map_name)
@@ -99,6 +106,6 @@ def ground_elevation(map_name: Optional[str], x: float, y: float) -> Optional[fl
         return None
     d2 = (traj[:, 0] - x) ** 2 + (traj[:, 1] - y) ** 2
     idx = np.nonzero(d2 <= QUERY_RADIUS_M * QUERY_RADIUS_M)[0]
-    if idx.size == 0:
-        return None
-    return float(np.median(traj[idx, 2]))
+    if idx.size > 0:
+        return float(np.median(traj[idx, 2]))
+    return float(traj[np.argmin(d2), 2])

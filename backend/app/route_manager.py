@@ -169,7 +169,9 @@ class RouteManager:
         估计, 也不需要在预处理阶段用点云单独去量——推导见 path_planner.py 模块
         docstring。
 
-        机器狗当前位置附近没有建图轨迹经过(还没走到这张图覆盖的区域)时返回 None。
+        这张图压根没有建图轨迹数据时返回 None——机器狗当前位置附近没有轨迹直接
+        经过不算, path_planner.ground_elevation 这种情况下会退到离得最近的那个
+        轨迹点, 不再是 None, 见该函数的说明。
         """
         if not map_name or pose is None:
             return None
@@ -192,16 +194,16 @@ class RouteManager:
             logger.info(
                 "  机器狗当前: x=%.3f y=%.3f z=%.3f yaw=%.1f°  脚下地面=%s  定位cov=%.3f%s",
                 pose.x, pose.y, pose.z, math.degrees(pose.yaw),
-                f"{ground:.3f}" if ground is not None else "未知(附近无建图轨迹)",
+                f"{ground:.3f}" if ground is not None else "未知(这张图没有建图轨迹数据)",
                 pose.cov, "  【定位失败!】" if pose.cov >= config.POSE_COV_BAD else "",
             )
         for i, (wp, a) in enumerate(zip(waypoints, alts), 1):
             if a.ground is not None and a.delta is not None:
                 how = f"轨迹{a.ground:+.3f} + Δ{a.delta:+.3f}" + (f" + 微调{wp.z_offset:+.3f}" if wp.z_offset else "")
             elif pose is not None:
-                how = "附近无建图轨迹, 退回当前 odom 高度"
+                how = "这张图没有建图轨迹数据, 退回当前 odom 高度"
             else:
-                how = "附近无建图轨迹, 也没收到过位姿, 按 0 兜底"
+                how = "这张图没有建图轨迹数据, 也没收到过位姿, 按 0 兜底"
             dist = (math.dist((pose.x, pose.y, pose.z), (wp.x, wp.y, a.z)) if pose else float("nan"))
             # planNextWaypoint() 的重合点判据(不是到达判据): 只有跟机器狗当前位置
             # 几乎重合(<5cm)才会被跳过, 标出来
@@ -217,10 +219,12 @@ class RouteManager:
         + z_offset。地面高度来自 path_planner.ground_elevation, 数据源是建图
         轨迹(不再是点云预处理出的高程面, 见该模块 docstring 里的说明和推导)。
 
-        机器狗当前位置附近没有建图轨迹经过(算不出 Δ)、或者该途经点附近没有建图
-        轨迹经过时, 退回机器狗当前的 odom z —— 单层平面图上这恰好是对的, 因为
-        目标高度就等于它现在所处的高度。连位姿都还没收到(刚打开页面/还没连上狗)
-        时, 没有任何现场数据可退, 按 0 兜底(odom 系原点高度) —— 只是让"设置路线"
+        这张图压根没有建图轨迹数据(算不出 Δ, 或者查不到该途经点的地面高度)时,
+        退回机器狗当前的 odom z —— 单层平面图上这恰好是对的, 因为目标高度就
+        等于它现在所处的高度(机器狗/途经点附近没有轨迹直接经过不算这种情况,
+        path_planner.ground_elevation 会退到最近的轨迹点, 见该函数的说明)。
+        连位姿都还没收到(刚打开页面/还没连上狗)时, 没有任何现场数据可退,
+        按 0 兜底(odom 系原点高度) —— 只是让"设置路线"
         不必因为还没收到过一次位姿就直接报错, 不是说这个 0 一定精确; 等真的收到
         位姿后再提交, 就会退回上面那条更准的 fallback。
         """
@@ -228,7 +232,7 @@ class RouteManager:
         if pose is None:
             logger.warning("还没收到机器狗位姿, 高度按 0 兜底(+ z_offset)下发")
         elif delta is None and map_name:
-            logger.warning("机器狗当前位置附近无建图轨迹, 高度退回当前 odom 高度下发")
+            logger.warning("这张图没有建图轨迹数据, 高度退回当前 odom 高度下发")
 
         out: List[_Altitude] = []
         for wp in waypoints:

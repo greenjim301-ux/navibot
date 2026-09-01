@@ -201,8 +201,8 @@ async def map_ground(name: str, req: GroundZRequest):
     跟 submit_route 一样叠加 route_manager 里那个 Δ 标定偏移(见
     RouteManager.get_altitude_calibration), 让预览高度和实际下发执行的高度
     对得上, 也和 3D 预览里机器狗自身的 marker(用原始 odom.z 画)对得上。
-    机器狗当前位置附近没有建图轨迹经过(算不出 Δ)时退回未标定的轨迹高度,
-    和之前的行为一致。
+    这张图压根没有建图轨迹数据(算不出 Δ)时退回未标定的轨迹高度, 和之前的
+    行为一致。
     """
     def compute() -> list:
         delta = route_manager.get_altitude_calibration(name)
@@ -241,7 +241,7 @@ async def plan_path(name: str, req: PlanPathRequest):
             ground = path_planner.ground_elevation(name, x, y)
             if ground is None or delta is None:
                 logger.warning(
-                    "plan_path: (%.2f, %.2f) 附近没有建图轨迹或算不出位姿标定 Δ, z 按 0 兜底", x, y,
+                    "plan_path: (%.2f, %.2f) 这张图没有建图轨迹数据或算不出位姿标定 Δ, z 按 0 兜底", x, y,
                 )
                 z = 0.0
             else:
