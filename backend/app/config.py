@@ -230,7 +230,7 @@ SYSTEMD_SERVICES = [
     {"id": "lidar", "label": "激光雷达", "unit": "mid360.service"},
     {"id": "camera", "label": "相机", "unit": "camera.service"},
     {"id": "localization", "label": "导航定位", "unit": LOCALIZATION_SERVICE_UNIT},
-    {"id": "planner", "label": "路线规划", "unit": "ros-bringup.service"},
+    {"id": "planner", "label": "路线规划", "unit": "navi_planner.service"},
 ]
 
 # 启动/停止服务需要特权, 用 sudo -n(非交互——没配免密的话直接报错, 不会卡在等
@@ -265,14 +265,27 @@ MAPPING_MODES = [
 # 它依赖的服务都在跑, 没在跑就自动启动(见 service_manager.start_with_dependencies);
 # 停止一个服务前必须先确认没有(直接或间接)依赖它、且仍在运行的服务(见
 # service_manager.find_blocking_dependents), 有就拒绝, 报错列出是哪些服务,
-# 提示用户先停那些。只列直接依赖就够——间接依赖(比如 ros-bringup.service 通过
+# 提示用户先停那些。只列直接依赖就够——间接依赖(比如 navi_planner.service 通过
 # localization.service 间接依赖 mid360.service)靠 service_manager 里的传递
 # 闭包算法推出来, 这里不用重复写。
 SERVICE_DEPENDENCIES = {
     "mid360.service": [],
     "camera.service": [],
     "localization.service": ["mid360.service"],
-    "ros-bringup.service": ["localization.service"],
+    "navi_planner.service": ["localization.service"],
+}
+
+# localization.service 和 hand_lio.service(实时里程计, 导航定位用它输出的位姿)
+# 必须一起跑, 顺序固定: 先启动 localization.service, 再启动 hand_lio.service
+# (用户口述的顺序要求, 没有拿到 hand_lio 的实际配置核对过反过来会怎样)。这跟
+# SERVICE_DEPENDENCIES 是不同方向的关系, 不能塞进那张表: SERVICE_DEPENDENCIES
+# 表达的是"启动 A 前确保 A 依赖的 B 已经在跑"(单向, 由启动 A 触发), 这里要的是
+# "启动 A 之后紧接着也启动 B"(由启动 A 触发, 但 B 在 A 之后而不是之前)——两者
+# 触发方向相同、但 B 相对 A 的先后顺序相反, 用同一张表会自相矛盾。hand_lio.service
+# 没有单独的 SYSTEMD_SERVICES 条目(不在系统管理页单独展示/开关), 只跟着
+# localization.service 一起启动/停止, 见 service_manager.ServiceManager.start/stop。
+SERVICE_COSTART = {
+    "localization.service": ["hand_lio.service"],
 }
 
 # 建图模式服务的依赖, 跟上面 SERVICE_DEPENDENCIES 是两张分开的表(对应两个独立

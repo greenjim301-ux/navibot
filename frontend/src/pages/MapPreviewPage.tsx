@@ -41,7 +41,7 @@ const PANEL_SWITCH_CLASS =
   "data-unchecked:bg-white/15 data-checked:bg-cyan-500 " +
   "[&_[data-slot=switch-thumb]]:bg-white [&_[data-slot=switch-thumb]]:shadow-[0_0_0_1px_rgba(0,0,0,0.35)]";
 
-// 「路线规划」服务(ros-bringup.service)状态展示用, 颜色配这个面板自己的暗色
+// 「路线规划」服务(navi_planner.service)状态展示用, 颜色配这个面板自己的暗色
 // 主题(跟 SystemPage.tsx 浅色主题下那份同名映射不一样, 两边各自独立, 没必要
 // 抽公共组件——就四五行, 抽出来跨两个视觉风格完全不同的页面复用反而绕远)。
 const PLANNER_SERVICE_STATE_DISPLAY: Record<ServiceActiveState, { text: string; className: string }> = {
@@ -159,7 +159,7 @@ export default function MapPreviewPage() {
     }
   }
 
-  // 「路线规划」服务(ros-bringup.service)状态: 跟具体是哪张地图无关(机器狗
+  // 「路线规划」服务(navi_planner.service)状态: 跟具体是哪张地图无关(机器狗
   // 层面的服务), 但只有激活地图时"导航控制"面板才有意义, 顺带在同一个地方
   // 管这个服务的启停, 省得用户还要跳去系统管理页——只在激活地图时轮询, 见下面
   // 那个 effect 的 isActive 门槛。

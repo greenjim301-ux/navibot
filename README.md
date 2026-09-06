@@ -116,7 +116,7 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 | `lidar` | 激光雷达 | `mid360.service` |
 | `camera` | 相机 | `camera.service` |
 | `localization` | 导航定位 | `localization.service` |
-| `planner` | 路线规划 | `ros-bringup.service` |
+| `planner` | 路线规划 | `navi_planner.service` |
 
 对应接口：`GET /api/services`（3s 轮询查状态）、`POST /api/services/{id}/start`、
 `POST /api/services/{id}/stop`（`service_manager.py`）。查状态用 `systemctl show`，
@@ -133,7 +133,8 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
     /bin/systemctl stop mid360.service, \
     /bin/systemctl start camera.service, /bin/systemctl stop camera.service, \
     /bin/systemctl start localization.service, /bin/systemctl stop localization.service, \
-    /bin/systemctl start ros-bringup.service, /bin/systemctl stop ros-bringup.service, \
+    /bin/systemctl start hand_lio.service, /bin/systemctl stop hand_lio.service, \
+    /bin/systemctl start navi_planner.service, /bin/systemctl stop navi_planner.service, \
     /bin/systemctl start cloud_mapping_small.service, /bin/systemctl stop cloud_mapping_small.service, \
     /bin/systemctl start cloud_mapping_large.service, /bin/systemctl stop cloud_mapping_large.service, \
     /bin/systemctl start color_mapping_small.service, /bin/systemctl stop color_mapping_small.service, \
@@ -150,9 +151,17 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 `service_manager.py` 里的传递闭包算法推出来）：
 
 - `localization.service` 依赖 `mid360.service`
-- `ros-bringup.service` 依赖 `localization.service`（因此间接依赖 `mid360.service`）
+- `navi_planner.service` 依赖 `localization.service`（因此间接依赖 `mid360.service`）
 - 建图服务（`cloud_mapping_*.service`）依赖 `mid360.service`
 - 彩色点云建图服务（`color_mapping_*.service`）额外依赖 `camera.service`
+
+另外 `SERVICE_COSTART` 声明了一条方向相反的"伴生"关系：启动 `localization.
+service` 后紧接着也要启动 `hand_lio.service`（导航定位用它输出的实时里程计），
+顺序固定先 `localization.service` 后 `hand_lio.service`（用户口述的顺序要求，
+没有拿到 `hand_lio` 的实际配置核对过反过来会怎样）；停止 `localization.
+service` 时顺序相反，先停 `hand_lio.service` 再停 `localization.service`。
+`hand_lio.service` 没有自己的 `SYSTEMD_SERVICES` 条目（系统管理页看不到它单独
+的开关/状态），只能跟着「导航定位」这张卡片一起启/停。
 
 这些 unit 文件本身没有声明 `Requires=`/`After=`（板子上是各自独立配置的脚本，
 不假设它们互相知道对方存在），依赖关系是在应用层做的：
@@ -373,6 +382,13 @@ keyframe_info_3d.txt}` + `2d_map/{map_2d.pgm,map_2d.yaml}`）跟
   `systemctl`/`sudo -n systemctl`，开发机没有 systemd/这几个单元，本地跑不了；
   见"服务状态管理"一节的 sudoers 规则也还没有在机器上实际配过——权限没配对时
   的报错文本是否真的可读、`sudo -n` 在目标机器上的确切失败提示，都还没实机验证。
+- **`localization.service`/`hand_lio.service` 的伴生启停顺序是用户口述的，没有
+  实机核对过。** `config.SERVICE_COSTART` 假定先启动 `localization.service`
+  再启动 `hand_lio.service`（停止顺序相反），如果实际顺序反了或者两者之间还有
+  别的初始化时序要求，现象会是「导航定位」点了启动、`localization.service`
+  正常起来了，但 `hand_lio.service` 起不来或状态不对——两个服务各自的
+  `active_state` 仍然可以在 `systemctl status` 里查到，只是系统管理页目前只
+  展示 `localization.service` 这一个的状态，`hand_lio.service` 没有单独的卡片。
 - **建图页的保存流程还没在真实机器上跑过。** `start_save_map.bash` 产出的目录
   结构是否真的跟 `map_registry` 期望的一致是推断，不是核对过的事实——见
   「建图」一节。点云/机器狗位置这部分已经实机验证过（见下一条），保存这一步

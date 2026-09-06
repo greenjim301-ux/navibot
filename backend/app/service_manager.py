@@ -18,6 +18,12 @@ config.SYSTEMCTL_SUDO_CMD(默认 "sudo -n systemctl")包一层, 部署时需要�
 拒绝, 不静默停掉——那样会让依赖它的服务在不知情的情况下失去底层支撑。这两件事
 都是应用层做的, 不是 systemd unit 文件自己声明的 Requires=/After=, 因为这些
 unit 是板子上独立配置的脚本, 不假设它们互相知道对方的存在。
+
+另外还有 config.SERVICE_COSTART 表达的"伴生服务"关系(目前只有 localization.
+service -> hand_lio.service 一条): 跟依赖关系方向相反——不是"启动前确保已经在
+跑", 而是"启动之后紧接着也启动", 见该常量的说明。伴生服务(hand_lio.service)
+没有自己的 SYSTEMD_SERVICES 条目, 只能跟着主服务一起启/停, 见 ServiceManager.
+start/stop。
 """
 import logging
 import subprocess
@@ -108,8 +114,8 @@ def _transitive_dependencies(unit: str) -> Set[str]:
 def start_with_dependencies(unit: str, _visited: Optional[Set[str]] = None) -> None:
     """启动 unit 前先确认它(递归)依赖的每个服务都在跑, 没在跑就先启动——
     深度优先, 先把依赖(以及依赖的依赖)全部确认/启动好, 最后才检查 unit 自己
-    要不要启动(比如启动 ros-bringup.service 会先递归确认 localization.service
-    和它依赖的 mid360.service 都已经在跑, 再决定 ros-bringup.service 自己要不要
+    要不要启动(比如启动 navi_planner.service 会先递归确认 localization.service
+    和它依赖的 mid360.service 都已经在跑, 再决定 navi_planner.service 自己要不要
     启动)。每一层都是"已经 active/activating 就不重复喊 start", 递归和 unit
     自己走的是同一段判断逻辑, 不重复写两遍。"""
     if _visited is None:
@@ -183,6 +189,12 @@ class ServiceManager:
     def start(self, service_id: str) -> dict:
         svc = _find(service_id)
         start_with_dependencies(svc["unit"])
+        # 伴生服务(目前只有 hand_lio.service 跟着 localization.service)在主
+        # 服务之后启动, 顺序要求见 config.SERVICE_COSTART 的说明——
+        # start_with_dependencies 本身就是"已经 active/activating 就不重复喊
+        # start", 这里复用同一段判断, 不用再手写一次幂等检查。
+        for costart_unit in config.SERVICE_COSTART.get(svc["unit"], []):
+            start_with_dependencies(costart_unit)
         return self._status(svc)
 
     def stop(self, service_id: str) -> dict:
@@ -193,5 +205,16 @@ class ServiceManager:
             raise ServiceDependencyError(
                 f"「{svc['label']}」仍被以下正在运行的服务依赖, 需要先停止它们: {labels}"
             )
+        # 先停伴生服务, 再停主服务(跟 start 顺序相反)——伴生服务(hand_lio.
+        # service)不在 SYSTEMD_SERVICES 里, 用户在界面上没有单独的开关能停它,
+        # 不在这里处理的话, 它一直运行会被后面某次 find_blocking_dependents
+        # (如果以后 hand_lio.service 也被加进 SERVICE_DEPENDENCIES)挡住主服务
+        # 停不掉, 或者更糟——不挡的话"停止导航定位"表面成功、但伴生服务其实
+        # 还留在跑, 跟主服务已经停了的状态对不上。
+        for costart_unit in config.SERVICE_COSTART.get(svc["unit"], []):
+            costart_status = systemctl_status(costart_unit)
+            if costart_status["active_state"] not in _NOT_RUNNING_STATES:
+                logger.info("停止伴生服务: %s (跟 %s 一起停止)", costart_unit, svc["unit"])
+                systemctl_action(costart_unit, "stop")
         systemctl_action(svc["unit"], "stop")
         return self._status(svc)
