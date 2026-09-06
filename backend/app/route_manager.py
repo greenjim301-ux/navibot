@@ -112,6 +112,16 @@ class RouteManager:
             return self._status_locked()
 
     def _status_locked(self) -> NavStatus:
+        # 停掉 localization.service/hand_lio.service 之后, /hand_lio/odom_vehicle
+        # 不会再有新消息, self._robot_pose 就停在服务停止前最后一帧, 永远不会
+        # 自己清空(没有"服务停了"这种 ROS 事件可以监听, 只能靠这一帧多久没更新
+        # 反推)。这里在每次真正对外吐出快照时判一次新鲜度, 而不是让它一直是
+        # 陈旧的坐标——尤其是新连上 /ws/nav 的客户端(比如重新进地图预览页)
+        # 直接查的就是这个快照, 不判断的话会显得"服务明明停了, 界面却还显示
+        # 机器狗在原来的位置"。见 config.POSE_STALE_S 的说明。
+        pose = self._robot_pose
+        if pose is not None and time.time() - pose.stamp > config.POSE_STALE_S:
+            pose = None
         return NavStatus(
             state=self._state,
             waypoints=list(self._waypoints),
@@ -119,7 +129,7 @@ class RouteManager:
             label=self._label,
             map_name=self._map_name,
             message=self._message,
-            robot_pose=self._robot_pose,
+            robot_pose=pose,
             updated_at=time.time(),
             reference_path_active=self._reference_path_active,
         )

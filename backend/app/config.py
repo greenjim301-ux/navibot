@@ -126,6 +126,14 @@ WAYPOINTS_SUB_WAIT_S = float(os.environ.get("NAVIBOT_WAYPOINTS_WAIT_S", "5.0"))
 # 定位协方差达到这个值就认为定位失败 (hand-topic.csv: covariance[0] 0.99 = 定位失败)
 POSE_COV_BAD = 0.99
 
+# 收到的最后一帧位姿距现在超过这么久, 就认为它已经过时, 对外(NavStatus.
+# robot_pose)当没收到过处理——见 route_manager._status_locked。odom 正常是
+# 200Hz(见下面 POSE_BROADCAST_HZ 的说明), 5s 已经是断了几百帧的量级, 唯一
+# 合理的解释是发布方(localization.service/hand_lio.service)已经停了, 不是
+# 网络抖动。不这样过滤的话, 关掉「导航定位」服务后再打开地图预览页, 界面会
+# 一直显示服务停止前那一刻机器狗所在的坐标, 而不是"现在没有位姿"。
+POSE_STALE_S = float(os.environ.get("NAVIBOT_POSE_STALE_S", "5.0"))
+
 # odom 是 200Hz, 但前端只是画个点/更新一下文字, 用不着这么高频地推 —— 每一帧都
 # 转发的话大部分带宽和渲染都是浪费。这里只限流 WS 广播, 不影响内部用 odom 推进度
 # /判断卡住的逻辑(那部分仍然吃满 200Hz, 要的就是精度); 状态机变化(到达途经点、
