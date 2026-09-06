@@ -598,6 +598,11 @@ def main():
     ap.add_argument("--map2d-structure-min-span-bins", type=int, default=5,
                      help="detect_structure 判'这格有纵向实体撑着'(墙/柱子, 而不是孤立悬空"
                           "杂物)所需的最少支撑层数, 乘以 z_bin(0.1m)就是要求的最小纵向跨度")
+    ap.add_argument("--map2d-structure-ground-clearance", type=float, default=0.6,
+                     help="detect_structure 判定'贴地障碍 vs 悬空、狗能钻过去'的净空阈值"
+                          "(m): 候选 occupied 格子最低支撑层的高度减去它最近的建图轨迹点"
+                          "高度, 超过这个值就改判回不占据。0.6m 是凭经验估的机器狗净空"
+                          "高度, 没有拿真机验证过, 偏保守/偏激进都可能要调")
     ap.add_argument("--map2d-trajectory-clear-radius", type=float, default=0.25,
                      help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
                           "误判——默认 0.25 跟 backend/app/config.py 的"
@@ -708,6 +713,8 @@ def main():
                 z_bin=0.1,
                 min_support_frac=args.map2d_structure_min_support_frac,
                 min_span_bins=args.map2d_structure_min_span_bins,
+                trajectory=trajectory,
+                ground_clearance_m=args.map2d_structure_ground_clearance,
             )
             print(f"      detect_structure: 从点云密度现算出 min_support={min_support}")
             grid = elevation.classify_occupancy(structure)

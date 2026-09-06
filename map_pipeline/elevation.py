@@ -47,6 +47,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import binary_erosion, distance_transform_edt, maximum_filter, uniform_filter
+from scipy.spatial import cKDTree
 
 N8 = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -481,6 +482,8 @@ def detect_structure(
     z_bin: float,
     min_support_frac: float,
     min_span_bins: int,
+    trajectory: np.ndarray,
+    ground_clearance_m: float,
     min_support_floor: int = 2,
 ) -> tuple[np.ndarray, int]:
     """跟地面高度完全无关地识别"纵向有实体撑着"的格子(墙/柱子/大件家具...),
@@ -506,6 +509,19 @@ def detect_structure(
     [z_lo, z_hi] 建议按轨迹高度居中开一个几米宽的窗口(轨迹中位数 z 上下各
     几米)——单层地图里真正的结构都在这个范围内, 天花板/屋顶横梁这类远高于
     正常层高的东西天然被排除在窗口外。
+
+    上面这套判据只看"跨的层数够不够多", 不看这些支撑层挨不挨着地面——挂墙
+    置物架、招牌、栏杆扶手这类真悬空的结构, 只要垂直方向扫描点够密、跨的
+    层数够多, 一样会被判成 occupied, 即使狗其实能从下面钻过去。这里额外做
+    一次"贴地"复核: 每个候选 occupied 格子, 找它最低的那个支撑层(zbi 最小的
+    那层), 换算成世界坐标高度后, 减去这个格子最近的建图轨迹点的高度(狗站在
+    那附近时脚下的地面), 差值超过 ground_clearance_m 就认为下面净空够狗钻
+    过去, 改判回不占据。轨迹点本身就是"狗站过的地方", 拿它当地面参考比再猜
+    一个绝对地面高度更可靠(参考 backend/app/path_planner.py 用同一份轨迹数据
+    查地面高度的做法)——只对已经过关的候选格子(通常远少于全图格子数)做
+    最近邻查询, 不是对全图每格都查, 开销可控。ground_clearance_m 目前是凭
+    经验给的估计值, 没有拿真机验证过, 偏保守/偏激进都可能要调, 见调用方的
+    命令行参数说明。
 
     返回 (布尔数组(形状 (height, width), True=occupied), 实际用的 min_support)
     ——后者是从这张图现算出来的, 调用方打出来看看合不合理, 不是当参数传进来的
@@ -539,7 +555,7 @@ def detect_structure(
     bin_starts = np.searchsorted(zbi_s, np.arange(nz + 1))
 
     layer_counts = np.zeros((height, width), np.int32)
-    sparse_layers: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    sparse_layers: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
     for z in range(nz):
         sl = slice(bin_starts[z], bin_starts[z + 1])
         if sl.start == sl.stop:
@@ -547,12 +563,12 @@ def detect_structure(
         layer_counts.fill(0)
         np.add.at(layer_counts, (row_s[sl], col_s[sl]), 1)
         rr, cc = np.nonzero(layer_counts)
-        sparse_layers.append((rr, cc, layer_counts[rr, cc].copy()))
+        sparse_layers.append((z, rr, cc, layer_counts[rr, cc].copy()))
 
     if not sparse_layers:
         return np.zeros((height, width), dtype=bool), min_support_floor
 
-    nonzero_counts = np.concatenate([cnts for _, _, cnts in sparse_layers])
+    nonzero_counts = np.concatenate([cnts for _, _, _, cnts in sparse_layers])
     # 75 分位数, 不用中位数——实测(house/large 两份图)非空 (格子,切层) 组合的
     # 中位数在两份密度差好几倍的图上都恰好是 2, 因为大部分非空组合是掠射角/
     # 边缘只扫到一两个点的稀疏命中, 不是真墙那种密集命中, 中位数被这些"稀疏
@@ -563,11 +579,35 @@ def detect_structure(
     min_support = max(min_support_floor, int(typical_density * min_support_frac))
 
     populated_bins = np.zeros((height, width), np.int32)
-    for rr, cc, cnts in sparse_layers:
+    # 每个格子第一次(zbi 最小, 因为上面 for z in range(nz) 是从下往上遍历)被
+    # 记进 populated_bins 的那一层, 就是它最低的支撑层——留着给下面"贴地"复核
+    # 用, -1 表示这格从来没被任何一层支撑过。
+    lowest_bin = np.full((height, width), -1, np.int32)
+    for z, rr, cc, cnts in sparse_layers:
         supported = cnts >= min_support
-        populated_bins[rr[supported], cc[supported]] += 1
+        sr, sc = rr[supported], cc[supported]
+        populated_bins[sr, sc] += 1
+        first_hit = lowest_bin[sr, sc] < 0
+        lowest_bin[sr[first_hit], sc[first_hit]] = z
 
-    return populated_bins >= min_span_bins, min_support
+    occupied = populated_bins >= min_span_bins
+
+    # "贴地"复核(见函数 docstring): 候选格子最低支撑层的世界高度减去它最近的
+    # 建图轨迹点高度(狗当时脚下的地面), 差值超过 ground_clearance_m 就是真
+    # 悬空、狗能钻过去, 改判回不占据。只对已经过关的候选格子做最近邻查询,
+    # 不是对全图每格都查。
+    if occupied.any() and len(trajectory) > 0:
+        rr, cc = np.nonzero(occupied)
+        cell_x = x_min + (cc + 0.5) * resolution
+        cell_y = y_max - (rr + 0.5) * resolution
+        tree = cKDTree(trajectory[:, :2])
+        _, nearest_idx = tree.query(np.column_stack([cell_x, cell_y]))
+        ground_z = trajectory[nearest_idx, 2]
+        lowest_z = z_lo + lowest_bin[rr, cc] * z_bin
+        suspended = (lowest_z - ground_z) > ground_clearance_m
+        occupied[rr[suspended], cc[suspended]] = False
+
+    return occupied, min_support
 
 
 def classify_occupancy(structure: np.ndarray) -> np.ndarray:
