@@ -742,16 +742,26 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         return d < bestD ? h : best;
       }, undefined);
     }
-    // 点云有空洞(没扫到/被遮挡的地方)时, 光标下可能一个点都碰不到, 点选就完全
-    // 没反应。兜底跟一个水平面(假定地面高度取 world_bounds.z_min, 约等于地板)
-    // 求交, 用交点的 x/y——顶视角下这个假设带来的视差(跟真实地面的 x/y 偏差)
-    // 很小, 倾斜视角下会有一点, 但比"点哪都点不上"好得多。z 无所谓准不准, 摆点/
-    // 画路线/居中之后各自还会按 x/y 查真实地面高度(见 useGroundZ)。
+    // 点云有空洞(没扫到/被遮挡的地方、瓦片还没加载到高精度层级)时, 光标下可能
+    // 一个点都碰不到, 点选就完全没反应。兜底跟一个水平面求交, 用交点的 x/y——
+    // 倾斜视角下, 这个平面假设的高度跟光标视觉上瞄准的真实表面高度差多少, 会
+    // 被视差近乎放大成多少倍的 x/y 偏差(掠射角越明显放大倍数越大), 所以这个
+    // 高度得取"光标附近"的地面, 不能是整张图统一的一个数——以前直接用
+    // world_bounds.z_min(全图最低点), 在大地图/有高差的地图上跟光标附近的
+    // 真实地面能差出一截, 一偏斜着看就会出现"点哪偏出去老远"。现在改成动态
+    // 跟踪"最近一次真的命中点云"时的那个点的高度, 没命中过(这次交互刚开始,
+    // 一次都没蹭到点)才退回 world_bounds.z_min 起个头——命中点云的机会远多于
+    // 落空的机会(空洞通常只是小范围), 这个高度绝大多数时候就是光标附近最新的
+    // 真实地面, 比固定用全图最低点准得多。z 本身无所谓准不准, 摆点/画路线/
+    // 居中之后各自还会按 x/y 查真实地面高度(见 useGroundZ)。
     const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -meta.world_bounds.z_min);
     function pickXYZ(pickable: THREE.Points[]): { x: number; y: number; z: number } | undefined {
       const hits = raycaster.intersectObjects(pickable, false);
       const hit = nearestToRayHit(hits);
-      if (hit) return { x: hit.point.x, y: hit.point.y, z: hit.point.z };
+      if (hit) {
+        groundPlane.constant = -hit.point.z;
+        return { x: hit.point.x, y: hit.point.y, z: hit.point.z };
+      }
       const fallback = new THREE.Vector3();
       return raycaster.ray.intersectPlane(groundPlane, fallback)
         ? { x: fallback.x, y: fallback.y, z: fallback.z } : undefined;
