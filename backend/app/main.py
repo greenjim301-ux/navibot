@@ -239,11 +239,16 @@ async def plan_path(name: str, req: PlanPathRequest):
         out = []
         for x, y in raw_points:
             ground = path_planner.ground_elevation(name, x, y)
-            if ground is None or delta is None:
+            if ground is None:
                 logger.warning(
-                    "plan_path: (%.2f, %.2f) 这张图没有建图轨迹数据或算不出位姿标定 Δ, z 按 0 兜底", x, y,
+                    "plan_path: (%.2f, %.2f) 这张图没有建图轨迹数据, 查不到地面高程, z 按 0 兜底", x, y,
                 )
                 z = 0.0
+            elif delta is None:
+                logger.warning(
+                    "plan_path: (%.2f, %.2f) 算不出位姿标定 Δ, z 直接用未标定的地面高程 %.3f", x, y, ground,
+                )
+                z = ground
             else:
                 z = ground + delta
             out.append({"x": x, "y": y, "z": z})
