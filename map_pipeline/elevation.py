@@ -160,8 +160,21 @@ class ElevationResult:
     stats: dict = field(default_factory=dict)
 
 
+# keyframe_info_3d.txt 每行的列格式(见文件本身的 "#format:" 注释行):
+#   time frame_id tx ty tz qx qy qz qw pose_cov gps_flag gx gy gz g_cov
+# pose_cov(列 9)跟 backend/app/config.py 的 POSE_COV_BAD 是同一套约定
+# (>=0.99 表示定位失败, 这里独立定义一份而不是 import backend——map_pipeline
+# 是离线脚本, 不依赖 backend 包)。实测每张图的第一个关键帧(frame_id=1,
+# tx=ty=tz=0, 建图刚开始、SLAM 还没收敛那一帧)pose_cov 都是 0.99, 其余关键帧
+# 都是 0.01——这一个坏点如果混进轨迹, detect_structure/clear_trajectory/
+# mark_known_region 会把地图原点当成狗确实站过的地方, 在那里凭空清出一小片
+# "已知可走"区域。
+POSE_COV_BAD = 0.99
+_POSE_COV_COL = 9
+
+
 def load_trajectory(map_dir: Path) -> np.ndarray | None:
-    """读建图轨迹 (Nx3 世界系 xyz)。
+    """读建图轨迹 (Nx3 世界系 xyz), 过滤掉 pose_cov 标记为定位失败的帧。
 
     keyframe_info_3d.txt 是 HandBot-S1 建图时输出的关键帧位姿, 和
     dense_cloud_map.pcd 同一坐标系、同一次回环优化的产物 —— 实测逐帧取脚下点云
@@ -173,12 +186,15 @@ def load_trajectory(map_dir: Path) -> np.ndarray | None:
         data = np.loadtxt(txt, comments="#")
         if data.ndim == 1:
             data = data[None, :]
-        return np.ascontiguousarray(data[:, 2:5], dtype=np.float64)
+        valid = data[:, _POSE_COV_COL] < POSE_COV_BAD
+        return np.ascontiguousarray(data[valid, 2:5], dtype=np.float64)
 
     pcd = map_dir / "keyframe_pos_3d.pcd"
     if pcd.exists():
         import open3d as o3d
 
+        # keyframe_pos_3d.pcd 只有位置, 没有 pose_cov 这一列, 过滤不了这类坏点——
+        # 只有 keyframe_info_3d.txt 这条路径能做上面的过滤。
         return np.asarray(o3d.io.read_point_cloud(str(pcd)).points, dtype=np.float64)
     return None
 
