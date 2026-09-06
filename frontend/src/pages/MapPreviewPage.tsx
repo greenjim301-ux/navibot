@@ -30,6 +30,12 @@ const SHOW_INFLATION_TOGGLES = false;
 // 页面把内存吃掉。
 const TRAIL_MIN_STEP_M = 0.05;
 const TRAIL_MAX_POINTS = 5000;
+// 跟 backend/app/config.py 的 POSE_COV_BAD 保持一致: odom covariance[0] 到这个
+// 值就是"定位失败", 此时 x/y/z 不可信(hand_lio/localization.service 刚起来、
+// 还没收敛时会先发几帧这样的位姿)。历史上踩过的坑: 不过滤的话, 这种失败位姿
+// 会被当成正常轨迹点记进 trail, 跟它前后的真实位姿之间画出一条不存在的直线
+// (比如从原点直接拉到机器狗当前位置)。
+const POSE_COV_BAD = 0.99;
 
 // 面板背景是暗色(bg-neutral-900/90), 但 Switch 组件的默认配色走的是全局(浅色)
 // 主题 token——关闭态的滑轨(bg-input, 浅灰)跟球(bg-background, 近白)几乎同色,
@@ -104,7 +110,11 @@ export default function MapPreviewPage() {
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const pose = displayStatus?.robot_pose;
   useEffect(() => {
-    if (!pose) return;
+    // cov >= POSE_COV_BAD 表示这一帧位姿定位失败, x/y/z 不可信——不跳过的话
+    // 这一帧会被记成轨迹上的一个点, 跟前后真实位姿之间连出一条不存在的直线
+    // (刚启动导航定位服务、hand_lio 还没收敛时最容易看到, 见 POSE_COV_BAD 声明
+    // 处的说明)。
+    if (!pose || pose.cov >= POSE_COV_BAD) return;
     setTrail((prev) => {
       const last = prev[prev.length - 1];
       if (last && Math.hypot(pose.x - last.x, pose.y - last.y, pose.z - last.z) < TRAIL_MIN_STEP_M) {
@@ -113,7 +123,7 @@ export default function MapPreviewPage() {
       const next = [...prev, { x: pose.x, y: pose.y, z: pose.z }];
       return next.length > TRAIL_MAX_POINTS ? next.slice(next.length - TRAIL_MAX_POINTS) : next;
     });
-  }, [pose?.x, pose?.y, pose?.z]);
+  }, [pose?.x, pose?.y, pose?.z, pose?.cov]);
 
   // "清空目标点" 也要把 planner 局部轨迹线(optimalTraj)擦掉, 但那条线是 ws
   // 推来的、页面并不持有它的数据, 只能记一个"擦掉了"标记, 下一条新轨迹
