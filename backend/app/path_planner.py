@@ -28,8 +28,8 @@ keyframe_info_3d.txt), 不碰点云, 也不需要任何离线预处理产物。
 
 C 恰好消掉, 不需要单独估计, 也不需要在预处理阶段用点云去量。
 
-不处理楼梯/多层重叠: 每个 (x, y) 只取轨迹上离得最近一批点的中位数高度, 不做
-区域生长或多值检测——这是有意简化, 复杂的分层逻辑等寻路重做时再上; 现在的唯一
+不处理楼梯/多层重叠: 每个 (x, y) 只取轨迹上离得最近那一个点的高度, 不做区域
+生长或多值检测——这是有意简化, 复杂的分层逻辑等寻路重做时再上; 现在的唯一
 目标是给"设置导航点"提供一个能兼容任意地图大小的 z。
 """
 import logging
@@ -48,12 +48,6 @@ logger = logging.getLogger("navibot.path_planner")
 # map_pipeline 专用的 scipy/open3d)。
 RESAMPLE_STEP_M = 0.2
 
-# 查询某个 (x, y) 时, 往外找多远的轨迹点算"附近"。超出这个半径就认为没有轨迹
-# 经过(狗没走过那里), 不给近似值——跟旧版 elevation 查询"未观测就不给"的设计
-# 一致, 只是数据源换了。
-QUERY_RADIUS_M = 2.0
-
-
 def _resample_polyline(pts: np.ndarray, step: float) -> np.ndarray:
     """把轨迹折线按弧长重采样, 填满关键帧之间的断点(见模块开头注释)。"""
     out = [pts[0]]
@@ -69,8 +63,20 @@ def _resample_polyline(pts: np.ndarray, step: float) -> np.ndarray:
 _traj_cache: Dict[str, Tuple[float, Optional[np.ndarray]]] = {}
 
 
+# keyframe_info_3d.txt 每行的列格式(见文件本身的 "#format:" 注释行):
+#   time frame_id tx ty tz qx qy qz qw pose_cov gps_flag gx gy gz g_cov
+# pose_cov(列 9)跟 route_manager 里 odom covariance[0] 是同一套约定
+# (config.POSE_COV_BAD, >=0.99 表示定位失败)。实测每张图的第一个关键帧
+# (frame_id=1, tx=ty=tz=0, 建图刚开始、SLAM 还没收敛那一帧)pose_cov 都是
+# 0.99, 其余关键帧都是 0.01——这一个坏点如果混进轨迹, 会让"地图原点附近"
+# 查地面高度/生成 2D 栅格图时被当成狗确实站过 (0, 0, 0), 得到错误的高程/
+# 清空一小片障碍。
+_POSE_COV_COL = 9
+
+
 def _load_trajectory(map_name: str) -> Optional[np.ndarray]:
-    """按地图名加载(重采样后的)建图轨迹 xyz, 用文件 mtime 做缓存键。"""
+    """按地图名加载(过滤掉定位失败帧、重采样后的)建图轨迹 xyz, 用文件 mtime
+    做缓存键。"""
     txt = Path(config.MAP_DATA_DIR) / map_name / config.MAP_3D_SUBDIR / config.MAP_3D_KEYFRAME_FILENAME
     if not txt.is_file():
         return None
@@ -83,29 +89,23 @@ def _load_trajectory(map_name: str) -> Optional[np.ndarray]:
     data = np.loadtxt(txt, comments="#")
     if data.ndim == 1:
         data = data[None, :]
-    xyz = np.ascontiguousarray(data[:, 2:5], dtype=np.float64)
+    valid = data[:, _POSE_COV_COL] < config.POSE_COV_BAD
+    xyz = np.ascontiguousarray(data[valid, 2:5], dtype=np.float64)
     resampled = _resample_polyline(xyz, RESAMPLE_STEP_M) if len(xyz) > 1 else xyz
     _traj_cache[map_name] = (mtime, resampled)
     return resampled
 
 
 def ground_elevation(map_name: Optional[str], x: float, y: float) -> Optional[float]:
-    """(x, y) 附近建图轨迹的高度, 当作该点的地面高度近似(不区分楼层/不做多值
-    检测, 见模块 docstring)。QUERY_RADIUS_M 内有轨迹经过就取这些点的中位数
-    (局部多点平均, 更抗噪); 半径内没有的话退到"离得最近的那一个轨迹点"
-    (不设距离上限)——途经点很少正好落在机器狗走过的 QUERY_RADIUS_M 范围内
-    (常常点在房间中间、过道一侧), 严格按半径"没有就不给"会导致这个函数经常
-    返回 None; 单层
-    平面图上再远一点的地面高度基本不变, 给个"最近处"的近似值远比什么都不给
-    有用。只有这张图压根没有建图轨迹数据(地图不存在/keyframe 文件是空的)才
-    真的返回 None。"""
+    """(x, y) 最近的建图轨迹点的高度, 当作该点的地面高度近似(不区分楼层/不做
+    多值检测, 见模块 docstring)——不设距离上限, 途经点很少正好落在机器狗走过
+    的路径上(常常点在房间中间、过道一侧), 单层平面图上再远一点的地面高度
+    基本不变, 给个"最近处"的近似值远比什么都不给有用。只有这张图压根没有
+    建图轨迹数据(地图不存在/keyframe 文件是空的)才真的返回 None。"""
     if not map_name:
         return None
     traj = _load_trajectory(map_name)
     if traj is None or len(traj) == 0:
         return None
     d2 = (traj[:, 0] - x) ** 2 + (traj[:, 1] - y) ** 2
-    idx = np.nonzero(d2 <= QUERY_RADIUS_M * QUERY_RADIUS_M)[0]
-    if idx.size > 0:
-        return float(np.median(traj[idx, 2]))
     return float(traj[np.argmin(d2), 2])
