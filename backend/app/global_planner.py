@@ -24,8 +24,10 @@ z 直接用 path_planner.ground_elevation + route_manager 的位姿标定 Δ (�
 不可通行, "未知"——map_pipeline/elevation.py 的 mark_known_region 标的、离
 建图轨迹太远的 free 格子——不挡, 只是走一步的代价乘
 GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER, 优先绕开走验证过的地方, 绕不开还是
-能穿过去) -> 按机身半径膨胀障碍 -> 在膨胀后的自由栅格上跑带权 8 连通 A* ->
-贪心 line-of-sight 剪枝把锯齿收敛成关键拐点 -> 换算回世界坐标。
+能穿过去) -> 按机身半径膨胀障碍 -> 硬膨胀边界外再留一段软惩罚缓冲带(见
+_wall_clearance_weight), 有空间可绕时优先离墙远一点, 而不是贴着硬膨胀边界
+走几何最短路 -> 在膨胀后的自由栅格上跑带权 8 连通 A* -> 贪心 line-of-sight
+剪枝把锯齿收敛成关键拐点 -> 换算回世界坐标。
 
 不用 scipy/pillow: 这两个是 map_pipeline/ 离线预处理专用的重依赖, backend 本身
 不依赖(见 requirements.txt), 这里的 pgm 解析和膨胀都是不到 50 行的 numpy/纯
@@ -143,6 +145,30 @@ def _cost_weight(prob: np.ndarray, free_thresh: float, occupied_thresh: float,
     return weight
 
 
+def _wall_clearance_weight(blocked: np.ndarray, free: np.ndarray, radius_px: int,
+                            clearance_px: int, max_multiplier: float) -> np.ndarray:
+    """硬膨胀边界(radius_px)之外再留 clearance_px 像素宽的软惩罚缓冲带: A*
+    找最短路时天然会贴着硬膨胀边界走(几何上最短), 这里让"贴着边界"比"稍微
+    远一点"代价更高, 有空间可绕时优先绕开贴墙路线, 但缓冲带只是加代价, 不是
+    _blocked_mask 那种硬挡, 过窄的地方(缓冲带内没有别的路)照样能穿过去。见
+    config.GLOBAL_PLANNER_WALL_CLEARANCE_M/_MULTIPLIER 的说明。
+
+    分 3 档由内向外线性回落到 1.0(不是连续的距离场, 但比单一台阶更平滑),
+    每档在 free 上再多膨胀一圈算出来, 只比硬膨胀多这 3 次(复用同一个
+    _dilate_bool)。clearance_px<=0 时直接返回全 1.0(关掉这个偏好)。
+    """
+    weight = np.ones(blocked.shape, dtype=np.float64)
+    if clearance_px <= 0:
+        return weight
+    n_tiers = 3
+    for i in range(1, n_tiers + 1):
+        tier_radius_px = radius_px + round(clearance_px * i / n_tiers)
+        tier_mult = 1.0 + (max_multiplier - 1.0) * (n_tiers - i + 1) / n_tiers
+        tier_mask = _dilate_bool(blocked, tier_radius_px) & free
+        weight[tier_mask] = np.maximum(weight[tier_mask], tier_mult)
+    return weight
+
+
 def _dilate_bool(mask: np.ndarray, radius_px: int) -> np.ndarray:
     """把 True(障碍)按方形结构元素膨胀 radius_px 像素(棋盘距离, 不是精确的
     欧氏圆——对角线方向会多裁掉一点, 偏保守不偏危险)。用两次可分离的 1D 滑动
@@ -182,11 +208,11 @@ def _astar(free: np.ndarray, cost_weight: np.ndarray, start: RC, goal: RC) -> Op
     """8 连通 A*, 禁止穿对角夹缝(两个直连相邻格子都是障碍时不允许斜着穿过去,
     不然现实里会蹭到墙角)。
 
-    单步代价是几何距离(1.0/根号2)乘目标格子的 cost_weight——"未知"格子权重
-    > 1(见 _cost_weight), 一视同仁的格子权重都是 1.0。_octile 启发式按权重
-    恒为 1 算(未知格子的真实代价只会更高不会更低), 所以启发式永远不高估
-    实际代价, A* 的最优性不受影响, 只是遇到大片未知区域时搜索空间会张得更大
-    一些(启发式没那么"准"了)。"""
+    单步代价是几何距离(1.0/根号2)乘目标格子的 cost_weight——"未知"格子/贴墙
+    惩罚带里的格子权重 > 1(见 _cost_weight/_wall_clearance_weight), 一视同仁
+    的格子权重都是 1.0。_octile 启发式按权重恒为 1 算(这些格子的真实代价只会
+    更高不会更低), 所以启发式永远不高估实际代价, A* 的最优性不受影响, 只是
+    遇到大片高权重区域时搜索空间会张得更大一些(启发式没那么"准"了)。"""
     height, width = free.shape
     open_heap: List[Tuple[float, float, RC]] = [(_octile(start, goal), 0.0, start)]
     came_from: dict = {}
@@ -248,12 +274,64 @@ def _line_free(free: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> bool:
             return False
 
 
-def _prune_path(path: List[RC], free: np.ndarray) -> List[RC]:
+def _line_cost(cost_weight: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> float:
+    """跟 _line_free 走同一条 Bresenham 线, 累加每一步的加权代价——公式跟
+    _astar 里 ng = g + step_dist * cost_weight[nr, nc] 完全一致, 只是不检查
+    是否越过障碍(调用方应该先用 _line_free 确认过全程可走), 给 _prune_path
+    比较"直连"和"原始拐点路径"哪个更贵用。"""
+    dr, dc = abs(r1 - r0), abs(c1 - c0)
+    sr = 1 if r1 > r0 else -1
+    sc = 1 if c1 > c0 else -1
+    err = dr - dc
+    r, c = r0, c0
+    total = 0.0
+    while r != r1 or c != c1:
+        e2 = 2 * err
+        step_r = step_c = False
+        if e2 > -dc:
+            err -= dc
+            r += sr
+            step_r = True
+        if e2 < dr:
+            err += dr
+            c += sc
+            step_c = True
+        total += (math.sqrt(2) if (step_r and step_c) else 1.0) * cost_weight[r, c]
+    return total
+
+
+# 直连比原路径贵不超过这个比例才允许拉直——留一点容差, 不是严格 <=, 因为
+# Bresenham 直连和 A* 实际走的锯齿路径即使代价场完全一样, 累加出来的浮点数
+# 也可能有极小的量级差异, 严格比较会把这类本该拉直的情况也保留成一堆多余拐点。
+_PRUNE_COST_TOLERANCE = 1.02
+
+
+def _prune_path(path: List[RC], free: np.ndarray, cost_weight: np.ndarray) -> List[RC]:
     """贪心 line-of-sight 剪枝: 从当前锚点往后尽量跳到能直连的最远点, 把栅格
     A* 的锯齿收敛成关键拐点。navi_mode=3 要的就是这种稀疏 via-points, 不需要
-    再重采样成稠密路径(见模块 docstring)。"""
+    再重采样成稠密路径(见模块 docstring)。
+
+    直连判据除了"没有障碍挡着"(_line_free), 还要求直连的加权代价不比原始
+    A* 路径在这一段的加权代价更贵(_line_cost, 容差见 _PRUNE_COST_TOLERANCE)。
+    只看 free 的话, A* 为了绕开未知区域/贴墙惩罚带特意多拐的弯, 只要终点跟
+    起点之间技术上"没有障碍物挡着"就会被拉直变回穿过去, 白费了
+    GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER/GLOBAL_PLANNER_WALL_CLEARANCE_
+    MULTIPLIER 这两个偏好；但反过来"touch 过软惩罚格子就完全不让直连"又太
+    严格——同一片代价均匀的软惩罚区域内部, 笔直穿过去和沿着 A* 8 连通网格走出
+    的锯齿, 加权代价几乎一样(直线距离更短, 只是格点对齐产生的锯齿让 A* 路径
+    看着绕), 一律不让直连会把这些锯齿也完整保留下来, 拐点暴增。按代价比较
+    就能只在"直连真的会穿过原路径绕开的高代价区域"时才保留拐点, 其余情况
+    (包括软惩罚区域内部的锯齿)照样能拉直成少数几个关键点。"""
     if len(path) <= 2:
         return path
+    # 原始路径每一步的加权代价前缀和, 跟候选直连的加权代价比较用——O(1) 查
+    # 任意一段 [anchor, j] 的原始代价, 不用每次重新扫一遍。
+    cum_cost = [0.0]
+    for k in range(len(path) - 1):
+        (r0, c0), (r1, c1) = path[k], path[k + 1]
+        step_dist = math.sqrt(2) if (r0 != r1 and c0 != c1) else 1.0
+        cum_cost.append(cum_cost[-1] + step_dist * cost_weight[r1, c1])
+
     pruned = [path[0]]
     anchor = 0
     while anchor < len(path) - 1:
@@ -262,11 +340,13 @@ def _prune_path(path: List[RC], free: np.ndarray) -> List[RC]:
         while j < len(path):
             r0, c0 = path[anchor]
             r1, c1 = path[j]
-            if _line_free(free, r0, c0, r1, c1):
-                last_visible = j
-                j += 1
-            else:
+            if not _line_free(free, r0, c0, r1, c1):
                 break
+            raw_cost = cum_cost[j] - cum_cost[anchor]
+            if _line_cost(cost_weight, r0, c0, r1, c1) > raw_cost * _PRUNE_COST_TOLERANCE:
+                break
+            last_visible = j
+            j += 1
         pruned.append(path[last_visible])
         anchor = last_visible
     return pruned
@@ -301,6 +381,14 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY) -> List[XY]:
         prob, meta["free_thresh"], meta["occupied_thresh"],
         config.GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER,
     )
+    clearance_px = math.ceil(config.GLOBAL_PLANNER_WALL_CLEARANCE_M / resolution)
+    wall_weight = _wall_clearance_weight(
+        blocked, free, radius_px, clearance_px, config.GLOBAL_PLANNER_WALL_CLEARANCE_MULTIPLIER,
+    )
+    # 跟"未知"惩罚取 max 而不是相乘: 两个都是"软惩罚, 不是硬挡"的独立信号(贴墙
+    # 又恰好在未知区域的格子不该被罚两次、代价乘出离谱的数字), 取较大的那个
+    # 惩罚就够表达"这格不太受待见"。
+    cost_weight = np.maximum(cost_weight, wall_weight)
 
     start_rc = _world_to_pixel(start_xy[0], start_xy[1], height, resolution, origin_x, origin_y)
     goal_rc = _world_to_pixel(goal_xy[0], goal_xy[1], height, resolution, origin_x, origin_y)
@@ -317,5 +405,5 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY) -> List[XY]:
     if raw is None:
         raise ValueError("起点和终点之间找不到可行路径")
 
-    pruned = _prune_path(raw, free)
+    pruned = _prune_path(raw, free, cost_weight)
     return [_pixel_to_world(r, c, height, resolution, origin_x, origin_y) for r, c in pruned]

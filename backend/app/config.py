@@ -79,6 +79,20 @@ GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
 GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER", "5.0")
 )
+# 硬膨胀边界(GLOBAL_PLANNER_INFLATION_RADIUS_M)之外, 再留这么宽一段"更希望
+# 离墙远一点"的软惩罚缓冲带(m)——A* 找最短路时天然会贴着硬膨胀边界走(那是
+# 几何上最短的路), 有更宽敞的地方可绕时应该优先绕开贴墙的路线, 但缓冲带内
+# 并不是不能走, 绕不开(比如过窄门)时照样能穿过去。0 关掉这个偏好(退回纯
+# 最短路径, 跟加这个功能之前一致)。0.3m 是凭经验估的, 没有拿真机验证过。
+GLOBAL_PLANNER_WALL_CLEARANCE_M = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_WALL_CLEARANCE_M", "0.3")
+)
+# 缓冲带最靠近硬膨胀边界那一档的代价倍率(越往外几档线性回落到 1.0, 见
+# global_planner._wall_clearance_weight)——跟 GLOBAL_PLANNER_UNKNOWN_COST_
+# MULTIPLIER 是同一套"软惩罚, 不是硬挡"的机制, 数越大越倾向绕更远也要离墙远。
+GLOBAL_PLANNER_WALL_CLEARANCE_MULTIPLIER = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_WALL_CLEARANCE_MULTIPLIER", "3.0")
+)
 EMERGENCY_STOP_TOPIC = os.environ.get("NAVIBOT_EMERGENCY_STOP_TOPIC", "/planning/emergency_stop")
 # planner 侧 -> backend, scan_planner/PlanFinished (ROS 包名是 scan_planner, 源码
 # 目录是 plan_manage)。整轮任务只发一次: status=REACHED(到达最终目标)或
