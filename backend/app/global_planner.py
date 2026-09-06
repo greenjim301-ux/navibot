@@ -1,5 +1,13 @@
-"""基于 2D 栅格图 (map-data-dir/<name>/2d_map/map_2d.pgm + .yaml) 的全局路径规划,
+"""基于 2D 栅格图 (map-assets-dir/<name>/map_2d.pgm + .yaml) 的全局路径规划,
 给 SCAN-Planner navi_mode=3 (REFERENCE_PATH) 用。
+
+这份 pgm/yaml 是 map_pipeline/generate_map_assets.py 重新生成的版本, 落在
+navibot 自己独占的资源目录(config.MAP_ASSETS_DIR)下, 不是
+map-data-dir/<name>/2d_map/ 下 handbot slam 自己存的那份原始占据栅格图——那份
+是 localization.service 等第三方组件认死的固定路径, 这条流水线只读不写它(见
+generate_map_assets.py 模块 docstring), global_planner 这边自然也不该去读
+它——它是按固定扫描高度切片判占据的旧图, 没有本脚本这条流水线里
+detect_structure/clear_trajectory/mark_known_region 这些修正。
 
 跟 navi_mode=2 (/preset_waypoints, route_manager.py) 是完全不同的下发链路:
 navi_mode=3 订阅 /initial_path, 只读每个点的 position (orientation 不看), 内部
@@ -273,7 +281,7 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY) -> List[XY]:
     路径时抛 ValueError——不做"自动挪到最近自由格子"这种静默纠偏, 规划失败
     应该原样告诉用户, 不能悄悄给一条他没画过的路线。
     """
-    map2d_dir = Path(config.MAP_DATA_DIR) / map_name / config.MAP_2D_SUBDIR
+    map2d_dir = Path(config.MAP_ASSETS_DIR) / map_name
     pgm_path = map2d_dir / config.MAP_2D_PGM_FILENAME
     yaml_path = map2d_dir / config.MAP_2D_YAML_FILENAME
     if not pgm_path.is_file() or not yaml_path.is_file():

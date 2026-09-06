@@ -6,20 +6,30 @@
   3d_map/dense_cloud_map.pcd     稠密重建点云
   3d_map/keyframe_info_3d.txt    建图轨迹关键帧位姿, 用来定 detect_structure 的
                                   z 窗口(见 elevation.detect_structure)
-  2d_map/map_2d.pgm + .yaml      handbot slam 自带的 2D 占据栅格图。默认会被
-                                  本脚本从点云重新生成的版本覆盖掉(见
-                                  --gen-2d-map)——slam 自带的图是按固定扫描
-                                  高度切片判占据, 漏掉切片高度之外的障碍;
-                                  没有 keyframe_info_3d.txt 生成不了就沿用
-                                  原文件, 都没有就跳过
-  2d_map/map_2d_raw.pgm + .yaml  handbot slam 实时建图时自己存的原图, 不会被
-                                  本脚本覆盖(文件名跟上面那个不同)。既用来当
-                                  2D 栅格图的物理边界(见 raw_map2d_xy_bounds),
-                                  也用来把它标"未知"的格子在新图里改判 occupied
-                                  (见 --block-unscanned/raw_map2d_unknown_mask)
+  2d_map/map_2d.pgm + .yaml      handbot slam 自带的 2D 占据栅格图。只读, 本
+                                  脚本绝不写回这个路径——localization.service
+                                  等第三方组件直接认这个固定路径, 早期版本在
+                                  这里原地覆盖过, 导致预处理一跑, 第三方定位
+                                  服务实际用的地图内容也跟着变了(不是我们
+                                  navibot 自己的地图状态该有的副作用)。本脚本
+                                  从点云重新生成的版本改落到 web_assets/map/
+                                  <room>/map_2d.pgm(见下面输出说明), slam 自带
+                                  的图是按固定扫描高度切片判占据, 漏掉切片
+                                  高度之外的障碍, 只在生成不了(没有
+                                  keyframe_info_3d.txt)时当一次性只读的沿用/
+                                  拷贝来源, 都没有就跳过
+  2d_map/map_2d_raw.pgm + .yaml  handbot slam 实时建图时自己存的原图, 同样只读
+                                  (文件名跟上面那个不同)。既用来当 2D 栅格图的
+                                  物理边界(见 raw_map2d_xy_bounds), 也用来把它
+                                  标"未知"的格子在新图里改判 occupied(见
+                                  --block-unscanned/raw_map2d_unknown_mask)
                                   ——它是 SLAM 自己做过 ray casting 的结果, 比
                                   事后从点云猜"扫没扫到"靠谱。没有就都跳过
 输出 (web_assets/map/<room>/ 下):
+  map_2d.pgm + .yaml       本脚本重新生成(或从 2d_map/map_2d.pgm 只读拷贝沿用)
+                            的 2D 占据栅格图, 供 backend/app/global_planner.py
+                            规划路径读取——不再落回 map-data-dir/<name>/2d_map/,
+                            理由见上面输入说明。
   topview_meta.json       地图基础几何信息: world_bounds(含 z_min/z_max, 从点云
                            算, 3D 预览用) + topview2d(2D 栅格图的分辨率/像素尺寸/
                            世界坐标范围, 设置路线用, 没有 2D 源图时这个字段不写)。
@@ -47,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import struct
 import sys
 import time
@@ -309,6 +320,29 @@ def raw_map2d_unknown_mask(
     unknown = np.zeros((height, width), dtype=bool)
     unknown[inb] = raw_arr[raw_row[inb], raw_col[inb]] == 205
     return unknown
+
+
+def bootstrap_map2d_from_slam(map2d_dir: Path, pgm_path: Path, yaml_path: Path) -> bool:
+    """规划/展示用的 (pgm_path, yaml_path) 这次没能重新生成(没有
+    keyframe_info_3d.txt, 或者调用方传了 --no-gen-2d-map), 且此前也没有成功
+    生成过(out_dir 下还没有这两个文件)时, 从 map2d_dir(handbot slam 自带的
+    原始 2D 占据栅格图, 只读)拷贝一份过去当起始版本用, 好让 global_planner.py/
+    topview.png 在第一次预处理时就有图可用, 不用非等到轨迹文件齐了才有 2D 图。
+
+    只拷贝, 绝不修改/写回 map2d_dir 本身(见模块 docstring 里的说明——那是
+    第三方组件认死的固定路径)。out_dir 下已经有文件(不管是上一次真正生成的,
+    还是之前拷贝过的)就什么都不做, 不会用 slam 原图覆盖掉我们自己更好的版本。
+
+    返回是否真的拷贝了(纯粹给调用方打日志用)。"""
+    if pgm_path.is_file() and yaml_path.is_file():
+        return False
+    src_pgm, src_yaml = map2d_dir / "map_2d.pgm", map2d_dir / "map_2d.yaml"
+    if not (src_pgm.is_file() and src_yaml.is_file()):
+        return False
+    pgm_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_pgm, pgm_path)
+    shutil.copy2(src_yaml, yaml_path)
+    return True
 
 
 def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path,
@@ -620,13 +654,19 @@ def main():
     # 跟 3d_map 同级的 2d_map/ 目录, 是 map-data-dir/<name>/ 的固定目录结构
     # (见 backend/app/config.py 的 MAP_DATA_DIR 注释), 这里直接从
     # --input(3d_map/dense_cloud_map.pcd)反推兄弟目录, 不用额外加命令行参数。
+    # 这个目录下的 map_2d.pgm/.yaml 是 handbot slam 自己的原始产出,
+    # localization.service 等第三方组件直接认这个固定路径——这条流水线只读它,
+    # 绝不写回(见上面模块 docstring 输入说明里的教训)。我们自己重新生成的
+    # 版本改落到 out_dir(web_assets/map/<name>/, navibot 独占的资源目录),
+    # 跟 topview.png 等其它预处理产物放一起; backend/app/global_planner.py
+    # 也相应改成从这里读, 不再读 map-data-dir/<name>/2d_map/。
     map2d_dir = in_path.parent.parent / "2d_map"
-    pgm_path, yaml_path = map2d_dir / "map_2d.pgm", map2d_dir / "map_2d.yaml"
+    pgm_path, yaml_path = out_dir / "map_2d.pgm", out_dir / "map_2d.yaml"
 
     # 2D 栅格图的包围盒优先复用 map_2d_raw.pgm(handbot slam 自己存的原图,
-    # 不会被这条流水线覆盖——我们只写 map_2d.pgm 这个文件名), 而不是从点云
-    # 统计猜——理由见 raw_map2d_xy_bounds 的说明。3D 预览/分片用的 x_min 等
-    # 变量仍然是点云自己的包围盒, 跟这里的 map2d_x_min 等是两套边界, 不要混用。
+    # 这条流水线只读, 不会写它——见上面的说明), 而不是从点云统计猜——理由见
+    # raw_map2d_xy_bounds 的说明。3D 预览/分片用的 x_min 等变量仍然是点云自己
+    # 的包围盒, 跟这里的 map2d_x_min 等是两套边界, 不要混用。
     map2d_raw_bounds = raw_map2d_xy_bounds(map2d_dir)
     if map2d_raw_bounds is not None:
         map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max = map2d_raw_bounds
@@ -646,6 +686,9 @@ def main():
         if trajectory is None:
             print(f"      {in_path.parent} 下没有 keyframe_info_3d.txt(或 keyframe_pos_3d.pcd), "
                   f"没法从点云生成占据栅格图, 跳过——沿用已有文件(如果有)")
+            if bootstrap_map2d_from_slam(map2d_dir, pgm_path, yaml_path):
+                print(f"      {pgm_path} 还没生成过, 从 {map2d_dir / 'map_2d.pgm'} "
+                      f"(handbot slam 原图, 只读拷贝)启动一份沿用")
         else:
             # 占据栅格图默认 free, 只有 detect_structure 查出"纵向有实体撑着"
             # (墙/柱子)的格子才是 occupied, 不产生 unknown 状态(见
@@ -707,7 +750,6 @@ def main():
                 grid, trajectory, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max),
                 map2d_resolution, radius=args.map2d_known_radius,
             )
-            map2d_dir.mkdir(parents=True, exist_ok=True)
             write_map_server_grid(grid, pgm_path, yaml_path, map2d_resolution, map2d_x_min, map2d_y_min)
             n_free, n_occ, n_unk = int((grid == 254).sum()), int((grid == 0).sum()), int((grid == 205).sum())
             print(f"      生成 {pgm_path}: {grid.shape[1]}x{grid.shape[0]}px, {map2d_resolution}m/px, "
@@ -724,6 +766,9 @@ def main():
                 display_grid[block_unscanned_only & (grid == 0)] = 205
     else:
         print("      --no-gen-2d-map, 跳过生成, 沿用已有文件(如果有)")
+        if bootstrap_map2d_from_slam(map2d_dir, pgm_path, yaml_path):
+            print(f"      {pgm_path} 还没生成过, 从 {map2d_dir / 'map_2d.pgm'} "
+                  f"(handbot slam 原图, 只读拷贝)启动一份沿用")
 
     # 不是每份地图都有 2D 栅格图(比如只导了点云、生成也失败/关掉了的旧地图),
     # 没有就跳过, topview_meta.json 里不写 topview2d 字段, 前端得处理"没有"这种

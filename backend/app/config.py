@@ -164,7 +164,12 @@ ROS_NODE_NAME = os.environ.get("NAVIBOT_ROS_NODE_NAME", "navibot_backend")
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _REPO_ROOT = REPO_ROOT
 
-# 每个地图是 web_assets/map/<name>/ 下的一份预处理产物 (topview.png / pointcloud.bin 等)
+# 每个地图是 web_assets/map/<name>/ 下的一份预处理产物 (topview.png / pointcloud.bin 等)。
+# 同一个目录下还有 map_2d.pgm/.yaml——map_pipeline/generate_map_assets.py 重新
+# 生成的 2D 占据栅格图, global_planner.py 规划路径读的就是这一份 (直接落在
+# <name>/ 下, 不带 2d_map/ 这层子目录, 跟下面 MAP_DATA_DIR 里那份区分开)。
+# 不落在 MAP_DATA_DIR 下的原因见那边的注释——这份是预处理产物, 会反复重新生成,
+# 不是"原始地图数据"。
 MAP_ASSETS_DIR = os.environ.get("NAVIBOT_MAP_ASSETS_DIR", os.path.join(_REPO_ROOT, "web_assets", "map"))
 
 # 地图数据根目录: 地图列表不落 SQLite, 直接扫这个目录——每个直接子目录是一张
@@ -174,12 +179,19 @@ MAP_ASSETS_DIR = os.environ.get("NAVIBOT_MAP_ASSETS_DIR", os.path.join(_REPO_ROO
 #   <map-data-dir>/<name>/3d_map/keyframe_info_3d.txt
 #   <map-data-dir>/<name>/2d_map/map_2d.pgm
 #   <map-data-dir>/<name>/2d_map/map_2d.yaml
+# 这里的 2d_map/map_2d.pgm(+.yaml) 是 handbot slam 自带的原始占据栅格图,
+# localization.service 等第三方组件直接认这个固定路径——只用来判定地图目录结构
+# 完整/给 generate_map_assets.py 当只读的沿用来源, navibot 自己不会写它 (早期
+# 版本在这里原地覆盖过, 导致预处理一跑第三方定位服务实际用的地图内容也跟着变了,
+# 现在重新生成的版本改落到上面的 MAP_ASSETS_DIR 下, 见 global_planner.py)。
 MAP_DATA_DIR = os.environ.get("NAVIBOT_MAP_DATA_DIR", "/home/lisi/Documents/map-data")
 
 MAP_3D_SUBDIR = "3d_map"
 MAP_3D_PCD_FILENAME = "dense_cloud_map.pcd"
 MAP_3D_KEYFRAME_FILENAME = "keyframe_info_3d.txt"
 MAP_2D_SUBDIR = "2d_map"
+# 文件名在 MAP_DATA_DIR(/2d_map/ 子目录下)和 MAP_ASSETS_DIR(直接在 <name>/ 下)
+# 两处共用同一对常量——两边只是所在目录不同, 文件名保持一致方便对照。
 MAP_2D_PGM_FILENAME = "map_2d.pgm"
 MAP_2D_YAML_FILENAME = "map_2d.yaml"
 

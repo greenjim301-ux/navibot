@@ -42,12 +42,16 @@ map-data-dir/<name>/                 地图数据根目录 (默认 /home/lisi/Do
 <map-data-dir>/<name>/3d_map/dense_cloud_map.pcd    HandBot-S1 建的稠密点云
 <map-data-dir>/<name>/3d_map/keyframe_info_3d.txt   建图轨迹 —— 后端运行时直接查它算导航点 z (见下文), 不
                                                      经过预处理, 缺了它这份地图不满足目录结构, 不会出现在列表里
-<map-data-dir>/<name>/2d_map/map_2d.pgm(+.yaml)     2D 占据栅格图, "设置路线"页面点选导航点用
+<map-data-dir>/<name>/2d_map/map_2d.pgm(+.yaml)     handbot slam 自带的原始 2D 占据栅格图。只用来判定目录
+                                                     结构完整、给下面流水线当只读的沿用来源——localization.service
+                                                     等第三方组件直接认这个固定路径, 流水线绝不写回它
         │
-        │  map_pipeline/generate_map_assets.py
+        │  map_pipeline/generate_map_assets.py (只读 2d_map/map_2d.pgm, 不修改)
         ▼
 web_assets/map/<name>/
-    topview.png             2D 占据栅格图转成的展示用 PNG
+    map_2d.pgm(+.yaml)      流水线重新生成的 2D 占据栅格图, 全局规划 (global_planner.py)
+                            实际读的是这一份, 不是 map-data-dir 下那份原始图
+    topview.png             上面这份 2D 占据栅格图转成的展示用 PNG
     pointcloud.bin          降采样点云 (自定义 PCW1 格式), 供前端 3D 预览
     pointcloud_meta.json    点数/降采样体素/分片清单等
     topview_meta.json       坐标元数据(世界边界 + 2D 栅格图的分辨率/像素尺寸);
