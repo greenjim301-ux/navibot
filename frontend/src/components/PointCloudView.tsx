@@ -142,6 +142,10 @@ function parsePCW1(buf: ArrayBuffer) {
   return { count, positions, colors };
 }
 
+// 点选落空时的兜底平面: 固定 z=0, 全程只读, 不跟着任何东西变(见 pickXYZ 里的
+// 说明)。放在模块级就是为了让"不可变"是结构上保证的, 不依赖谁记得别去写它。
+const GROUND_FALLBACK_PLANE = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
 // 途经点编号标记: three.js 没有现成的"画文字"图元, 把数字画到一张离屏 canvas
 // 上当贴图, 做成 Sprite(始终朝向摄像机, 不用像 Mesh 文字那样操心朝向)。途经点
 // 数量很小(几个到几十个, 不是点云那种量级), 每次 waypoints 变化都整组重建
@@ -742,28 +746,38 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
         return d < bestD ? h : best;
       }, undefined);
     }
-    // 点云有空洞(没扫到/被遮挡的地方、瓦片还没加载到高精度层级)时, 光标下可能
-    // 一个点都碰不到, 点选就完全没反应。兜底跟一个水平面求交, 用交点的 x/y——
-    // 倾斜视角下, 这个平面假设的高度跟光标视觉上瞄准的真实表面高度差多少, 会
-    // 被视差近乎放大成多少倍的 x/y 偏差(掠射角越明显放大倍数越大), 所以这个
-    // 高度得取"光标附近"的地面, 不能是整张图统一的一个数——以前直接用
-    // world_bounds.z_min(全图最低点), 在大地图/有高差的地图上跟光标附近的
-    // 真实地面能差出一截, 一偏斜着看就会出现"点哪偏出去老远"。现在改成动态
-    // 跟踪"最近一次真的命中点云"时的那个点的高度, 没命中过(这次交互刚开始,
-    // 一次都没蹭到点)才退回 world_bounds.z_min 起个头——命中点云的机会远多于
-    // 落空的机会(空洞通常只是小范围), 这个高度绝大多数时候就是光标附近最新的
-    // 真实地面, 比固定用全图最低点准得多。z 本身无所谓准不准, 摆点/画路线/
+    // 点云有空洞时(雷达经常扫不到脚下的地面, 这是常态不是例外), 光标下可能一个
+    // 点都碰不到, 这时兜底跟一个水平面求交, 用交点的 x/y。
+    //
+    // 平面固定取 z=0, 理由是**途经点下发的高度本来就在这个面上**: route_manager
+    // 下发的 z 是 ground_elevation + Δ, 而 ground_elevation 返回的是建图轨迹的 z
+    // (见 backend/app/path_planner.py), 实测 save_map_bedroom / house 两张平地图
+    // 的轨迹 z 中位数分别是 0.004 / 0.001 —— z=0 就是 SLAM 原点, 也就是建图起点
+    // 处的机体高度。所以拿 z=0 求交得到的正是这个途经点最终会在的位置, 标记也就
+    // 正好落在光标底下。它比地面高出一个机体高度(卧室图实测地面约 -0.25), 但
+    // 途经点本来就不是地面上的点, 是机体位置, 那个差值不是误差。
+    //
+    // 这里**不能**跟着"最近一次命中点云的那个点的高度"走(曾经这么做过): 倾斜
+    // 视角下平面高度差多少, 会被视差放大成多少倍的 x/y 偏差(掠射角越小放大越
+    // 狠, maxPolarAngle 允许到离地平线 2.9°, 放大约 20 倍), 而"上次命中"和"这次
+    // 落点"之间没有任何空间关系 —— 上次可能点在墙上、桌上、另一层楼上, hit 也
+    // 不保证是地面; 这个状态还跨整个组件生命周期持久、被下面三个入口共用(用
+    // "点选旋转中心"对准一面墙就会污染后面摆点用的高度)。结果是同一个光标位置
+    // 因点击历史给出不同答案, 表现就是"有时候点了漂出去老远"。固定 z=0 是无状态
+    // 的, 同一个光标位置永远给同一个答案。
+    //
+    // 已知边界: 多层图上 z=0 只在靠近 0 的那层是对的 —— save_map_stairs 的轨迹
+    // 上层在 +1.32, save_map 跨 -8.10 ~ +3.75, 在别的层上落空会偏一个层高。但仍
+    // 然是确定的、可预期的。
+    //
+    // 命中点云时 z 直接用命中点的; 无论哪条路径 z 都无所谓准不准, 摆点/画路线/
     // 居中之后各自还会按 x/y 查真实地面高度(见 useGroundZ)。
-    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -meta.world_bounds.z_min);
     function pickXYZ(pickable: THREE.Points[]): { x: number; y: number; z: number } | undefined {
       const hits = raycaster.intersectObjects(pickable, false);
       const hit = nearestToRayHit(hits);
-      if (hit) {
-        groundPlane.constant = -hit.point.z;
-        return { x: hit.point.x, y: hit.point.y, z: hit.point.z };
-      }
+      if (hit) return { x: hit.point.x, y: hit.point.y, z: hit.point.z };
       const fallback = new THREE.Vector3();
-      return raycaster.ray.intersectPlane(groundPlane, fallback)
+      return raycaster.ray.intersectPlane(GROUND_FALLBACK_PLANE, fallback)
         ? { x: fallback.x, y: fallback.y, z: fallback.z } : undefined;
     }
     let pointerDownPos: { x: number; y: number; button: number } | null = null;
