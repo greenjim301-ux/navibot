@@ -17,8 +17,11 @@ mapdata/
 web_assets/
 
 # --- 运行时状态 ---
-# 根目录下的运行时数据(比如已删除的旧版地图 SQLite 落盘文件残留)。锚定成
-# /data/ 而不是 data/, 不然会连 frontend/src/data/ 这种源码目录也一起忽略掉。
+# 根目录下的运行时数据: 现在主要是 data/routes/ 下的巡检路线 (一条一个 json,
+# 见 backend/app/route_store.py)。这些是用户自己创作的数据, 不是能从源头重新
+# 生成的派生产物 —— 不进版本库不等于可以随便删, 换机器/重装要自己带走。
+# 锚定成 /data/ 而不是 data/, 不然会连 frontend/src/data/ 这种源码目录也一起
+# 忽略掉。
 /data/
 
 *.log

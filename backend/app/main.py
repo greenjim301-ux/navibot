@@ -13,21 +13,24 @@ from . import config
 from .map_registry import MapRegistry
 from .mapping_manager import MappingManager
 from .models import (
+    CreateRouteRequest,
     GroundZRequest, GroundZResponse,
     MapInfo, NavStatus,
     InflationMapRequest,
     MappingModeInfo, MappingStatus,
     PlanPathRequest, PlanPathResponse, PlanPathPoint,
-    RouteRequest,
+    RouteRecord, RouteRequest,
     SelfInflationRequest,
     ServiceInfo,
     StartMappingRequest,
     SurfCloudRequest,
+    UpdateRouteRequest,
 )
 from . import global_planner
 from . import path_planner
 from .ros_bridge import RosBridge
 from .route_manager import RouteManager
+from .route_store import RouteStore, validate_route_id
 from .service_manager import ServiceDependencyError, ServiceManager
 from .ws_manager import WebSocketManager
 
@@ -83,6 +86,7 @@ route_manager: Optional[RouteManager] = None
 mapping_manager: Optional[MappingManager] = None
 ros_bridge: Optional[RosBridge] = None
 map_registry = MapRegistry()
+route_store = RouteStore(map_registry)
 service_manager = ServiceManager()
 
 
@@ -342,6 +346,73 @@ async def delete_map(name: str):
         await run_in_threadpool(map_registry.delete_map, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+# ---- 巡检路线 (route_store.py) ----
+# 注意跟上面的 /api/route (单数) 区分: 那个是"把一串途经点立刻下发给机器狗"
+# (navi_mode=2, route_manager.py), 不落盘、不带名字; 这里的 /api/routes (复数)
+# 是存起来的巡检路线的增删改查, 不碰 ROS。两者现在完全没有连接 —— 把存好的路线
+# 下发执行是后续单独的活, 见 route_store.py 模块 docstring。
+
+
+@app.get("/api/routes", response_model=List[RouteRecord])
+async def list_routes():
+    """按更新时间倒序返回全部路线, **带完整的 points**——一条路线撑死几十个点,
+    列表页本来也要显示点数, 再单独做一个"摘要"模型不值得。"""
+    return await run_in_threadpool(route_store.list_routes)
+
+
+@app.post("/api/routes", response_model=RouteRecord, status_code=201)
+async def create_route(req: CreateRouteRequest):
+    """新建一条空路线(没有导航点), 点在编辑页对着 2D 栅格图摆。关联地图必须
+    已预处理完成且有 2D 栅格图, 否则 400 —— 见 route_store.create_route。"""
+    try:
+        return await run_in_threadpool(
+            route_store.create_route, req.name, req.map_name, req.mode, req.note,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/routes/{route_id}", response_model=RouteRecord)
+async def get_route(route_id: str):
+    try:
+        validate_route_id(route_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    record = await run_in_threadpool(route_store.get_route, route_id)
+    if record is None:
+        raise HTTPException(404, f"路线 '{route_id}' 不存在")
+    return record
+
+
+@app.put("/api/routes/{route_id}", response_model=RouteRecord)
+async def update_route(route_id: str, req: UpdateRouteRequest):
+    """整条替换(不做字段级 patch, 见 UpdateRouteRequest)。改不了关联地图——
+    points 是那张图坐标系下的世界坐标, 换图会让所有点静默指错位置。"""
+    try:
+        validate_route_id(route_id)
+        return await run_in_threadpool(
+            route_store.update_route,
+            route_id, req.name, req.mode, req.note, req.points, req.schedule,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/routes/{route_id}", status_code=204)
+async def delete_route(route_id: str):
+    try:
+        validate_route_id(route_id)
+        await run_in_threadpool(route_store.delete_route, route_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/services", response_model=List[ServiceInfo])

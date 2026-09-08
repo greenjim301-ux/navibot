@@ -237,6 +237,22 @@ PIPELINE_SCRIPT = os.environ.get(
     "NAVIBOT_PIPELINE_SCRIPT", os.path.join(_REPO_ROOT, "map_pipeline", "generate_map_assets.py"),
 )
 
+# 巡检路线存储目录: 一条路线一个 <route_id>.json (见 route_store.py), 跟地图列表
+# 一样不落 SQLite——路线数据量很小(几十个点), 平铺的 json 直接可读可备份可 diff,
+# 出问题时不用起数据库客户端就能看。
+#
+# 单独一个目录, 既不放 MAP_ASSETS_DIR(那是预处理产物, 会被反复重新生成/整个删掉,
+# 见上面的说明), 也不放 MAP_DATA_DIR(那是外部建图产物目录, navibot 不往里写)——
+# 路线是用户自己创作的数据, 丢了没法从别处重新生成出来。
+ROUTE_DATA_DIR = os.environ.get("NAVIBOT_ROUTE_DATA_DIR", os.path.join(_REPO_ROOT, "data", "routes"))
+
+# 一条路线最多多少个导航点。挡的是"前端出 bug 循环加点"/手工构造的超大请求这类
+# 情况, 不是产品意义上的上限——真实巡检路线几十个点撑死了。
+ROUTE_MAX_POINTS = int(os.environ.get("NAVIBOT_ROUTE_MAX_POINTS", "500"))
+# 路线名/备注/导航点名的长度上限, 同样只是防滥用的护栏。
+ROUTE_MAX_NAME_LEN = 100
+ROUTE_MAX_NOTE_LEN = 2000
+
 CORS_ALLOW_ORIGINS = os.environ.get("NAVIBOT_CORS_ALLOW_ORIGINS", "*").split(",")
 
 # 单独起个常量: map_registry.py 激活地图前要检查这个服务是否在跑(见

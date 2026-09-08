@@ -216,6 +216,54 @@ export interface MappingStatus {
   updated_at: number;
 }
 
+/** 巡检路线上的一个导航点, 见 backend/app/models.py 的 RoutePoint。
+ *
+ *  **故意继承 Waypoint**: TopView 的 waypoints/onChangeWaypoints 收发的是
+ *  Waypoint[], 直接把 RoutePoint[] 传进去, 它做的两种编辑(末尾追加 / filter
+ *  删一个)都会**原样保留没动过的那些对象引用**, 于是 name/action/stay 这些
+ *  TopView 不认识的字段自动跟着一起回来, 不需要在外面按下标去 diff 对齐
+ *  (坐标完全相同的重复点——"绕一圈回到起点"——按下标 diff 是对不准的)。
+ *  回调里只有新加的那个是不带 id 的裸 Waypoint, 认 id 就能区分出来。 */
+export interface RoutePoint extends Waypoint {
+  /** 前端列表的稳定 key。后端只保证同一条路线里不重复, 不解释内容
+   *  (见 backend/app/route_store.py 的 _normalize_points)。 */
+  id: string;
+  name: string;
+  /** 到达后做什么。**后端不解释这个值**, 执行链路还没做, 现在纯粹是存着的
+   *  标注 —— 候选项在 data/routeOptions.ts, 是前端自己的列表。 */
+  action: string;
+  /** 到达后停留秒数, 同样只是存着, 现在没有代码会读它。 */
+  stay: number;
+}
+
+/** 路线的定时执行计划。**整块都只是存下来的用户配置, 现在没有调度器会读它**
+ *  (见 backend/app/route_store.py 模块 docstring) —— 所以不要拿它算"下次执行
+ *  时间"之类的东西展示给用户, 那是凭空编造。 */
+export interface RouteSchedule {
+  enabled: boolean;
+  cycle: string;
+  times: string[];
+  days: string[];
+  effective_date: string;
+  miss_policy: string;
+}
+
+/** 一条巡检路线, 见 backend/app/models.py 的 RouteRecord。 */
+export interface RouteRecord {
+  id: string;
+  name: string;
+  /** 关联地图名。**创建后不可修改** —— points 存的是这张图坐标系下的世界坐标,
+   *  换图会让所有点静默指到错的位置, 所以换图只能新建路线。 */
+  map_name: string;
+  /** 巡检方式。跟 RoutePoint.action 一样, 后端不解释。 */
+  mode: string;
+  note: string;
+  points: RoutePoint[];
+  schedule: RouteSchedule;
+  created_at: number;
+  updated_at: number;
+}
+
 /** 建图页机器狗当前位置, 来自 /tf(见 backend/app/config.py 的
  *  MAPPING_TF_MAP_FRAME/MAPPING_TF_BODY_FRAME), 没有 cov 字段——建图模式下
  *  没有 EKF 融合出来的定位质量标量, 见 backend/app/ros_bridge.py 的

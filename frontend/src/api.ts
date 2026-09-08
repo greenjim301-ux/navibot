@@ -1,5 +1,6 @@
 import type {
-  MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint, ServiceInfo, Waypoint, XY,
+  MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint,
+  RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, Waypoint, XY,
 } from "./types";
 
 export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "http://localhost:8000";
@@ -151,6 +152,58 @@ export async function planPath(
   });
   const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
   return { points: data.points, published: data.published, publishError: data.publish_error };
+}
+
+// ---- 巡检路线 (存储型 CRUD, 见 backend/app/route_store.py) ----
+// 注意跟上面的 submitRoute (/api/route, 单数) 区分: 那个是"把一串途经点立刻
+// 下发给机器狗", 不落盘; 下面这组 (/api/routes, 复数) 是存起来的巡检路线的
+// 增删改查, 不碰 ROS。**两者现在没有连接** —— 把存好的路线下发执行是后续
+// 单独的活。
+
+/** 全部路线, 后端按更新时间倒序返回, 带完整的 points。 */
+export async function listRoutes(): Promise<RouteRecord[]> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/routes`));
+}
+
+export async function getRoute(id: string): Promise<RouteRecord> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/routes/${encodeURIComponent(id)}`));
+}
+
+/** 新建一条**空**路线(没有导航点), 点在编辑页对着 2D 栅格图摆。关联地图必须
+ *  已预处理完成且有 2D 栅格图, 否则后端 400。 */
+export async function createRoute(
+  name: string, mapName: string, mode: string, note: string,
+): Promise<RouteRecord> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/routes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, map_name: mapName, mode, note }),
+    }),
+  );
+}
+
+/** 整条替换(PUT 语义, 不是字段级 patch)。**改不了 map_name** ——
+ *  points 是那张图坐标系下的世界坐标, 换图会让所有点指错位置。 */
+export async function updateRoute(
+  id: string,
+  patch: { name: string; mode: string; note: string; points: RoutePoint[]; schedule: RouteSchedule },
+): Promise<RouteRecord> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/routes/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+  );
+}
+
+export async function deleteRoute(id: string): Promise<void> {
+  const res = await fetch(`${BACKEND_HTTP}/api/routes/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`${res.status} ${body}`);
+  }
 }
 
 /** 系统管理页「服务状态」卡片: lidar/相机/导航定位/路线规划这几个固定的

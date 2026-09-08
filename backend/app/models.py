@@ -213,3 +213,73 @@ class MappingStatus(BaseModel):
 class StartMappingRequest(BaseModel):
     mode_id: str
     map_name: str
+
+
+class RoutePoint(Waypoint):
+    """巡检路线上的一个导航点。
+
+    继承 Waypoint(x/y/yaw/z_offset), 所以一条存好的路线可以直接喂给
+    /api/route 下发 —— 下面这几个字段是"路线编辑器需要、下发链路不需要"的
+    附加信息, 后端只负责原样存取, **不解释它们的含义**:
+
+    - id: 前端列表的稳定 key / 选中态用。后端不生成也不校验语义, 只保证同一
+      条路线里不重复(见 route_store._normalize_points)。
+    - name / action / stay: 给人看的标注和"到达后做什么"。执行链路还没做
+      (见 route_store.py 模块 docstring), 所以 action 是自由文本, 后端不维护
+      合法值列表 —— 真做执行时这里必须换成一个后端认识的枚举, 不能沿用现在
+      这份前端写死的中文选项。
+    """
+    id: str = ""
+    name: str = ""
+    action: str = ""
+    stay: int = 0
+    """到达后停留秒数。同样只是存着, 现在没有任何代码会读它。"""
+
+
+class RouteSchedule(BaseModel):
+    """路线的定时执行计划。整块都只是存下来的用户配置, **现在没有调度器会读它**
+    (见 route_store.py 模块 docstring) —— 前端不能拿它算"下次执行时间"之类的
+    展示, 那是凭空编造。"""
+    enabled: bool = False
+    cycle: str = "每天"
+    times: List[str] = []
+    days: List[str] = []
+    effective_date: str = ""
+    miss_policy: str = ""
+
+
+class RouteRecord(BaseModel):
+    """一条巡检路线, 对应 config.ROUTE_DATA_DIR 下的一个 <id>.json。"""
+    id: str
+    name: str
+    map_name: str
+    """关联地图名。**创建后不可修改** —— points 里存的是这张图坐标系下的世界
+    坐标, 换一张图会让所有点静默地指到错误的位置, 所以换图只能新建路线
+    (见 route_store.update_route)。"""
+    mode: str = ""
+    """巡检方式。跟 RoutePoint.action 一样是自由文本, 后端不解释。"""
+    note: str = ""
+    points: List[RoutePoint] = []
+    schedule: RouteSchedule = Field(default_factory=RouteSchedule)
+    created_at: float
+    updated_at: float
+
+
+class CreateRouteRequest(BaseModel):
+    name: str
+    map_name: str
+    mode: str = ""
+    note: str = ""
+
+
+class UpdateRouteRequest(BaseModel):
+    """整条替换(PUT 语义), 不做字段级 patch —— 编辑页本来就持有完整的一份,
+    整体提交比逐字段合并少一整类"两个标签页同时编辑, 结果互相覆盖出一个
+    谁都没写过的组合"的问题。
+
+    没有 map_name: 关联地图创建后不可改, 见 RouteRecord.map_name。"""
+    name: str
+    mode: str = ""
+    note: str = ""
+    points: List[RoutePoint] = []
+    schedule: RouteSchedule = Field(default_factory=RouteSchedule)
