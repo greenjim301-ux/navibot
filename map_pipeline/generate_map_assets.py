@@ -586,23 +586,26 @@ def main():
     ap.add_argument("--map2d-resolution", type=float, default=None,
                      help="生成占据栅格图的格子大小 (m/格), 同时也是 detect_structure 的"
                           "格子大小。不传则按地图跨度自动选(见 MAP2D_RESOLUTION_BY_EXTENT_M)")
-    ap.add_argument("--map2d-structure-margin-lo", type=float, default=1.0,
-                     help="detect_structure 的 z 窗口下界 = 轨迹高度 1% 分位数 - 这个值(m)")
-    ap.add_argument("--map2d-structure-margin-hi", type=float, default=1.0,
-                     help="detect_structure 的 z 窗口上界 = 轨迹高度 99% 分位数 + 这个值(m)")
+    ap.add_argument("--map2d-body-clearance", type=float, default=0.10,
+                     help="机器狗的离地余量(m): 低于'局部地面 + 这个值'的点不算障碍"
+                          "(地面回波、它能迈过去的小坎)。detect_structure 的判据就是"
+                          "'机体区间里有没有点', 见那个函数的说明")
+    ap.add_argument("--map2d-body-height", type=float, default=0.55,
+                     help="机器狗的机体高度(m): 高于'局部地面 + 这个值'的点不算障碍"
+                          "(桌面、挂墙置物架、天花板横梁, 狗从下面走得过去)。0.55 是"
+                          "实测的传感器离地高度, 调大会更保守——实测放到 0.80 时 house "
+                          "的召回 60.7%→66.9%, 但走廊误报 8.61%→15.82%")
     ap.add_argument("--map2d-structure-min-support-frac", type=float, default=0.4,
                      help="detect_structure 判'这一层有支撑'的点数阈值, 不是写死的绝对数"
                           "——从这张图 z 窗口内非空(格子,切层)组合的点数中位数(这张图的"
                           "'典型密度')乘这个比例现算, 不同地图密度差一个数量级也不用"
                           "重新调这个参数")
-    ap.add_argument("--map2d-structure-min-span-bins", type=int, default=5,
-                     help="detect_structure 判'这格有纵向实体撑着'(墙/柱子, 而不是孤立悬空"
-                          "杂物)所需的最少支撑层数, 乘以 z_bin(0.1m)就是要求的最小纵向跨度")
-    ap.add_argument("--map2d-structure-ground-clearance", type=float, default=0.6,
-                     help="detect_structure 判定'贴地障碍 vs 悬空、狗能钻过去'的净空阈值"
-                          "(m): 候选 occupied 格子最低支撑层的高度减去它最近的建图轨迹点"
-                          "高度, 超过这个值就改判回不占据。0.6m 是凭经验估的机器狗净空"
-                          "高度, 没有拿真机验证过, 偏保守/偏激进都可能要调")
+    ap.add_argument("--map2d-sensor-height", type=float, default=None,
+                     help="传感器离地高度(m), 用来把'最近轨迹点高度'换算成'局部地面'。"
+                          "不传则每张图各自用 elevation.build_elevation 从数据里量"
+                          "(推荐)——**这个值不是机器人常数**: 实测室内三张图一致"
+                          "(0.549/0.540/0.551), 但室外的 large 是 0.374, 多半是草地回波"
+                          "抬高了'地面'; 在 large 上错用 0.55 会让召回掉 4 个点")
     ap.add_argument("--map2d-trajectory-clear-radius", type=float, default=0.25,
                      help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
                           "误判——默认 0.25 跟 backend/app/config.py 的"
@@ -704,19 +707,30 @@ def main():
             # 高度区间, 再各自加一段边距——这样窗口会跟着轨迹真实的高低起伏自动
             # 收缩/放大(比如 large 这份图轨迹本身有 0.75m 高差, 固定边距不会跟
             # 着变), 天花板/屋顶横梁这类远高于正常层高的东西天然被排除在外。
-            traj_z_lo = float(np.percentile(trajectory[:, 2], 1))
-            traj_z_hi = float(np.percentile(trajectory[:, 2], 99))
+            # 传感器离地高度: 没显式指定就每张图各自量一次(见 estimate_sensor_height
+            # 的说明——这个值不是机器人常数, 室外那张实测比室内小 0.17m)。
+            sensor_height = args.map2d_sensor_height
+            if sensor_height is None:
+                try:
+                    sensor_height = elevation.estimate_sensor_height(raw_points, trajectory)
+                    print(f"      传感器离地高度: 从这张图量出 {sensor_height:.3f}m")
+                except RuntimeError as e:
+                    # 量不出来(轨迹脚下一个地面点都没有)不该让整张图的预处理失败,
+                    # 退回一个实测的室内典型值并说清楚, 结果会偏但仍然可用。
+                    sensor_height = 0.55
+                    print(f"      传感器离地高度量不出来({e}), 退回默认 {sensor_height}m "
+                          f"—— 这张图的障碍判定可能整体偏高或偏低")
             structure, min_support = elevation.detect_structure(
                 raw_points, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max), map2d_resolution,
-                z_lo=traj_z_lo - args.map2d_structure_margin_lo,
-                z_hi=traj_z_hi + args.map2d_structure_margin_hi,
                 z_bin=0.1,
                 min_support_frac=args.map2d_structure_min_support_frac,
-                min_span_bins=args.map2d_structure_min_span_bins,
                 trajectory=trajectory,
-                ground_clearance_m=args.map2d_structure_ground_clearance,
+                delta_sensor_m=sensor_height,
+                body_lo_m=args.map2d_body_clearance,
+                body_hi_m=args.map2d_body_height,
             )
-            print(f"      detect_structure: 从点云密度现算出 min_support={min_support}")
+            print(f"      detect_structure: 机体区间 [{args.map2d_body_clearance:.2f},"
+                  f"{args.map2d_body_height:.2f})m, 从点云密度现算出 min_support={min_support}")
             grid = elevation.classify_occupancy(structure)
             block_unscanned_only = None
             if args.block_unscanned:

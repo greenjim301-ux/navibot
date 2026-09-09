@@ -473,29 +473,98 @@ def build_elevation(
     )
 
 
+def estimate_sensor_height(
+    points: np.ndarray,
+    trajectory: np.ndarray,
+    resolution: float = 0.20,
+    lo_m: float = 0.25,
+    hi_m: float = 1.00,
+    min_points: int = 5,
+) -> float:
+    """传感器离地高度: median(轨迹点高度 − 它脚下的地面高度)。
+
+    detect_structure 要拿它把"最近轨迹点高度"换算成"局部地面"。**必须逐图量**:
+    实测室内三张图一致(0.549/0.540/0.551), 但室外的 large 是 0.374(IQR 0.157),
+    多半是草地/植被的回波抬高了"地面"。
+
+    build_elevation 内部第一步算的就是这个量(它的 delta_sensor_m), 但为了一个
+    标量跑它整套区域生长/楼梯检测太贵——实测 large 上它一个人就多吃 8GB 内存
+    (1.1GB → 9.1GB)、多花 35 秒, 而这条管线在大图上本来就被 OOM killer 杀过。
+    这里只做它那一步: 每个轨迹点脚下 [zt−hi_m, zt−lo_m) 这段高度里的点取中位数
+    当地面。窗口下界挡掉地面以下的噪点/反射, 上界挡掉狗自己的身子。
+
+    实现上按 2D 格子分桶 + 排序 + searchsorted 取每个轨迹格的点, 不开任何三维
+    数组, 内存只跟点数线性相关。
+
+    量不出来(轨迹脚下一个格子都攒不够 min_points)时抛 RuntimeError, 由调用方
+    决定退回什么默认值——静默返回一个猜的数会让整张图的障碍判定系统性偏移。
+    """
+    if len(trajectory) == 0 or len(points) == 0:
+        raise RuntimeError("没有轨迹或点云, 量不出传感器离地高度")
+    x_min, y_min = points[:, 0].min(), points[:, 1].min()
+    pc = ((points[:, 0] - x_min) / resolution).astype(np.int64)
+    pr = ((points[:, 1] - y_min) / resolution).astype(np.int64)
+    ncol = int(pc.max()) + 1
+    key = pr * ncol + pc
+    order = np.argsort(key, kind="stable")
+    key_s, z_s = key[order], points[order, 2]
+
+    tc = ((trajectory[:, 0] - x_min) / resolution).astype(np.int64)
+    tr = ((trajectory[:, 1] - y_min) / resolution).astype(np.int64)
+    tkey = tr * ncol + tc
+    lo_idx = np.searchsorted(key_s, tkey, "left")
+    hi_idx = np.searchsorted(key_s, tkey, "right")
+
+    deltas = []
+    for zt, a, b in zip(trajectory[:, 2], lo_idx, hi_idx):
+        if b - a < min_points:
+            continue
+        zs = z_s[a:b]
+        band = zs[(zs >= zt - hi_m) & (zs < zt - lo_m)]
+        if len(band) >= min_points:
+            deltas.append(zt - float(np.median(band)))
+    if not deltas:
+        raise RuntimeError("轨迹脚下找不到任何地面, 量不出传感器离地高度")
+    return float(np.median(deltas))
+
+
 def detect_structure(
     points: np.ndarray,
     bounds: tuple[float, float, float, float],
     resolution: float,
-    z_lo: float,
-    z_hi: float,
     z_bin: float,
     min_support_frac: float,
-    min_span_bins: int,
     trajectory: np.ndarray,
-    ground_clearance_m: float,
+    delta_sensor_m: float,
+    body_lo_m: float,
+    body_hi_m: float,
     min_support_floor: int = 2,
 ) -> tuple[np.ndarray, int]:
-    """跟地面高度完全无关地识别"纵向有实体撑着"的格子(墙/柱子/大件家具...),
-    产出全局规划器用的 occupied 掩膜。
+    """判"这格挡不挡狗的身子", 产出全局规划器用的 occupied 掩膜。
 
-    之前试过判障碍靠"这格离地面 [obstacle_lo, obstacle_hi] 这段有没有点", 依赖
-    "这格有没有地面参考", 离轨迹稍远(墙、柱子这类地方轨迹本来就不会贴过去)就
-    没有地面参考, 墙反而判不出来。这里换成完全不依赖地面参考的判据: 按 z_bin
-    切层统计 [z_lo, z_hi] 范围内的点数, 要求至少 min_span_bins 个不同切层各自都
-    "有支撑"才算"有实体"——贯穿地板到天花板的墙到处都有支撑, 能轻松过关; 只
-    集中在一两层的孤立悬空杂物(远处扫到的碎片、反光噪点)过不了这一关, 天然
-    被滤掉, 不需要额外猜一个"多高算太高"的阈值。
+    判据只有一句话: **这一格在 [局部地面 + body_lo_m, 局部地面 + body_hi_m)
+    这段高度里有没有点**。这就是机器狗身子实际会扫过的那层体积——低于
+    body_lo_m 的是地面回波和它能迈过去的小坎, 高于 body_hi_m 的是桌面、
+    挂墙置物架、天花板横梁这类它能从下面走过去的东西。
+
+    这个判据的参数是**机器人的物理尺寸**, 不是需要逐图调的经验值:
+    body_lo_m 是离地余量, body_hi_m 是机体高度。实测(house/bedroom/large/
+    stairs 四张图, 见 tools/probe_detect_structure.py)同一组
+    [0.10, 0.55) 在四张图上都追平或超过逐图调过的旧判据, 而旧判据
+    (min_span_bins)在楼梯图上是崩的——最松那档 94.68% 的走廊格子被判成障碍。
+
+    "局部地面" = 这一格最近的建图轨迹点的高度 − delta_sensor_m。轨迹点是"狗
+    确实站过的地方", 处处有值; delta_sensor_m 是传感器离地高度, 由
+    build_elevation 从这张图自己的数据里量出来(它的 delta_sensor_m 字段)。
+    **必须逐图量, 不能写死**: 实测室内三张一致(0.549/0.540/0.551, IQR<0.08),
+    但室外的 large 是 0.374(IQR 0.157)——多半是草地/植被的回波抬高了"地面"。
+    在 large 上用错的 0.55 会让召回从 40.7% 掉到 36.6%。
+
+    不用 build_elevation 的**逐格**地面面当参考(只用它量一个标量): 它在实测的
+    几张图上可站立面覆盖率只有 0.3%~13.5%(house 28.9m²), 离轨迹稍远就没有值。
+    这正是这个函数的上一版放弃"按离地高度判障碍"的原因; 换成"最近轨迹点高度
+    − 标量偏移"就绕开了, 代价是地面基准在远离轨迹处有误差(house 实测地面本身
+    起伏 0.40m)。
 
     "有支撑"的点数门槛(min_support)不是写死的绝对数, 从这张图自己的点云密度
     现算: 不同地图的点云密度能差一个数量级(实测 wewe ~3000 点/m² vs big 密集
@@ -504,29 +573,27 @@ def detect_structure(
     "非空的 (格子, 切层)"组合的点数, 取 75 分位数(不用中位数, 见下方实现里的
     说明)当这张图的"典型密度", min_support = 这个值 × min_support_frac, 向下
     取整但不低于 min_support_floor(防止密度极低时阈值破产成 0/1, 随便一个
-    噪点就过关)。
+    噪点就过关)。**已知问题**: 实测 house/large/stairs 三张图上这个值都被
+    min_support_floor 夹住(现算出来 <= 2), 也就是说 min_support_frac 在多数图上
+    是失效的, 门槛实际就是"一个体素里有 2 个点"。没有跟着这次一起改, 因为它是
+    独立的一条。
 
-    [z_lo, z_hi] 建议按轨迹高度居中开一个几米宽的窗口(轨迹中位数 z 上下各
-    几米)——单层地图里真正的结构都在这个范围内, 天花板/屋顶横梁这类远高于
-    正常层高的东西天然被排除在窗口外。
-
-    上面这套判据只看"跨的层数够不够多", 不看这些支撑层挨不挨着地面——挂墙
-    置物架、招牌、栏杆扶手这类真悬空的结构, 只要垂直方向扫描点够密、跨的
-    层数够多, 一样会被判成 occupied, 即使狗其实能从下面钻过去。这里额外做
-    一次"贴地"复核: 每个候选 occupied 格子, 找它最低的那个支撑层(zbi 最小的
-    那层), 换算成世界坐标高度后, 减去这个格子最近的建图轨迹点的高度(狗站在
-    那附近时脚下的地面), 差值超过 ground_clearance_m 就认为下面净空够狗钻
-    过去, 改判回不占据。轨迹点本身就是"狗站过的地方", 拿它当地面参考比再猜
-    一个绝对地面高度更可靠(参考 backend/app/path_planner.py 用同一份轨迹数据
-    查地面高度的做法)——只对已经过关的候选格子(通常远少于全图格子数)做
-    最近邻查询, 不是对全图每格都查, 开销可控。ground_clearance_m 目前是凭
-    经验给的估计值, 没有拿真机验证过, 偏保守/偏激进都可能要调, 见调用方的
-    命令行参数说明。
+    **这个判据不解决动态物**: 建图时扫到的人, 躯干正好落在机体高度区间里, 拦不住。
+    见 tools/probe_detect_structure.py 的说明——射线投射/自由空间/时间持久性
+    那几类方法都实测排除了(家具对激光是多孔的, 射线常年从缝隙穿过, 那几类方法
+    会把家具一起铲掉)。
 
     返回 (布尔数组(形状 (height, width), True=occupied), 实际用的 min_support)
     ——后者是从这张图现算出来的, 调用方打出来看看合不合理, 不是当参数传进来的
     那个数。
     """
+    # z 扫描范围只需要覆盖"所有格子的机体区间"的并集: 轨迹最低点脚下往上
+    # body_lo_m, 到轨迹最高点脚下往上 body_hi_m。比原来"轨迹分位数 ± 固定边距"
+    # 窄得多, 切层数少, 也不再需要 margin_lo/margin_hi 这两个参数。
+    traj_z_lo = float(np.percentile(trajectory[:, 2], 1))
+    traj_z_hi = float(np.percentile(trajectory[:, 2], 99))
+    z_lo = traj_z_lo - delta_sensor_m + body_lo_m
+    z_hi = traj_z_hi - delta_sensor_m + body_hi_m
     x_min, x_max, y_min, y_max = bounds
     width = int(np.ceil((x_max - x_min) / resolution))
     height = int(np.ceil((y_max - y_min) / resolution))
@@ -578,34 +645,32 @@ def detect_structure(
     typical_density = float(np.percentile(nonzero_counts, 75))
     min_support = max(min_support_floor, int(typical_density * min_support_frac))
 
-    populated_bins = np.zeros((height, width), np.int32)
-    # 每个格子第一次(zbi 最小, 因为上面 for z in range(nz) 是从下往上遍历)被
-    # 记进 populated_bins 的那一层, 就是它最低的支撑层——留着给下面"贴地"复核
-    # 用, -1 表示这格从来没被任何一层支撑过。
-    lowest_bin = np.full((height, width), -1, np.int32)
+    # 每格的"局部地面": 最近建图轨迹点的高度 − 传感器离地高度。对全图每格都算
+    # 一次最近邻——不像上一版只对候选格子查, 因为现在每一层都要拿它来判"这层落
+    # 在这格的机体区间里没有", 是判据本身而不是事后复核。全图一次 cKDTree 查询
+    # 在实测最大的图(1735×1580)上是秒级, 可以接受。
+    cell_y, cell_x = np.mgrid[0:height, 0:width]
+    floor = np.zeros((height, width), np.float64)
+    if len(trajectory) > 0:
+        _, nearest_idx = cKDTree(trajectory[:, :2]).query(np.column_stack([
+            (x_min + (cell_x.ravel() + 0.5) * resolution),
+            (y_max - (cell_y.ravel() + 0.5) * resolution),
+        ]))
+        floor = trajectory[nearest_idx, 2].reshape(height, width) - delta_sensor_m
+
+    # 机体区间是逐格的(跟着局部地面走), 所以不能先算一张"全图统一"的高度掩膜:
+    # 对每个切层, 拿这一层的世界高度跟每格自己的区间比。切层数不多(z 范围只覆盖
+    # 机体区间的并集), 这个循环很短。
+    occupied = np.zeros((height, width), bool)
     for z, rr, cc, cnts in sparse_layers:
         supported = cnts >= min_support
+        if not supported.any():
+            continue
         sr, sc = rr[supported], cc[supported]
-        populated_bins[sr, sc] += 1
-        first_hit = lowest_bin[sr, sc] < 0
-        lowest_bin[sr[first_hit], sc[first_hit]] = z
-
-    occupied = populated_bins >= min_span_bins
-
-    # "贴地"复核(见函数 docstring): 候选格子最低支撑层的世界高度减去它最近的
-    # 建图轨迹点高度(狗当时脚下的地面), 差值超过 ground_clearance_m 就是真
-    # 悬空、狗能钻过去, 改判回不占据。只对已经过关的候选格子做最近邻查询,
-    # 不是对全图每格都查。
-    if occupied.any() and len(trajectory) > 0:
-        rr, cc = np.nonzero(occupied)
-        cell_x = x_min + (cc + 0.5) * resolution
-        cell_y = y_max - (rr + 0.5) * resolution
-        tree = cKDTree(trajectory[:, :2])
-        _, nearest_idx = tree.query(np.column_stack([cell_x, cell_y]))
-        ground_z = trajectory[nearest_idx, 2]
-        lowest_z = z_lo + lowest_bin[rr, cc] * z_bin
-        suspended = (lowest_z - ground_z) > ground_clearance_m
-        occupied[rr[suspended], cc[suspended]] = False
+        z_world = z_lo + (z + 0.5) * z_bin
+        rel = z_world - floor[sr, sc]          # 这一层相对该格局部地面的高度
+        in_band = (rel >= body_lo_m) & (rel < body_hi_m)
+        occupied[sr[in_band], sc[in_band]] = True
 
     return occupied, min_support
 

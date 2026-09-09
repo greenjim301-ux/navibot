@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -87,6 +88,29 @@ class MapProbe:
 
         self._build_voxels(pts)
         self._build_metrics()
+        self._build_body_band(pts)
+
+    def _build_body_band(self, pts: np.ndarray) -> None:
+        """现在 detect_structure 用的判据: 每格"局部地面 + 机体区间"里有没有点。
+
+        局部地面 = 最近轨迹点高度 − 传感器离地高度。后者逐图量, **不是机器人常数**
+        (实测室内 0.53~0.55, 室外 large 0.476)。
+        """
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "map_pipeline"))
+        import elevation
+        try:
+            self.sensor_height = elevation.estimate_sensor_height(pts, self.traj)
+        except RuntimeError:
+            self.sensor_height = 0.55
+        _, idx = cKDTree(self.traj[:, :2]).query(
+            np.column_stack([self.wx.ravel(), self.wy.ravel()]))
+        self.floor = self.traj[idx, 2].reshape(self.H, self.W) - self.sensor_height
+        k = np.arange(self.NZ)[None, None, :]
+        self._rel = (self.zlo + k * Z_BIN) - self.floor[:, :, None]
+
+    def body_band(self, lo: float, hi: float) -> np.ndarray:
+        """[局部地面+lo, 局部地面+hi) 这段高度里有没有支撑体素。"""
+        return (self.sup & (self._rel >= lo) & (self._rel < hi)).any(2)
 
     # ---- 体素化 + 现有判据的几个候选特征 ----
     def _flat(self, x, y, z) -> np.ndarray:
@@ -252,7 +276,10 @@ def run(name: str, do_raycast: bool) -> None:
           + ("  ← 撞下限2, min_support_frac 无效" if p.min_support_clamped else ""))
     print(f"  尺子: 走廊{int(p.corridor.sum())}格  SLAM占据{int(p.slam_occ.sum())}格")
 
-    print("\n  [现] 支撑层总数 n_layers:")
+    print(f"\n  [现用] 机体区间 (传感器离地高度实测 {p.sensor_height:.3f}m):")
+    for lo, hi in ((0.10, 0.55), (0.10, 0.80)):
+        p.show(f"局部地面 + [{lo:.2f},{hi:.2f})m", p.body_band(lo, hi))
+    print("  [旧] 支撑层总数 n_layers (全局 z 窗口, 楼梯图上会崩):")
     for k in (1, 2, 3, 5):
         p.show(f"n_layers>={k}", p.n_layers >= k)
     print("  最长连续段 maxrun (house 上更好, large 上更差, 不普适):")
