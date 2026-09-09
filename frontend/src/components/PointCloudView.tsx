@@ -6,6 +6,7 @@ import { Line2 } from "three/examples/jsm/lines/Line2.js";
 import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { mapAssetUrl } from "../api";
+import "../styles/point-cloud-gizmo.css";
 import { useGroundZ } from "../hooks/useGroundZ";
 import type {
   NavStatus, OptimalTrajPoint, PlannedRoutePoint, PointcloudMeta, SelfInflationMarker, TopviewMeta,
@@ -65,6 +66,17 @@ interface Props {
   /** 高度限制(世界系绝对 z, 米): 只渲染 z <= heightLimit 的点, 用 GPU 裁剪平面
    *  实现, 不重建几何体。不传则不裁剪。 */
   heightLimit?: number;
+  /** 地图详情显示面板的纯前端点云显示设置。 */
+  displayPointSize?: number;
+  displayColorMode?: "深度" | "强度" | "灰色";
+  displaySampleSize?: number;
+  referenceAxisVisible?: boolean;
+  referenceAxisSize?: number;
+  referenceGridVisible?: boolean;
+  referenceGridRadius?: number;
+  referenceGridRadials?: number;
+  referenceGridCircles?: number;
+  referenceGridColor?: string;
   /** "orbit"(默认): 鼠标左键拖拽自由旋转 + 右键拖拽平移。
    *  "fixed": 保留鼠标旋转(左键拖拽)和缩放(滚轮), 但关掉拖拽平移 —— 地图预览页
    *  要的是"视角不会被误拖走", 想换视角中心改用 PointCloudViewHandle.
@@ -124,6 +136,10 @@ export interface PointCloudViewHandle {
    *  (updateFollow 里 !robot 直接跳过), 外部按钮自己根据有没有位姿决定要不要
    *  disabled。 */
   toggleFollow(): void;
+  /** 右下角三轴控件切换到指定正/反轴观察视角。 */
+  setAxisView(axis: "x" | "y" | "z", sign: 1 | -1): void;
+  /** 详情面板的相机预设。 */
+  setCameraPreset(preset: "跟随" | "自由" | "俯视" | "前视"): void;
 }
 
 // 解析 map_pipeline/generate_map_assets.py 导出的 PCW1 自定义二进制格式:
@@ -203,7 +219,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, surroundCloud = null,
   liveOnly = false, enableFollow = false,
   showFollowButton = true, onFollowingChange,
-  heightLimit, controlMode = "orbit", robotMarkerStyle = "cone", onRecenterModeChange,
+  heightLimit, displayPointSize = 0.12, displayColorMode = "深度", displaySampleSize = 0,
+  referenceAxisVisible = true, referenceAxisSize = 0.5,
+  referenceGridVisible = true, referenceGridRadius = 50, referenceGridRadials = 16,
+  referenceGridCircles = 5, referenceGridColor = "#444444",
+  controlMode = "orbit", robotMarkerStyle = "cone", onRecenterModeChange,
   routeEditMode = false, onChangeWaypoints,
   startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
 }, ref) {
@@ -213,10 +233,14 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // useImperativeHandle 暴露的方法本身可以是稳定引用, 不用跟着重新生成。
   const toggleRecenterRef = useRef<() => void>(() => {});
   const resetViewRef = useRef<() => void>(() => {});
+  const setAxisViewRef = useRef<(axis: "x" | "y" | "z", sign: 1 | -1) => void>(() => {});
+  const setCameraPresetRef = useRef<(preset: "跟随" | "自由" | "俯视" | "前视") => void>(() => {});
   useImperativeHandle(ref, () => ({
     toggleRecenter: () => toggleRecenterRef.current(),
     resetView: () => resetViewRef.current(),
     toggleFollow: () => setFollowing((v) => !v),
+    setAxisView: (axis, sign) => setAxisViewRef.current(axis, sign),
+    setCameraPreset: (preset) => setCameraPresetRef.current(preset),
   }), []);
   // onRecenterModeChange/onChangeWaypoints 是外部传的回调, 引用可能每次渲染
   // 都变(调用方没包 useCallback 的话), 用 ref 存最新值, 挂载 effect 就不用
@@ -280,6 +304,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   const surroundCloudGroupRef = useRef<THREE.Group | null>(null);
   const surroundCloudPointsRef = useRef<THREE.Points | null>(null);
   const surroundCloudCapacityRef = useRef(0);
+  const staticPointsRef = useRef<THREE.Points | null>(null);
+  const staticTilesGroupRef = useRef<THREE.Group | null>(null);
+  const originRef = useRef<THREE.Group | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const polarGridRef = useRef<THREE.PolarGridHelper | null>(null);
   // 按需渲染: 场景大多数时候是静止的(尤其点云可能有几百万个点), 不值得每帧都
   // 真跑一次 renderer.render()。这个 flag 由所有会改变画面的地方(相机交互/跟随
   // 动画/props 驱动的场景更新/resize)置位, animate() 里渲染完就清掉, 空闲时
@@ -326,6 +355,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x111318);
+    sceneRef.current = scene;
 
     // 视角以世界坐标原点 (0,0,0) 为中心, 而不是点云包围盒的几何中心。
     //
@@ -419,9 +449,14 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
 
     // 固定视角模式(地图预览页用): 旋转(左键拖拽)/缩放(滚轮)都跟 orbit 模式一样,
     // 只关掉拖拽平移 —— 想换视角中心走 toggleRecenter() 点选, 不能靠拖拽随手划走。
-    if (controlMode === "fixed") {
-      controls.enablePan = false;
-    }
+    // 对齐参考查看器：左键平移，右键旋转，滚轮缩放。点选编辑仍只响应没有
+    // 拖动的左键单击，因此不会与平移手势冲突。
+    controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
+    controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
+    controls.enablePan = true;
+    // 保留该参数的兼容性：详情页 fixed 现在也允许平移以对齐参考 UI。
+    if (controlMode === "fixed") controls.enablePan = true;
+    renderer.domElement.addEventListener("contextmenu", (event) => event.preventDefault());
 
     // 挂载时这一套 position/up/target 就是"默认视角", resetView() 恢复到这里。
     const defaultView = {
@@ -457,6 +492,35 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       setRecenterMode(false);
       needsRenderRef.current = true;
     };
+    setAxisViewRef.current = (axis, sign) => {
+      const distance = camera.position.distanceTo(controls.target);
+      const direction = new THREE.Vector3(
+        axis === "x" ? sign : 0,
+        axis === "y" ? sign : 0,
+        axis === "z" ? sign : 0,
+      );
+      camera.position.copy(controls.target).addScaledVector(direction, distance);
+      camera.up.set(0, 0, 1);
+      camera.lookAt(controls.target);
+      controls.update();
+      needsRenderRef.current = true;
+    };
+    setCameraPresetRef.current = (preset) => {
+      if (preset === "自由") return;
+      const distance = camera.position.distanceTo(controls.target);
+      if (preset === "俯视") {
+        camera.position.set(controls.target.x, controls.target.y - distance * Math.sin(TILT_RAD), controls.target.z + distance * Math.cos(TILT_RAD));
+      } else if (preset === "前视") {
+        camera.position.set(controls.target.x, controls.target.y - distance * 0.94, controls.target.z + distance * 0.28);
+      } else {
+        setFollowing(true);
+        camera.position.set(controls.target.x - distance * 0.35, controls.target.y - distance * 0.68, controls.target.z + distance * 0.64);
+      }
+      camera.up.set(0, 0, 1);
+      camera.lookAt(controls.target);
+      controls.update();
+      needsRenderRef.current = true;
+    };
 
     // 世界坐标原点参照物 + 机器狗当前位置标记, 用同一套三叉轴材质画(见
     // createAxesTripod 的说明)——加粗到 4.0(其它线普遍是 2.0~2.5), 一眼能
@@ -471,6 +535,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 固定在世界原点, 点云本身不转, 这个参照物也就不用跟着挂在什么组下面。
     const origin = createAxesTripod(axisMaterials, 0.6);
     scene.add(origin);
+    originRef.current = origin;
 
     const markersGroup = new THREE.Group();
     scene.add(markersGroup);
@@ -615,6 +680,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
           });
           points = new THREE.Points(geometry, material);
           scene.add(points);
+          staticPointsRef.current = points;
           needsRenderRef.current = true;
           console.log(`point cloud loaded: ${count} points`);
         })
@@ -630,6 +696,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 反正近处分片点更密, 视觉上本来就会盖过骨架层稀疏的点)。
     const tilesGroup = new THREE.Group();
     scene.add(tilesGroup);
+    staticTilesGroupRef.current = tilesGroup;
     const tilesMeta = pointcloudMeta?.tiles ?? null;
     const availableTiles = new Set((tilesMeta?.tiles ?? []).map((t) => `${t.ix}_${t.iy}`));
     const loadedTiles = new Map<string, THREE.Points>();
@@ -1014,9 +1081,84 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       renderer.dispose();
       container.removeChild(renderer.domElement);
       domElementRef.current = null;
+      staticPointsRef.current = null;
+      staticTilesGroupRef.current = null;
+      originRef.current = null;
+      polarGridRef.current = null;
+      sceneRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meta, mapName, pointcloudMeta, liveOnly, robotMarkerStyle]);
+
+  // 静态地图的三项显示设置完全在浏览器端完成：不重新请求点云，也不改变后端
+  // 资产。颜色由缓存的 sourceColor 恢复/重算；下采样通过 drawRange 降低 GPU
+  // 实际绘制的点数，适合在大地图中快速看整体轮廓。
+  useEffect(() => {
+    const apply = (cloud: THREE.Points) => {
+      const geometry = cloud.geometry as THREE.BufferGeometry;
+      const positions = geometry.getAttribute("position") as THREE.BufferAttribute | undefined;
+      const colors = geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
+      if (!positions || !colors) return;
+      let source = geometry.getAttribute("sourceColor") as THREE.BufferAttribute | undefined;
+      if (!source) {
+        source = new THREE.BufferAttribute((colors.array as Float32Array).slice(), 3);
+        geometry.setAttribute("sourceColor", source);
+      }
+      const output = colors.array as Float32Array;
+      const original = source.array as Float32Array;
+      let zMin = Infinity; let zMax = -Infinity;
+      for (let i = 2; i < positions.array.length; i += 3) { const z = positions.array[i] as number; zMin = Math.min(zMin, z); zMax = Math.max(zMax, z); }
+      const zSpan = Math.max(0.001, zMax - zMin);
+      for (let i = 0; i < positions.count; i++) {
+        const offset = i * 3;
+        if (displayColorMode === "灰色") {
+          const gray = original[offset] * 0.299 + original[offset + 1] * 0.587 + original[offset + 2] * 0.114;
+          output[offset] = gray; output[offset + 1] = gray; output[offset + 2] = gray;
+        } else if (displayColorMode === "深度") {
+          const t = ((positions.array[offset + 2] as number) - zMin) / zSpan;
+          output[offset] = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3)));
+          output[offset + 1] = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)));
+          output[offset + 2] = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)));
+        } else { output[offset] = original[offset]; output[offset + 1] = original[offset + 1]; output[offset + 2] = original[offset + 2]; }
+      }
+      colors.needsUpdate = true;
+      geometry.setDrawRange(0, Math.max(1, Math.round(positions.count / (1 + displaySampleSize * 9))));
+      (cloud.material as THREE.PointsMaterial).size = Math.max(0.25, displayPointSize * 6);
+    };
+    if (staticPointsRef.current) apply(staticPointsRef.current);
+    staticTilesGroupRef.current?.children.forEach((item) => apply(item as THREE.Points));
+    needsRenderRef.current = true;
+  }, [displayPointSize, displayColorMode, displaySampleSize]);
+
+  useEffect(() => {
+    const origin = originRef.current;
+    if (!origin) return;
+    origin.visible = referenceAxisVisible;
+    origin.scale.setScalar(Math.max(0.1, referenceAxisSize / 0.5));
+    needsRenderRef.current = true;
+  }, [referenceAxisVisible, referenceAxisSize]);
+
+  // 严格使用参考 UI 同一套 Three.PolarGridHelper，而不是二维 CSS 同心圆：半径、
+  // 周向分区、轴向分区与颜色会在真实世界坐标系中随视角透视变化。
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    const previous = polarGridRef.current;
+    if (previous) {
+      scene.remove(previous);
+      previous.geometry.dispose();
+      const material = previous.material;
+      (Array.isArray(material) ? material : [material]).forEach((item) => item.dispose());
+      polarGridRef.current = null;
+    }
+    if (referenceGridVisible) {
+      const grid = new THREE.PolarGridHelper(referenceGridRadius, referenceGridRadials, referenceGridCircles, 64, referenceGridColor, referenceGridColor);
+      grid.rotation.x = Math.PI / 2;
+      scene.add(grid);
+      polarGridRef.current = grid;
+    }
+    needsRenderRef.current = true;
+  }, [referenceGridVisible, referenceGridRadius, referenceGridRadials, referenceGridCircles, referenceGridColor]);
 
   // 高度限制: heightLimit 本身就是世界系绝对 z(由页面把滑杆钉在
   // [world_bounds.z_min, z_max] 之间), 点云不会转, 直接赋值给裁剪平面就行。
@@ -1461,6 +1603,16 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
+      <div className="point-cloud-gizmo" aria-label="视角旋转控件">
+        <i className="point-cloud-gizmo__origin" />
+        <i className="point-cloud-gizmo__line point-cloud-gizmo__line--x" />
+        <i className="point-cloud-gizmo__line point-cloud-gizmo__line--y" />
+        <i className="point-cloud-gizmo__line point-cloud-gizmo__line--z" />
+        {(["x", "y", "z"] as const).map((axis) => <span key={axis}>
+          <button type="button" className={`point-cloud-gizmo__head point-cloud-gizmo__head--${axis}`} onPointerDown={(event) => { event.stopPropagation(); setAxisViewRef.current(axis, 1); }}>{axis.toUpperCase()}</button>
+          <button type="button" aria-label={`${axis.toUpperCase()} 轴反向`} className={`point-cloud-gizmo__negative point-cloud-gizmo__negative--${axis}`} onPointerDown={(event) => { event.stopPropagation(); setAxisViewRef.current(axis, -1); }} />
+        </span>)}
+      </div>
       {enableFollow && showFollowButton && (
         <button
           type="button"

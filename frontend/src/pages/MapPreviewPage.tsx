@@ -19,6 +19,7 @@ import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { MapDetailPanel } from "../components/map-detail/MapDetailPanel";
 
 const HEIGHT_LIMIT_STEP = 0.25;
 // 「自身膨胀」「膨胀地图」这两个图层开关先隐藏入口(订阅/渲染逻辑不动, 保留
@@ -221,12 +222,14 @@ export default function MapPreviewPage() {
   // 下用不上", 比直接消失更不容易让人以为是漏了什么。PointCloudView/TopView
   // 本身倒是按需整个装卸载(两边都可能是几百万点/整张大图, 没必要同时占着)。
   const [viewMode, setViewMode] = useState<ViewMode>("3d");
+  const [pointDisplay, setPointDisplay] = useState<{ color: "深度" | "强度" | "灰色"; size: number; sample: number }>({ color: "深度", size: 0.12, sample: 0 });
+  const [referenceDisplay, setReferenceDisplay] = useState({ axis: true, axisSize: 0.5, grid: true, gridRadius: 50, gridRadials: 16, gridCircles: 5, gridColor: "#444444" });
 
   // 高度限制(世界系绝对 z, 米), 高于这个高度的点云不渲染, 由 PointCloudView
   // 用裁剪平面实现。滑杆范围钉在这份地图自己的 [z_min, z_max] 之间 —— 这两个
   // 值要等 topview_meta 加载完才知道, 所以初值是 null, 拿到 meta 后默认给
   // z_max(不裁剪, 显示全部点云)。
-  const [heightLimit, setHeightLimit] = useState<number | null>(null);
+  const [heightLimit, setHeightLimit] = useState<number | null>(1.5);
   // 是否处于"点选新中心点"模式, 由 PointCloudView 通过 onRecenterModeChange
   // 回调同步过来(点选成功 / resetView 都会自动关闭), 纯用来控制按钮高亮和
   // 提示条的显示, 不直接驱动任何 three.js 逻辑。
@@ -512,11 +515,11 @@ export default function MapPreviewPage() {
 
       {info?.status === "ready" && info.topview_meta && (() => {
         const { z_min: zMin, z_max: zMax } = info.topview_meta.world_bounds;
-        const effectiveHeightLimit = heightLimit ?? zMax;
+        const effectiveHeightLimit = Math.min(zMax, Math.max(zMin, heightLimit ?? 1.5));
         const topview2d = info.topview_meta.topview2d;
         return (
         <>
-          {viewMode === "3d" ? (
+          {viewMode === "3d" ? (<>
             <PointCloudView
               ref={pcRef}
               mapName={name}
@@ -528,6 +531,16 @@ export default function MapPreviewPage() {
               trail={isActive ? trail : null}
               optimalTraj={isActive && !optimalTrajHidden ? optimalTraj : null}
               heightLimit={effectiveHeightLimit}
+              displayPointSize={pointDisplay.size}
+              displayColorMode={pointDisplay.color}
+              displaySampleSize={pointDisplay.sample}
+              referenceAxisVisible={referenceDisplay.axis}
+              referenceAxisSize={referenceDisplay.axisSize}
+              referenceGridVisible={referenceDisplay.grid}
+              referenceGridRadius={referenceDisplay.gridRadius}
+              referenceGridRadials={referenceDisplay.gridRadials}
+              referenceGridCircles={referenceDisplay.gridCircles}
+              referenceGridColor={referenceDisplay.gridColor}
               controlMode="fixed"
               enableFollow
               showFollowButton={false}
@@ -544,7 +557,7 @@ export default function MapPreviewPage() {
               inflationMap={inflationMap}
               surfCloud={surfCloud}
             />
-          ) : topview2d ? (
+          </>) : topview2d ? (
             <div className="flex size-full items-center justify-center">
               <TopView
                 ref={tvRef}
@@ -606,7 +619,7 @@ export default function MapPreviewPage() {
             </div>
           )}
 
-          {panelOpen && (
+          {false && panelOpen && (
             <div className="absolute top-0 right-0 z-10 flex h-full w-72 flex-col border-l border-white/10 bg-neutral-900/90 text-white/90 backdrop-blur-md">
               <div className="flex shrink-0 items-center justify-between border-b border-white/10 px-4 py-3">
                 <span className="text-sm font-medium">显示面板</span>
@@ -751,10 +764,10 @@ export default function MapPreviewPage() {
                     right={plannerService && (
                       <span className={cn(
                         "font-medium",
-                        PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].className,
+                        PLANNER_SERVICE_STATE_DISPLAY[plannerService!.active_state].className,
                       )}
                       >
-                        {PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].text}
+                        {PLANNER_SERVICE_STATE_DISPLAY[plannerService!.active_state].text}
                       </span>
                     )}
                   >
@@ -875,6 +888,50 @@ export default function MapPreviewPage() {
                 </PanelSection>
               </div>
             </div>
+          )}
+          {panelOpen && (
+            <MapDetailPanel
+              onClose={() => setPanelOpen(false)}
+              viewMode={viewMode}
+              onViewModeChange={setViewMode}
+              height={effectiveHeightLimit}
+              minHeight={zMin}
+              maxHeight={zMax}
+              onHeightChange={setHeightLimit}
+              realtimeCloud={surfCloudEnabled}
+              realtimeBusy={surfCloudBusy}
+              onRealtimeCloudChange={handleToggleSurfCloud}
+              following={following}
+              canFollow={viewMode === "3d" && hasPose}
+              onFollowingChange={() => pcRef.current?.toggleFollow()}
+              recentering={recentering}
+              onToggleRecenter={() => pcRef.current?.toggleRecenter()}
+              onResetView={() => pcRef.current?.resetView()}
+              goalEditing={routeEditing}
+              canSetGoal={!navRunning && !startGoalPicking}
+              onToggleGoal={handleToggleGoalPick}
+              onClearGoal={() => {
+                setWaypoints([]);
+                setTrail([]);
+                setDispatchedRoute(null);
+                setOptimalTrajHidden(true);
+              }}
+              canClearGoal={waypoints.length > 0}
+              canStart={waypoints.length > 0 && hasPose}
+              busy={submitting}
+              navigating={navRunning}
+              onStart={handleStartNav}
+              onStop={handleStopNav}
+              previewEditing={startGoalPicking}
+              previewBusy={planning}
+              hasPreview={hasStartGoal || plannedRoute != null}
+              onStartPreview={handleStartStartGoalPick}
+              onFinishPreview={handleFinishStartGoalPick}
+              onClearPreview={handleClearPlannedRoute}
+              onCameraChange={(preset) => pcRef.current?.setCameraPreset(preset)}
+              onPointDisplayChange={setPointDisplay}
+              onReferenceDisplayChange={setReferenceDisplay}
+            />
           )}
         </>
         );
