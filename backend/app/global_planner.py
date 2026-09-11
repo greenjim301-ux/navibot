@@ -169,16 +169,48 @@ def _wall_clearance_weight(blocked: np.ndarray, free: np.ndarray, radius_px: int
     return weight
 
 
+def _dilate_rows(mask: np.ndarray, half_width: int) -> np.ndarray:
+    """只在水平方向按 half_width 膨胀(1D 滑动窗口 max)。"""
+    if half_width <= 0:
+        return mask
+    padded = np.pad(mask, ((0, 0), (half_width, half_width)),
+                     mode="constant", constant_values=False)
+    return sliding_window_view(padded, 2 * half_width + 1, axis=1).max(axis=-1)
+
+
 def _dilate_bool(mask: np.ndarray, radius_px: int) -> np.ndarray:
-    """把 True(障碍)按方形结构元素膨胀 radius_px 像素(棋盘距离, 不是精确的
-    欧氏圆——对角线方向会多裁掉一点, 偏保守不偏危险)。用两次可分离的 1D 滑动
-    窗口 max 实现, 等价于一次方形核 max filter, 纯 numpy, 不用 scipy。"""
+    """把 True(障碍)按**圆形**结构元素膨胀 radius_px 像素(欧氏距离)。
+
+    以前这里用的是方形结构元(两次可分离的 1D max, 等价于边长 2R+1 的方核),
+    注释说"对角线方向多裁一点, 偏保守不偏危险"——但"偏保守"在窄通道上就是
+    封死: 方核在 45° 方向的实际半径是 R×√2, **比标称多吃 41%**。实测 house 上
+    一条净宽 0.71m 的通道被标称 0.25m 的膨胀斜着吃穿(5px×√2×0.05 = 0.354m,
+    正好等于通道半宽), 两侧房间在 A* 看来直接不连通, 规划报"找不到可行路径"。
+
+    圆盘按行拆: 行偏移 dr 上圆盘覆盖的列半宽是 floor(sqrt(R² − dr²))。对每种
+    半宽只做一次水平膨胀(不同 dr 常常共用同一个半宽), 再按 dr 平移后并起来。
+    纯 numpy, 不用 scipy(理由见模块 docstring)。
+    """
     if radius_px <= 0:
         return mask.copy()
-    size = 2 * radius_px + 1
-    padded = np.pad(mask, radius_px, mode="constant", constant_values=False)
-    row_dilated = sliding_window_view(padded, size, axis=1).max(axis=-1)
-    return sliding_window_view(row_dilated, size, axis=0).max(axis=-1)
+    # 半宽 -> 用到这个半宽的所有行偏移
+    by_width: dict = {}
+    for dr in range(-radius_px, radius_px + 1):
+        w = math.isqrt(radius_px * radius_px - dr * dr)
+        by_width.setdefault(w, []).append(dr)
+
+    height = mask.shape[0]
+    out = np.zeros_like(mask)
+    for w, drs in by_width.items():
+        band = _dilate_rows(mask, w)
+        for dr in drs:
+            if dr == 0:
+                out |= band
+            elif dr > 0:
+                out[dr:] |= band[:height - dr]
+            else:
+                out[:height + dr] |= band[-dr:]
+    return out
 
 
 def _world_to_pixel(x: float, y: float, height: int, resolution: float,

@@ -67,6 +67,11 @@ INITIAL_PATH_SUB_WAIT_S = float(os.environ.get("NAVIBOT_INITIAL_PATH_WAIT_S", "5
 # 的 grid_map/double_cylinder_radius=0.25(advanced_param.xml 里配的"双圆柱"自身
 # 膨胀半径)——用同一个数, 全局路径判定的"安全"标准才跟机器狗局部自身膨胀判定
 # 的标准一致, 不会出现全局觉得没问题、局部却嫌贴太近的情况。
+#
+# 这个"同一个数"只有在膨胀用**圆形**结构元时才成立。早期实现用可分离的方形核
+# (快, 但 45° 方向的实际半径是 R×√2, 比标称多 41%), 那时这里写 0.25 实际按
+# 0.354 在挡路——实测 house 上一条净宽 0.71m 的通道被整条封死。别为了省那几十
+# 毫秒改回方形核, 见 global_planner._dilate_bool。
 GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_INFLATION_RADIUS_M", "0.25")
 )
