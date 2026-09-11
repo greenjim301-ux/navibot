@@ -71,6 +71,7 @@ from PIL import Image
 from scipy import ndimage
 
 import elevation
+from pcd_intensity import IntensityLookup, load_intensity_lookup
 
 # Pillow 默认给大图片加了个"解压炸弹"保护(超过约 1.8 亿像素就拒绝打开), 防的是
 # 处理不可信的上传文件。这里的 2D 栅格图是离线管线自己从本机 SLAM 输出读的
@@ -506,7 +507,8 @@ def voxel_downsample_to_target(pcd: o3d.geometry.PointCloud, target_points: int,
 
 
 def export_pointcloud_bin(pcd: o3d.geometry.PointCloud, out_path: Path,
-                           z_range: tuple[float, float] | None = None):
+                           z_range: tuple[float, float] | None = None,
+                           intensity_lookup: IntensityLookup | None = None):
     """点数控制(降采样到预览规模)在更早的阶段就做完了(见 main()), 这里只管写
     文件——天花板裁剪不在这一步做, 前端界面自己按点云的 z_min/z_max 拉滑杆裁。
 
@@ -518,18 +520,24 @@ def export_pointcloud_bin(pcd: o3d.geometry.PointCloud, out_path: Path,
     pts = np.asarray(pcd.points).astype(np.float32)
     vmin, vmax = z_range if z_range is not None else (None, None)
     colors = height_to_color(pts[:, 2], vmin=vmin, vmax=vmax)
+    intensities = intensity_lookup.for_points(pts) if intensity_lookup is not None else None
 
     with open(out_path, "wb") as f:
-        f.write(b"PCW1")
+        # PCW2 在 PCW1 基础上增加原始 intensity(float32[count])，但为了浮点对齐，
+        # 布局是 xyz -> intensity -> rgb。前端同时兼容两种格式。
+        f.write(b"PCW2" if intensities is not None else b"PCW1")
         f.write(struct.pack("<I", len(pts)))
         f.write(pts.tobytes())
+        if intensities is not None:
+            f.write(np.asarray(intensities, dtype=np.float32).tobytes())
         f.write(colors.tobytes())
 
-    return len(pts), pts
+    return len(pts), pts, intensities is not None
 
 
 def export_tiles(pcd: o3d.geometry.PointCloud, out_dir: Path, x_min: float, y_min: float,
-                  tile_size: float, point_budget: int, z_range: tuple[float, float]) -> list:
+                  tile_size: float, point_budget: int, z_range: tuple[float, float],
+                  intensity_lookup: IntensityLookup | None = None) -> list:
     """把点云按 (x_min, y_min) 为原点、tile_size 为边长切成一个 x/y 网格, 每个非空
     格子单独导出一个 PCW1 文件(tiles/tile_{ix}_{iy}.bin)。格子内点数超过
     point_budget 才降采样(复用 voxel_downsample_to_target), 没超就保留原始精度
@@ -564,8 +572,9 @@ def export_tiles(pcd: o3d.geometry.PointCloud, out_dir: Path, x_min: float, y_mi
         tile_pcd = pcd.select_by_index(group_idx)
         if len(tile_pcd.points) > point_budget:
             tile_pcd, _ = voxel_downsample_to_target(tile_pcd, point_budget)
-        n_out, _ = export_pointcloud_bin(
+        n_out, _, _ = export_pointcloud_bin(
             tile_pcd, tiles_dir / f"tile_{ix}_{iy}.bin", z_range=z_range,
+            intensity_lookup=intensity_lookup,
         )
         tile_list.append({"ix": ix, "iy": iy, "num_points": n_out})
     return tile_list
@@ -642,6 +651,8 @@ def main():
     # "整图预览降到多少点"上做出正确的选择(见下面 TILED_OVERVIEW_TARGET_POINTS
     # 的分支)。
     raw_points = np.asarray(pcd_raw.points)
+    intensity_lookup = load_intensity_lookup(in_path, n_raw)
+    print("      intensity: " + ("已保留到 PCW2" if intensity_lookup is not None else "不可用，使用兼容 PCW1"))
     x_min, x_max, y_min, y_max = robust_xy_bounds(raw_points)
     z_min, z_max = float(raw_points[:, 2].min()), float(raw_points[:, 2].max())
     max_extent_xy = max(x_max - x_min, y_max - y_min)
@@ -844,7 +855,9 @@ def main():
     # z_range 配色——否则同一个绝对高度在整图预览和分片里会被染成不同颜色,
     # 缩放切换时出现突兀的颜色接缝。
     z_range = (z_min, z_max)
-    n_out, pts_out = export_pointcloud_bin(pcd_overview, out_dir / "pointcloud.bin", z_range=z_range)
+    n_out, pts_out, has_intensity = export_pointcloud_bin(
+        pcd_overview, out_dir / "pointcloud.bin", z_range=z_range, intensity_lookup=intensity_lookup,
+    )
     print(f"      导出点数: {n_out}")
     _log_step_done(t_step)
 
@@ -856,7 +869,7 @@ def main():
               f"(整图预览只是骨架层, 分片用原始分辨率的点云按 "
               f"{TILE_SIZE_M:.0f}m 网格单独降采样, 每格最多 {TILE_POINT_BUDGET} 点)")
         tile_list = export_tiles(pcd_raw, out_dir, x_min, y_min,
-                                  TILE_SIZE_M, TILE_POINT_BUDGET, z_range)
+                                  TILE_SIZE_M, TILE_POINT_BUDGET, z_range, intensity_lookup=intensity_lookup)
         tiles_meta = {
             "tile_size": TILE_SIZE_M,
             "origin_x": x_min,
@@ -876,7 +889,9 @@ def main():
         # 降采样用的体素边长(米), 没触发降采样(点数本来就 <= overview_target)
         # 时是 None, 记下来方便事后核对"这份预览到底是按多细的体素抽的"。
         "voxel_size_m": voxel_size,
-        "format": "PCW1: magic(4) + uint32 count + float32[count*3] xyz + uint8[count*3] rgb",
+        "format": ("PCW2: magic(4) + uint32 count + float32[count*3] xyz + float32[count] intensity + uint8[count*3] rgb"
+                   if has_intensity else "PCW1: magic(4) + uint32 count + float32[count*3] xyz + uint8[count*3] rgb"),
+        "has_intensity": has_intensity,
         "world_bounds": {
             "x_min": float(pts_out[:, 0].min()), "x_max": float(pts_out[:, 0].max()),
             "y_min": float(pts_out[:, 1].min()), "y_max": float(pts_out[:, 1].max()),

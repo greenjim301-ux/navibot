@@ -222,14 +222,14 @@ export default function MapPreviewPage() {
   // 下用不上", 比直接消失更不容易让人以为是漏了什么。PointCloudView/TopView
   // 本身倒是按需整个装卸载(两边都可能是几百万点/整张大图, 没必要同时占着)。
   const [viewMode, setViewMode] = useState<ViewMode>("3d");
-  const [pointDisplay, setPointDisplay] = useState<{ color: "深度" | "强度" | "灰色"; size: number; sample: number }>({ color: "深度", size: 0.12, sample: 0 });
+  const [pointDisplay, setPointDisplay] = useState<{ color: "高彩" | "深度" | "强度" | "灰色"; size: number; sample: number; opacity: number }>({ color: "深度", size: 0.20, sample: 0, opacity: 0.3 });
   const [referenceDisplay, setReferenceDisplay] = useState({ axis: true, axisSize: 0.5, grid: true, gridRadius: 50, gridRadials: 16, gridCircles: 5, gridColor: "#444444" });
 
   // 高度限制(世界系绝对 z, 米), 高于这个高度的点云不渲染, 由 PointCloudView
   // 用裁剪平面实现。滑杆范围钉在这份地图自己的 [z_min, z_max] 之间 —— 这两个
   // 值要等 topview_meta 加载完才知道, 所以初值是 null, 拿到 meta 后默认给
   // z_max(不裁剪, 显示全部点云)。
-  const [heightLimit, setHeightLimit] = useState<number | null>(1.5);
+  const [heightLimit, setHeightLimit] = useState<number | null>(1.0);
   // 是否处于"点选新中心点"模式, 由 PointCloudView 通过 onRecenterModeChange
   // 回调同步过来(点选成功 / resetView 都会自动关闭), 纯用来控制按钮高亮和
   // 提示条的显示, 不直接驱动任何 three.js 逻辑。
@@ -515,7 +515,7 @@ export default function MapPreviewPage() {
 
       {info?.status === "ready" && info.topview_meta && (() => {
         const { z_min: zMin, z_max: zMax } = info.topview_meta.world_bounds;
-        const effectiveHeightLimit = Math.min(zMax, Math.max(zMin, heightLimit ?? 1.5));
+        const effectiveHeightLimit = Math.min(zMax, Math.max(zMin, heightLimit ?? 1.0));
         const topview2d = info.topview_meta.topview2d;
         return (
         <>
@@ -534,6 +534,7 @@ export default function MapPreviewPage() {
               displayPointSize={pointDisplay.size}
               displayColorMode={pointDisplay.color}
               displaySampleSize={pointDisplay.sample}
+              displayOpacity={pointDisplay.opacity}
               referenceAxisVisible={referenceDisplay.axis}
               referenceAxisSize={referenceDisplay.axisSize}
               referenceGridVisible={referenceDisplay.grid}

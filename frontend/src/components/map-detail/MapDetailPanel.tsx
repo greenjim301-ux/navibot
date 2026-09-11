@@ -37,7 +37,7 @@ interface Props {
   onFinishPreview: () => void;
   onClearPreview: () => void;
   onCameraChange?: (preset: "跟随" | "自由" | "俯视" | "前视") => void;
-  onPointDisplayChange?: (settings: { color: "深度" | "强度" | "灰色"; size: number; sample: number }) => void;
+  onPointDisplayChange?: (settings: { color: "高彩" | "深度" | "强度" | "灰色"; size: number; sample: number; opacity: number }) => void;
   onReferenceDisplayChange?: (settings: { axis: boolean; axisSize: number; grid: boolean; gridRadius: number; gridRadials: number; gridCircles: number; gridColor: string }) => void;
 }
 
@@ -69,15 +69,17 @@ export function MapDetailPanel(props: Props) {
   const [gridCircles, setGridCircles] = useState(5);
   const [gridColor, setGridColor] = useState("#444444");
   const [pointColor, setPointColor] = useState("深度");
-  const [pointSize, setPointSize] = useState(0.12);
+  // PointCloudView 中按 6 倍转换为屏幕像素；0.20 对应默认 1.2px。
+  const [pointSize, setPointSize] = useState(0.20);
   const [sample, setSample] = useState(0);
+  const [opacity, setOpacity] = useState(0.3);
   const [camera, setCamera] = useState("俯视");
   const [forbidden, setForbidden] = useState(true);
   const [video, setVideo] = useState(false);
   const [videoMode, setVideoMode] = useState("左单目");
   useEffect(() => {
-    onPointDisplayChange?.({ color: pointColor as "深度" | "强度" | "灰色", size: pointSize, sample });
-  }, [pointColor, pointSize, sample, onPointDisplayChange]);
+    onPointDisplayChange?.({ color: pointColor as "高彩" | "深度" | "强度" | "灰色", size: pointSize, sample, opacity });
+  }, [pointColor, pointSize, sample, opacity, onPointDisplayChange]);
   useEffect(() => {
     onReferenceDisplayChange?.({ axis, axisSize, grid, gridRadius, gridRadials, gridCircles, gridColor });
   }, [axis, axisSize, grid, gridRadius, gridRadials, gridCircles, gridColor, onReferenceDisplayChange]);
@@ -98,8 +100,9 @@ export function MapDetailPanel(props: Props) {
 
       <Section title="地图">
         <label className="map-detail-panel__setting"><span>显示方式</span><select value={props.viewMode} onChange={(event) => props.onViewModeChange(event.target.value as ViewMode)}><option value="3d">3D点云</option><option value="2d">2D栅格</option></select></label>
-        <label className="map-detail-panel__setting"><span>颜色</span><select disabled={props.viewMode === "2d"} value={pointColor} onChange={(event) => setPointColor(event.target.value)}><option>深度</option><option>强度</option><option>灰色</option></select></label>
+        <label className="map-detail-panel__setting"><span>颜色</span><select disabled={props.viewMode === "2d"} value={pointColor} onChange={(event) => setPointColor(event.target.value)}><option>高彩</option><option>深度</option><option>强度</option><option>灰色</option></select></label>
         <Range label="尺寸" value={pointSize} min={0.03} max={0.4} step={0.01} onChange={setPointSize} />
+        <Range label="不透明度" value={opacity} min={0.25} max={1} step={0.05} onChange={setOpacity} />
         <Range label="下采样尺寸" value={sample} min={0} max={1} step={0.05} onChange={setSample} />
         <Range label="显示高度" value={props.height} min={props.minHeight} max={props.maxHeight} step={0.25} suffix="m" onChange={props.onHeightChange} />
         <label className="map-detail-panel__setting"><span>相机视角</span><select value={camera} onChange={(event) => { const preset = event.target.value as "跟随" | "自由" | "俯视" | "前视"; setCamera(preset); props.onCameraChange?.(preset); }}><option>跟随</option><option>自由</option><option>俯视</option><option>前视</option></select></label>

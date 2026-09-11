@@ -84,7 +84,7 @@ export default function MappingPage() {
     }
   }, [status?.state, checked, checkError, navigate, name]);
 
-  const [heightLimit, setHeightLimit] = useState<number | null>(1.5);
+  const [heightLimit, setHeightLimit] = useState<number | null>(1.0);
   const [zRange, setZRange] = useState({ min: DEFAULT_Z_MIN, max: DEFAULT_Z_MAX });
   useEffect(() => {
     if (surroundCloud.length < 3) return;
@@ -99,7 +99,7 @@ export default function MappingPage() {
     if (changed) setZRange({ min, max });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [surroundCloud]);
-  const effectiveHeightLimit = Math.min(zRange.max, Math.max(zRange.min, heightLimit ?? 1.5));
+  const effectiveHeightLimit = Math.min(zRange.max, Math.max(zRange.min, heightLimit ?? 1.0));
 
   const [recentering, setRecentering] = useState(false);
   const [following, setFollowing] = useState(false);
@@ -107,7 +107,7 @@ export default function MappingPage() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [realtimeCloud, setRealtimeCloud] = useState(true);
-  const [pointDisplay, setPointDisplay] = useState<{ color: "深度" | "强度" | "灰色"; size: number; sample: number }>({ color: "深度", size: 0.12, sample: 0 });
+  const [pointDisplay, setPointDisplay] = useState<{ color: "高彩" | "深度" | "强度" | "灰色"; size: number; sample: number; opacity: number }>({ color: "深度", size: 0.20, sample: 0, opacity: 0.3 });
   const [referenceDisplay, setReferenceDisplay] = useState({
     axis: true, axisSize: 0.5, grid: true, gridRadius: 50, gridRadials: 16, gridCircles: 5, gridColor: "#444444",
   });
@@ -243,6 +243,7 @@ export default function MappingPage() {
         displayPointSize={pointDisplay.size}
         displayColorMode={pointDisplay.color}
         displaySampleSize={pointDisplay.sample}
+        displayOpacity={pointDisplay.opacity}
         referenceAxisVisible={referenceDisplay.axis}
         referenceAxisSize={referenceDisplay.axisSize}
         referenceGridVisible={referenceDisplay.grid}
