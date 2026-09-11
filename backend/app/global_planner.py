@@ -338,7 +338,8 @@ def _line_cost(cost_weight: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> f
 _PRUNE_COST_TOLERANCE = 1.02
 
 
-def _prune_path(path: List[RC], free: np.ndarray, cost_weight: np.ndarray) -> List[RC]:
+def _prune_path(path: List[RC], free: np.ndarray, cost_weight: np.ndarray,
+                 abs_slack: float = 0.0) -> List[RC]:
     """贪心 line-of-sight 剪枝: 从当前锚点往后尽量跳到能直连的最远点, 把栅格
     A* 的锯齿收敛成关键拐点。navi_mode=3 要的就是这种稀疏 via-points, 不需要
     再重采样成稠密路径(见模块 docstring)。
@@ -372,16 +373,84 @@ def _prune_path(path: List[RC], free: np.ndarray, cost_weight: np.ndarray) -> Li
         while j < len(path):
             r0, c0 = path[anchor]
             r1, c1 = path[j]
+            # 被挡住就停: 这个判据近似单调(直连再远一般只会更容易撞上), 而且
+            # 继续扫下去代价不小。
             if not _line_free(free, r0, c0, r1, c1):
                 break
             raw_cost = cum_cost[j] - cum_cost[anchor]
-            if _line_cost(cost_weight, r0, c0, r1, c1) > raw_cost * _PRUNE_COST_TOLERANCE:
-                break
-            last_visible = j
+            if _line_cost(cost_weight, r0, c0, r1, c1) <= raw_cost * _PRUNE_COST_TOLERANCE + abs_slack:
+                last_visible = j
+            # 代价不过**不能 break**: 这个判据完全不单调。A* 路径绕过一小片
+            # 惩罚带时, 直连到紧邻的 j 会穿过惩罚带而变贵, 但再往后几步直连
+            # 反而可能重新便宜(分母 raw_cost 涨得更快)。原来在这里 break,
+            # 锚点就只前进一格 —— 于是每 0.05m(斜向 0.0707m)吐一个途经点,
+            # 正好落在 SCAN-Planner 的 0.2m 死区里(planner_manager.cpp:94,
+            # 低于 0.2m 直接 TOO_CLOSE_TO_GOAL, 根本不生成轨迹)。
             j += 1
         pruned.append(path[last_visible])
         anchor = last_visible
     return pruned
+
+
+def _enforce_min_spacing(pruned: List[RC], free: np.ndarray, min_px: float) -> List[RC]:
+    """兜底安全网: 把间距小于 min_px 的点压掉, 保证相邻途经点不会近到
+    SCAN-Planner 生成不出轨迹。
+
+    为什么必须有这条硬下限: `reboundReplan` 里有条 0.2m 的硬线
+    (planner_manager.cpp:94), 目标点离当前位置低于它就直接返回
+    TOO_CLOSE_TO_GOAL —— **根本不生成轨迹**, 还会把 continuous_failures_count_
+    加一(那个计数器只有完整成功才清零)。所以"点密"不只是浪费算力, 是真的会让
+    planner 空转。剪枝的代价门槛已经把这种点压到个位数百分比, 但门槛是"软"的,
+    挡不住所有情况, 这里再兜一道。
+
+    **终点必须原样保留** —— 它是整条路线里唯一有 `/planning/finished` 精确到达
+    判定的点, 中途点只有 0.3m 的提前切换(waypoint_arrival_radius_)。所以是
+    "上一个保留点离终点太近就丢掉上一个", 不是丢终点。
+
+    丢点会把两段并成一段直连, 而输入只保证**相邻**两点之间可走, 并不保证并完
+    之后还可走。所以每次并段都要 _line_free 复核, 复核不过就把刚跳过的那个点
+    放回来当中转 —— 宁可多留一个点, 也不能给出一条穿墙的路线。
+    """
+    if min_px <= 0 or len(pruned) <= 2:
+        return pruned
+
+    def dist(a: RC, b: RC) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    out = [pruned[0]]
+    i = 1
+    while i < len(pruned) - 1:
+        p = pruned[i]
+        if dist(out[-1], p) >= min_px:
+            out.append(p)
+            i += 1
+            continue
+        # p 离上一个保留点太近, 想丢掉它。**一次只丢一个, 而且丢之前先验证**
+        # 并出来的那一段仍然可走 —— 输入只保证相邻两点之间可走, 不保证跨过 p
+        # 直连还可走。验证通过才丢, 于是"out[-1] 到剩余队列头部之间可走"这个
+        # 不变量一直成立。
+        nxt = pruned[i + 1]
+        if _line_free(free, out[-1][0], out[-1][1], nxt[0], nxt[1]):
+            i += 1                           # 丢掉 p
+        elif (len(out) > 2 and dist(out[-2], p) >= min_px
+              and _line_free(free, out[-2][0], out[-2][1], p[0], p[1])):
+            # p 丢不掉(丢了会切角穿墙), 那就反过来丢**上一个**保留点, 把 p 这个
+            # 真拐点留下。out[0] 是起点, 不参与。
+            out[-1] = p
+            i += 1
+        else:
+            out.append(p)                    # 两边都丢不得, 宁可留个密点也不穿墙
+            i += 1
+
+    goal = pruned[-1]
+    # 终点保留, 太近的前一个点往回丢; 起点(out[0])不能丢。
+    while len(out) > 1 and dist(out[-1], goal) < min_px:
+        dropped = out.pop()
+        if not _line_free(free, out[-1][0], out[-1][1], goal[0], goal[1]):
+            out.append(dropped)              # 丢了就穿墙, 那还是留着
+            break
+    out.append(goal)
+    return out
 
 
 def plan_path(map_name: str, start_xy: XY, goal_xy: XY) -> List[XY]:
@@ -437,5 +506,14 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY) -> List[XY]:
     if raw is None:
         raise ValueError("起点和终点之间找不到可行路径")
 
-    pruned = _prune_path(raw, free, cost_weight)
+    # 两个阈值都是按米配的, 这里换算成像素——地图分辨率按跨度自动选(0.05~1.0m/格,
+    # 见 map_pipeline 的 MAP2D_RESOLUTION_BY_EXTENT_M), 写成像素常量的话同一个数在
+    # 不同图上含义完全不同。
+    pruned = _prune_path(
+        raw, free, cost_weight,
+        abs_slack=config.GLOBAL_PLANNER_PRUNE_ABS_SLACK_M / resolution,
+    )
+    pruned = _enforce_min_spacing(
+        pruned, free, config.GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M / resolution,
+    )
     return [_pixel_to_world(r, c, height, resolution, origin_x, origin_y) for r, c in pruned]

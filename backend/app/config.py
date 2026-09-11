@@ -75,6 +75,24 @@ INITIAL_PATH_SUB_WAIT_S = float(os.environ.get("NAVIBOT_INITIAL_PATH_WAIT_S", "5
 GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_INFLATION_RADIUS_M", "0.25")
 )
+# 剪枝代价比较的**绝对**松弛项(m)。_prune_path 判"直连能不能代替这一段 A* 路径"
+# 时, 光用相对容差(_PRUNE_COST_TOLERANCE=1.02)有尺度偏差: 段越短, 1.02 折算出来
+# 的绝对容差越小, 短段几乎零容忍, 于是锚点寸步难行、每几厘米吐一个途经点。加一个
+# 跟段长无关的绝对项就消掉了这个偏差。
+#
+# 0.20m 是实测扫出来的: house/stairs 上把"间距 < 0.2m 的途经点"(SCAN-Planner 的
+# 死区, 见 _enforce_min_spacing)从 30.8%/44.8% 压到 6.8%/11.5%, 再往上收益就没了
+# (0.5m 时反而回升到 9.9%/14.7%, 而且最大段长开始失控)。
+GLOBAL_PLANNER_PRUNE_ABS_SLACK_M = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_PRUNE_ABS_SLACK_M", "0.20")
+)
+# 相邻途经点的硬下限(m)。低于 SCAN-Planner 的 0.2m 死区就生成不出轨迹
+# (planner_manager.cpp:94), 留一点余量取 0.25。**不要设上限** —— 间距该由代价
+# 门槛和几何决定, 人为插点只会白白截短 planner 的 5m 前瞻(mode 2 没有跨途经点的
+# min-snap, 均匀间距没有收益), 长段超过 4m 时 planner 自己会插点。
+GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M", "0.25")
+)
 # 2D 栅格图里灰度 205("未知", map_pipeline/elevation.py 的 mark_known_region
 # 标的——离建图轨迹超过一定距离的 free 格子)不算不可通行(那是 occupied_thresh
 # 的事, 见 global_planner._blocked_mask), 只是全局规划走这类格子的单步代价要
