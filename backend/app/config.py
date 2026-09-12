@@ -86,6 +86,18 @@ GLOBAL_PLANNER_INFLATION_RADIUS_M = float(
 GLOBAL_PLANNER_PRUNE_ABS_SLACK_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_PRUNE_ABS_SLACK_M", "0.20")
 )
+# 单段途经点之间允许的最大爬升(m)。剪枝的 _line_free/_line_cost 都是**纯 2D**
+# 判据 —— "x/y 上是直线"不代表 3D 里能走。平地上 z 恒定所以看不出问题, 楼梯上
+# 就致命: 实测 save_map_stairs 上整条楼梯被压成一对途经点(水平 2.96m、爬升
+# 1.332m), 局部规划器拿到的是一条 25° 的空中直线, B 样条优化器只会把它从台阶
+# 体素里往外推, 狗就不沿路线走了。
+#
+# 0.20 ≈ 一级台阶的踢面高度加一点余量(elevation.ElevationParams.max_step 是
+# 0.25)。注意这跟"平地上不设间距上限"不矛盾: 上限不是按长度设的, 是按**爬升**
+# 设的 —— 平地爬升恒为 0, 一格不多插。
+GLOBAL_PLANNER_MAX_CLIMB_PER_SEGMENT_M = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_CLIMB_PER_SEGMENT_M", "0.20")
+)
 # 相邻途经点的硬下限(m)。低于 SCAN-Planner 的 0.2m 死区就生成不出轨迹
 # (planner_manager.cpp:94), 留一点余量取 0.25。**不要设上限** —— 间距该由代价
 # 门槛和几何决定, 人为插点只会白白截短 planner 的 5m 前瞻(mode 2 没有跨途经点的

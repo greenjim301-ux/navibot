@@ -238,7 +238,16 @@ async def plan_path(name: str, req: PlanPathRequest):
     说明)——给"只看看规划结果, 不想真的让机器狗动"这种预览场景用。
     """
     def compute() -> List[dict]:
-        raw_points = global_planner.plan_path(name, (req.start.x, req.start.y), (req.goal.x, req.goal.y))
+        # 把地面高程查询喂给剪枝: 它的 line-of-sight 判据是纯 2D 的, 不知道一条
+        # "x/y 上的直线"在 3D 里可能是条陡坡。楼梯上不给这个信息, 整条楼梯会被
+        # 压成一对途经点(实测水平 2.96m / 爬升 1.33m), 局部规划器没法跟。
+        def elevations(points: List[tuple]) -> List[Optional[float]]:
+            return [path_planner.ground_elevation(name, x, y) for x, y in points]
+
+        raw_points = global_planner.plan_path(
+            name, (req.start.x, req.start.y), (req.goal.x, req.goal.y),
+            elevation_fn=elevations,
+        )
         delta = route_manager.get_altitude_calibration(name)
         out = []
         for x, y in raw_points:
