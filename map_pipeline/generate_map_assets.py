@@ -81,7 +81,9 @@ import elevation
 Image.MAX_IMAGE_PIXELS = None
 
 
-# 大地图分片参数。只有跨度超过 TILE_EXTENT_THRESHOLD_M 的地图才分片 —— 小地图
+# 大地图分片参数。跨度超过 TILE_EXTENT_THRESHOLD_M **且**点数超过
+# TILED_OVERVIEW_TARGET_POINTS 的地图才分片(两个条件见 main() 里 will_tile
+# 的说明) —— 小地图
 # (室内房间尺度)整图一份预览的精度就够用, 强行分片反而不划算: 室内点云密度
 # 通常比室外结构高一个数量级以上(实测 wewe ~3000 点/m² vs big 密集处 ~240
 # 点/m²), 随便一个网格格子都会超预算, 变成"处处都要降采样", 质量不升反降。
@@ -641,7 +643,12 @@ def main():
     x_min, x_max, y_min, y_max = robust_xy_bounds(raw_points)
     z_min, z_max = float(raw_points[:, 2].min()), float(raw_points[:, 2].max())
     max_extent_xy = max(x_max - x_min, y_max - y_min)
-    will_tile = max_extent_xy > TILE_EXTENT_THRESHOLD_M
+    # 跨度够大**并且**点数确实装不下整图预览的预算, 才值得分片。跨度大但点数
+    # 本来就 <= TILED_OVERVIEW_TARGET_POINTS 时, 整图预览会原样导出每一个原始
+    # 点(见下面 [3/5] 的分支), 分片再怎么切也只能是同一批点 —— 白白多出十几个
+    # 文件和一遍降采样, 精度一点不涨。实测 save_map_large_1: 跨度 164.6m 但只有
+    # 124.9 万点, 旧逻辑照样切了 19 个分片, 而整图预览里那 124.9 万点一个没少。
+    will_tile = max_extent_xy > TILE_EXTENT_THRESHOLD_M and n_raw > TILED_OVERVIEW_TARGET_POINTS
     print(f"      x=[{x_min:.2f},{x_max:.2f}] y=[{y_min:.2f},{y_max:.2f}] z=[{z_min:.2f},{z_max:.2f}]"
           f"  跨度={max_extent_xy:.1f}m")
     _log_step_done(t_step)
@@ -786,10 +793,14 @@ def main():
     # TARGET_POINTS 的说明), 犯不着跟没有分片兜底的小地图一样按
     # max_preview_points 保精度 —— 那样只是白增加下载/显存, 缩小看整图的时候
     # 根本分辨不出多出来的点。
+    # 不分片的地图(小图, 以及跨度大但点数没超预算的图)走 max_preview_points ——
+    # 它们没有分片兜底, 整图预览就是唯一的细节来源, 精度不能省。注意显式传一个
+    # 很小的 --max-preview-points 时, 跨度大的图现在也不再有分片兜底了。
     overview_target = TILED_OVERVIEW_TARGET_POINTS if will_tile else args.max_preview_points
     if will_tile:
-        print(f"      跨度 {max_extent_xy:.1f}m > {TILE_EXTENT_THRESHOLD_M:.0f}m, 会生成分片, "
-              f"整图预览只做骨架层, 目标点数降到 {overview_target}")
+        print(f"      跨度 {max_extent_xy:.1f}m > {TILE_EXTENT_THRESHOLD_M:.0f}m 且点数 {n_raw} > "
+              f"{TILED_OVERVIEW_TARGET_POINTS}, 会生成分片, 整图预览只做骨架层, "
+              f"目标点数降到 {overview_target}")
     voxel_size = None
     if n_raw <= overview_target:
         print(f"      点数 {n_raw} <= {overview_target}, 不做降采样")
@@ -826,7 +837,8 @@ def main():
     t_step = time.perf_counter()
     tiles_meta = None
     if will_tile:
-        print(f"      地图跨度 {max_extent_xy:.1f}m > {TILE_EXTENT_THRESHOLD_M:.0f}m, 生成分片"
+        print(f"      地图跨度 {max_extent_xy:.1f}m > {TILE_EXTENT_THRESHOLD_M:.0f}m 且点数 {n_raw} > "
+              f"{TILED_OVERVIEW_TARGET_POINTS}, 生成分片"
               f"(整图预览只是骨架层, 分片用原始分辨率的点云按 "
               f"{TILE_SIZE_M:.0f}m 网格单独降采样, 每格最多 {TILE_POINT_BUDGET} 点)")
         tile_list = export_tiles(pcd_raw, out_dir, x_min, y_min,
@@ -840,7 +852,19 @@ def main():
         }
         print(f"      生成 {len(tile_list)} 个分片, 目录: {out_dir / 'tiles'}")
     else:
-        print(f"      地图跨度 {max_extent_xy:.1f}m <= {TILE_EXTENT_THRESHOLD_M:.0f}m, 不分片")
+        if max_extent_xy > TILE_EXTENT_THRESHOLD_M:
+            print(f"      地图跨度 {max_extent_xy:.1f}m > {TILE_EXTENT_THRESHOLD_M:.0f}m, 但点数 {n_raw} "
+                  f"<= {TILED_OVERVIEW_TARGET_POINTS}, 不分片(整图预览已经装得下全部原始点, "
+                  f"分片切出来还是同一批点)")
+        else:
+            print(f"      地图跨度 {max_extent_xy:.1f}m <= {TILE_EXTENT_THRESHOLD_M:.0f}m, 不分片")
+        # 这张图上一次可能是分过片的(改判据之前、或者换过一版点云), 留下来的
+        # tiles/ 已经没有 tiles_meta 指向它, 前端不会加载, 但会一直占着几十 MB,
+        # 还让人以为仍在用。产物目录本来每次预处理就整个重生成, 直接删掉。
+        stale_tiles = out_dir / "tiles"
+        if stale_tiles.is_dir():
+            shutil.rmtree(stale_tiles, ignore_errors=True)
+            print(f"      删掉上一次留下的 {stale_tiles}(这次不分片)")
 
     pc_meta = {
         "num_points": n_out,
