@@ -241,6 +241,14 @@ async def plan_path(name: str, req: PlanPathRequest):
     req.publish=False 时直接跳过下发这一步(见 PlanPathRequest.publish 的
     说明)——给"只看看规划结果, 不想真的让机器狗动"这种预览场景用。
     """
+    # 规划失败时前端只弹一句话, 现场没人能复现"当时点的到底是哪两个点"。请求一
+    # 进来就把地图名和起终点原样打出来, 跟下面失败那条日志配成一对, 照着 log 就
+    # 能用同样的参数在本地重跑一遍。
+    logger.info(
+        "plan_path: map=%s, 起点=(%.3f, %.3f), 终点=(%.3f, %.3f), publish=%s",
+        name, req.start.x, req.start.y, req.goal.x, req.goal.y, req.publish,
+    )
+
     def compute() -> List[dict]:
         # 把地面高程查询喂给剪枝: 它的 line-of-sight 判据是纯 2D 的, 不知道一条
         # "x/y 上的直线"在 3D 里可能是条陡坡。楼梯上不给这个信息, 整条楼梯会被
@@ -276,7 +284,25 @@ async def plan_path(name: str, req: PlanPathRequest):
     try:
         points = await run_in_threadpool(compute)
     except ValueError as e:
+        # global_planner.plan_path 抛的 ValueError 就是给用户看的失败原因(没有 2D
+        # 栅格图 / 起终点超出范围 / 落在禁行区 / 离障碍物太近 / 两点间无可行路径)。
+        # 它原本只进了 HTTP 400 的响应体, 后端日志里一点痕迹都没有。
+        logger.warning(
+            "plan_path: 规划失败, map=%s, 起点=(%.3f, %.3f), 终点=(%.3f, %.3f), 原因: %s",
+            name, req.start.x, req.start.y, req.goal.x, req.goal.y, e,
+        )
         raise HTTPException(400, str(e))
+    except Exception as e:
+        # 非 ValueError 的都是 bug(读图失败、numpy 报错之类), 不是"用户点错了"。
+        # 交给 FastAPI 兜成 500, 但先自己记一条带起终点的日志——500 的 traceback
+        # 里看不到请求参数。
+        logger.exception(
+            "plan_path: 规划异常, map=%s, 起点=(%.3f, %.3f), 终点=(%.3f, %.3f): %s",
+            name, req.start.x, req.start.y, req.goal.x, req.goal.y, e,
+        )
+        raise
+
+    logger.info("plan_path: 规划成功, map=%s, %d 个途经点", name, len(points))
 
     publish_error: Optional[str] = None
     if not req.publish:
