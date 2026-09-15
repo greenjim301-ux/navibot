@@ -51,7 +51,7 @@ map-data-dir/<name>/                 地图数据根目录 (默认 /home/lisi/Do
 web_assets/map/<name>/
     map_2d.pgm(+.yaml)      流水线重新生成的 2D 占据栅格图, 全局规划 (global_planner.py)
                             实际读的是这一份, 不是 map-data-dir 下那份原始图
-    topview.png             上面这份 2D 占据栅格图转成的展示用 PNG
+    topview.png             上面这份 2D 占据栅格图转成的展示用 PNG（逐像素一致，不改色）
     pointcloud.bin          降采样点云 (自定义 PCW1 格式), 供前端 3D 预览
     pointcloud_meta.json    点数/降采样体素/分片清单等
     topview_meta.json       坐标元数据(世界边界 + 2D 栅格图的分辨率/像素尺寸);
