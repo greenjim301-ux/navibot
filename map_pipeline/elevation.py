@@ -711,18 +711,38 @@ def clear_trajectory(
     ——全局规划器规划路径时本来就假设"轨迹周围这个半径内没有障碍物"(拿它膨胀
     障碍再规划), 这里只是让 2D 图跟这个假设保持一致, 不是另外发明一个容忍范围。
 
+    **换算方式必须跟 global_planner._dilate_bool 逐字一致**, 不能只是"传同一个
+    米数"。以前这里是 `int(round(radius / resolution))` 配**方形**核, 规划器那边
+    是 `ceil(radius / resolution)` 配**圆形**核: 同样的 0.25m, 在 0.1m/格的图上
+    这边清出半宽 2px(共 5px 宽)的带, 那边却按 3px 的圆盘吃回来——带子正中间的
+    格子离障碍恰好 3px, 正好被吃掉。于是"只靠轨迹清出来的通道"必然被规划器封死,
+    而且是**差整整一格**, 米数看着一样、日志里也看不出问题。
+
+    实测 save_map_large_1: 起终点在未膨胀的图上完全连通(free 区是一整块),
+    膨胀后被切成 34786 / 8708 两块, 沿途 64 个格子净空恰好 0.300m —— 全都踩在
+    轨迹上(离轨迹中位数 0.10m), 也就是全都是这个取整差造成的。
+
+    现在改成: 半径用跟规划器同一个 `ceil`, 核用同一个圆盘(dr²+dc² <= R², 由
+    EDT <= R 精确表达)。这样能给出一条硬保证——**清出来的格子经过规划器那次
+    膨胀之后一定还在**: 任何 occupied 格子离轨迹格子的距离都 > R(否则它早被这
+    里清成 free 了), 而膨胀只吃距离 <= R 的格子。轨迹按 resolution/2 重采样,
+    相邻种子格连续, 所以活下来的是一整条连通的带, 不是一串孤岛。
+
     直接原地改 grid 并返回。
     """
     x_min, x_max, y_min, y_max = bounds
     height, width = grid.shape
     traj = resample_polyline(trajectory, resolution / 2)
-    radius_px = max(1, int(round(radius / resolution)))
+    # ceil 而不是 round: 见 docstring。max(1, ...) 也照抄规划器。
+    radius_px = max(1, int(np.ceil(radius / resolution)))
     col = np.clip(((traj[:, 0] - x_min) / resolution).astype(np.int32), 0, width - 1)
     row = np.clip(((y_max - traj[:, 1]) / resolution).astype(np.int32), 0, height - 1)
-    for r, c in zip(row, col):
-        r0, r1 = max(0, r - radius_px), min(height, r + radius_px + 1)
-        c0, c1 = max(0, c - radius_px), min(width, c + radius_px + 1)
-        grid[r0:r1, c0:c1] = 254
+    seed = np.zeros((height, width), dtype=bool)
+    seed[row, col] = True
+    # EDT 给的是精确欧氏距离, `<= radius_px` 就是 dr²+dc² <= R² 那个圆盘, 跟
+    # global_planner._dilate_bool 按行拆圆盘(列半宽 floor(sqrt(R²-dr²)))覆盖的
+    # 格子集合完全相同。一次算完, 不用按轨迹点循环。
+    grid[distance_transform_edt(~seed) <= radius_px] = 254
     return grid
 
 
