@@ -91,7 +91,7 @@ Image.MAX_IMAGE_PIXELS = None
 # (p10 3.4cm, p90 15cm), 意味着体素小于 3~5cm 基本不再减少点数(见
 # voxel_downsample_to_target 的搜索曲线), 30m 网格 + 15 万点预算能让最密集的
 # 格子也不用压到比这更粗。
-TILE_EXTENT_THRESHOLD_M = 150.0
+TILE_EXTENT_THRESHOLD_M = 300.0
 TILE_SIZE_M = 30.0
 TILE_POINT_BUDGET = 150_000
 
@@ -573,7 +573,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default="mapdata/livingroom/dense_cloud_map.pcd")
     ap.add_argument("--outdir", default="web_assets/map")
-    ap.add_argument("--max-preview-points", type=int, default=3_000_000,
+    ap.add_argument("--max-preview-points", type=int, default=5_000_000,
                      help="3D 预览点数阈值: 不超过就原样导出, 超过则用固定体素大小降"
                           "采样到接近这个点数(voxel_downsample_to_target, 不是随机丢点)")
     ap.add_argument("--gen-2d-map", action=_BooleanOptionalAction, default=True,
@@ -608,7 +608,7 @@ def main():
                      help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
                           "误判——默认 0.25 跟 backend/app/config.py 的"
                           "GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致, 不要单独改")
-    ap.add_argument("--map2d-known-radius", type=float, default=1.0,
+    ap.add_argument("--map2d-known-radius", type=float, default=0.25,
                      help="离轨迹这个距离(m)以内的 free 格子算'已知'区域, 以外的降级成"
                           "map_server 的'未知'灰度(205)——不是不可通行, 全局规划器"
                           "(global_planner.py)只有明确占据才会挡, 未知区域只是规划代价更高,"
