@@ -42,6 +42,7 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
 from . import config
+from .models import MapEditKind, MapEditRegion
 
 RC = Tuple[int, int]
 XY = Tuple[float, float]
@@ -224,6 +225,18 @@ def _world_to_pixel(x: float, y: float, height: int, resolution: float,
     return row, col
 
 
+def _world_to_pixel_f(x: float, y: float, height: int, resolution: float,
+                       origin_x: float, origin_y: float) -> Tuple[float, float]:
+    """_world_to_pixel 的浮点版(不向下取整), 给多边形栅格化用。
+
+    跟另外两个换算严格一致: 格子 (r, c) 的中心落在 (r+0.5, c+0.5) —— 对
+    _pixel_to_world 反解一下就能验证, _rasterize_polygon 的格子中心判据依赖这一点。
+    """
+    col = (x - origin_x) / resolution
+    row = height - (y - origin_y) / resolution
+    return row, col
+
+
 def _pixel_to_world(row: int, col: int, height: int, resolution: float,
                      origin_x: float, origin_y: float) -> XY:
     x = origin_x + (col + 0.5) * resolution
@@ -336,6 +349,87 @@ def _line_cost(cost_weight: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> f
 # Bresenham 直连和 A* 实际走的锯齿路径即使代价场完全一样, 累加出来的浮点数
 # 也可能有极小的量级差异, 严格比较会把这类本该拉直的情况也保留成一堆多余拐点。
 _PRUNE_COST_TOLERANCE = 1.02
+
+
+def _rasterize_polygon(poly_rc: List[Tuple[float, float]], height: int, width: int) -> np.ndarray:
+    """把一个多边形(像素坐标的顶点列表, (row, col) 浮点)烧成格子掩膜。
+
+    偶奇规则(even-odd)射线法, 逐边向量化。自相交的多边形因此得到确定的
+    "内外交替"结果, 不报错(见 models.MapEditRegion)。
+
+    判据用**格子中心**: 格子 (r, c) 的中心是 (r+0.5, c+0.5)。用中心而不是左上角,
+    边界上的取舍才对称, 不会整体偏半格。
+
+    只在多边形的包围盒内计算 —— 大图(large 有 200 万格)上每个多边形都全图扫
+    会很慢, 而包围盒让开销只跟多边形自身大小成正比。
+
+    不用 scipy/PIL: backend 不依赖它们(见模块 docstring)。
+    """
+    mask = np.zeros((height, width), dtype=bool)
+    if len(poly_rc) < 3:
+        return mask
+
+    rs = np.array([p[0] for p in poly_rc], dtype=np.float64)
+    cs = np.array([p[1] for p in poly_rc], dtype=np.float64)
+    r0 = max(0, int(np.floor(rs.min())))
+    r1 = min(height - 1, int(np.ceil(rs.max())))
+    c0 = max(0, int(np.floor(cs.min())))
+    c1 = min(width - 1, int(np.ceil(cs.max())))
+    if r1 < r0 or c1 < c0:
+        return mask                       # 整个多边形都在图外
+
+    rr = np.arange(r0, r1 + 1, dtype=np.float64)[:, None] + 0.5
+    cc = np.arange(c0, c1 + 1, dtype=np.float64)[None, :] + 0.5
+    inside = np.zeros((r1 - r0 + 1, c1 - c0 + 1), dtype=bool)
+
+    n = len(poly_rc)
+    for i in range(n):
+        ra, ca = rs[i], cs[i]
+        rb, cb = rs[(i + 1) % n], cs[(i + 1) % n]
+        if ra == rb:
+            continue                      # 水平边不参与, 射线跟它平行
+        # 向 +col 方向投射射线: 这条边跨过本行时, 交点在格子中心右边就翻转一次。
+        straddles = (ra > rr) != (rb > rr)
+        cross_c = (cb - ca) * (rr - ra) / (rb - ra) + ca
+        inside ^= straddles & (cc < cross_c)
+
+    mask[r0:r1 + 1, c0:c1 + 1] = inside
+    return mask
+
+
+def _apply_edit_regions(prob: np.ndarray, regions: List[MapEditRegion], height: int, width: int,
+                         resolution: float, origin_x: float, origin_y: float) -> np.ndarray:
+    """把人工编辑的区域叠加到占据概率图上, 返回 (blocked_mask 供报错用)。
+
+    改的是 **prob**, 不是 blocked —— 一处生效、四处正确: 下游的 _blocked_mask /
+    膨胀 / _cost_weight / _wall_clearance_weight 全部从 prob 派生。
+      - blocked  -> prob = 1.0, 自动被膨胀、自动产生贴墙惩罚带
+      - passable -> prob = 0.0, 不但解除阻挡, 还顺带清掉"未知"的代价惩罚
+        (用户明确说这儿能走, 那就是验证过的), 也压过 --block-unscanned
+
+    **重叠时禁行优先**: 先铺 passable 再铺 blocked, 与添加顺序无关。
+
+    返回被标成禁行的掩膜, 给调用方区分"起点离障碍物太近"和"起点在禁行区内"。
+    """
+    blocked_paint = np.zeros((height, width), dtype=bool)
+    if not regions:
+        return blocked_paint
+
+    passable_paint = np.zeros((height, width), dtype=bool)
+    for region in regions:
+        poly_rc = [
+            _world_to_pixel_f(p.x, p.y, height, resolution, origin_x, origin_y)
+            for p in region.points
+        ]
+        mask = _rasterize_polygon(poly_rc, height, width)
+        if region.kind == MapEditKind.BLOCKED:
+            blocked_paint |= mask
+        else:
+            passable_paint |= mask
+
+    prob[passable_paint & ~blocked_paint] = 0.0
+    prob[blocked_paint] = 1.0
+    return blocked_paint
 
 
 def _climb_ok(ground_z: Optional[List[Optional[float]]], i: int, j: int,
@@ -483,6 +577,7 @@ def _enforce_min_spacing(path: List[RC], kept: List[int], free: np.ndarray, min_
 
 def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
                elevation_fn: Optional[Callable[[List[XY]], List[Optional[float]]]] = None,
+               edit_regions: Optional[List[MapEditRegion]] = None,
                ) -> List[XY]:
     """在 <map_name> 的 2D 栅格图上规划一条全局路径, 按机身半径膨胀障碍后跑
     A*, 剪枝成关键拐点, 返回世界坐标系 (x, y) 列表(含起点和终点, 不含 z——z
@@ -505,6 +600,12 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
     pgm = _read_pgm(pgm_path)
     height, width = pgm.shape
     prob = _prob(pgm, meta["negate"])
+    # 人工编辑的区域(见 map_edit_store.py)叠加在这里, 在一切派生量之前 ——
+    # 下面的 blocked / 膨胀 / cost_weight / wall_weight 全部从 prob 算出来,
+    # 所以只需要这一处。不传 edit_regions 就是原行为。
+    painted_blocked = _apply_edit_regions(
+        prob, edit_regions or [], height, width, resolution, origin_x, origin_y,
+    )
     blocked = _blocked_mask(prob, meta["occupied_thresh"])
     radius_px = max(1, math.ceil(config.GLOBAL_PLANNER_INFLATION_RADIUS_M / resolution))
     free = ~_dilate_bool(blocked, radius_px)
@@ -528,6 +629,10 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
         if not (0 <= r < height and 0 <= c < width):
             raise ValueError(f"{label}超出地图范围")
         if not free[r, c]:
+            # 落在人工画的禁行区里时, "离障碍物太近"这句话是误导的 —— 那里本来
+            # 没有障碍, 是用户自己标的。分开报, 否则用户会去地图上找不存在的墙。
+            if painted_blocked[r, c]:
+                raise ValueError(f"{label}在人工标注的禁行区内, 换个点或者先删掉那个区域")
             raise ValueError(
                 f"{label}离障碍物太近(膨胀半径 {config.GLOBAL_PLANNER_INFLATION_RADIUS_M:.2f}m), 换个点"
             )

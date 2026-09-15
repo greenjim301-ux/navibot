@@ -6,14 +6,17 @@ import {
   MapPin, CircleCheck, Trash2, Play, Flag, OctagonX,
 } from "lucide-react";
 import {
-  estop, listServices, planPath, setInflationMap, setSelfInflation, setSurfCloud, startService, stopService,
-  submitRoute,
+  addMapEdit, deleteMapEdit, estop, listMapEdits, listServices, planPath, setInflationMap,
+  setSelfInflation, setSurfCloud, startService, stopService, submitRoute, updateMapEdit,
 } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
-import type { PlannedRoutePoint, ServiceActiveState, ServiceInfo, TrailPoint, Waypoint, XY } from "../types";
+import type {
+  MapEditKind, MapEditRegion,
+  PlannedRoutePoint, ServiceActiveState, ServiceInfo, TrailPoint, Waypoint, XY,
+} from "../types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -297,6 +300,22 @@ export default function MapPreviewPage() {
     start: null, goal: null,
   });
   const [startGoalPicking, setStartGoalPicking] = useState(false);
+
+  // 地图编辑区域(人工标"这块其实能走"/"这块其实不能走", 见
+  // backend/app/map_edit_store.py)。**只在 2D 视图里编辑** —— 多边形是画在
+  // 栅格图上的世界坐标, 3D 视图里没有对应的作图平面。
+  const [regions, setRegions] = useState<MapEditRegion[]>([]);
+  const [regionDraftKind, setRegionDraftKind] = useState<MapEditKind | null>(null);
+  const [regionDraft, setRegionDraft] = useState<XY[]>([]);
+  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
+  const [regionError, setRegionError] = useState<string | null>(null);
+  const [regionsVisible, setRegionsVisible] = useState(true);
+
+  const refreshRegions = useCallback(() => {
+    if (!name) return;
+    listMapEdits(name).then((e) => setRegions(e.regions)).catch(() => setRegions([]));
+  }, [name]);
+  useEffect(refreshRegions, [refreshRegions]);
   const [plannedRoute, setPlannedRoute] = useState<PlannedRoutePoint[] | null>(null);
   const [planning, setPlanning] = useState(false);
   const hasStartGoal = Boolean(startGoal.start || startGoal.goal);
@@ -346,6 +365,7 @@ export default function MapPreviewPage() {
     // 手势, 三者语义互斥, 进拾取前把另外两个都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (startGoalPicking) setStartGoalPicking(false);
+    cancelRegionDraft();
     setRouteEditing(true);
   }
 
@@ -357,10 +377,67 @@ export default function MapPreviewPage() {
     setWaypoints(next.slice(-1));
   }
 
+  function cancelRegionDraft() {
+    setRegionDraftKind(null);
+    setRegionDraft([]);
+    setRegionError(null);
+  }
+
+  /** 开始画一块区域。跟另外三个拾取模式互斥(它们在 2D/3D 里共用同一个左键手势)。 */
+  function handleStartRegionDraft(kind: MapEditKind) {
+    if (regionDraftKind === kind) { cancelRegionDraft(); return; }
+    if (recentering) pcRef.current?.toggleRecenter();
+    if (routeEditing) setRouteEditing(false);
+    if (startGoalPicking) setStartGoalPicking(false);
+    setSelectedRegionId(null);
+    setRegionDraft([]);
+    setRegionError(null);
+    setRegionDraftKind(kind);
+  }
+
+  /** 完成当前多边形。后端还会再挡一次(少于 3 点、围不出面积), 这里只做最基本的
+   *  拦截, 免得白跑一次请求。 */
+  async function handleFinishRegion() {
+    if (!name || !regionDraftKind || regionDraft.length < 3) return;
+    try {
+      await addMapEdit(name, regionDraftKind, regionDraft);
+      cancelRegionDraft();
+      refreshRegions();
+      // 编辑区域会改变全局规划的结果, 上一次算出来的预览路线已经不作数了。
+      setPlannedRoute(null);
+    } catch (e) {
+      setRegionError(String(e));
+    }
+  }
+
+  async function handleDeleteRegion(id: string) {
+    if (!name) return;
+    try {
+      await deleteMapEdit(name, id);
+      setSelectedRegionId(null);
+      refreshRegions();
+      setPlannedRoute(null);
+    } catch (e) {
+      setRegionError(String(e));
+    }
+  }
+
+  async function handleToggleRegion(id: string, enabled: boolean) {
+    if (!name) return;
+    try {
+      await updateMapEdit(name, id, { enabled });
+      refreshRegions();
+      setPlannedRoute(null);
+    } catch (e) {
+      setRegionError(String(e));
+    }
+  }
+
   function handleStartStartGoalPick() {
     // 同上, 进起终点拾取前把"点选新中心点"/"设置目标点"都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (routeEditing) setRouteEditing(false);
+    cancelRegionDraft();
     setStartGoalPicking(true);
   }
 
@@ -568,6 +645,12 @@ export default function MapPreviewPage() {
                 showWaypointNumbers={false}
                 onChangeWaypoints={handleChangeGoalPoint}
                 editable={routeEditing}
+                regionDraftKind={regionDraftKind}
+                regionDraft={regionDraft}
+                onChangeRegionDraft={setRegionDraft}
+                regions={regionsVisible ? regions : []}
+                selectedRegionId={selectedRegionId}
+                onSelectRegion={setSelectedRegionId}
                 startGoalPickMode={startGoalPicking}
                 startGoal={startGoal}
                 onChangeStartGoal={setStartGoal}
@@ -887,12 +970,24 @@ export default function MapPreviewPage() {
                     />
                   </div>
                 </PanelSection>
+
               </div>
             </div>
           )}
           {panelOpen && (
             <MapDetailPanel
               onClose={() => setPanelOpen(false)}
+              regions={regions}
+              regionsVisible={regionsVisible}
+              onRegionsVisibleChange={setRegionsVisible}
+              canEditRegions={viewMode === "2d"}
+              regionDraftKind={regionDraftKind}
+              regionDraftCount={regionDraft.length}
+              regionError={regionError}
+              onStartRegionDraft={handleStartRegionDraft}
+              onFinishRegion={handleFinishRegion}
+              onDeleteRegion={handleDeleteRegion}
+              onToggleRegion={handleToggleRegion}
               viewMode={viewMode}
               onViewModeChange={setViewMode}
               height={effectiveHeightLimit}

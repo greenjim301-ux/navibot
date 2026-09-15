@@ -288,6 +288,23 @@ ROUTE_MAX_POINTS = int(os.environ.get("NAVIBOT_ROUTE_MAX_POINTS", "500"))
 ROUTE_MAX_NAME_LEN = 100
 ROUTE_MAX_NOTE_LEN = 2000
 
+# 地图编辑区域(人工标注的"这块其实能走"/"这块其实不能走")存储目录, 一张图一个
+# <map_name>.json, 见 map_edit_store.py。
+#
+# **不能烘进 map_2d.pgm**: map_registry.start_preprocess 每次都把
+# web_assets/map/<name>/ 整个重新生成, 烘进去的编辑会被无声抹掉。所以存成矢量
+# 多边形, 规划时(global_planner.plan_path)再叠加上去。
+#
+# **多边形存世界坐标, 不存像素**: 2D 图的分辨率是按地图跨度自动选的
+# (map_pipeline 的 _auto_map2d_resolution, 0.05~1.0m/格), 点云变一变跨度就可能
+# 跨档, 像素坐标会整体错位; 世界坐标跟途经点同一套约定, 重新预处理也不会失效。
+MAP_EDIT_DATA_DIR = os.environ.get(
+    "NAVIBOT_MAP_EDIT_DATA_DIR", os.path.join(_REPO_ROOT, "data", "map_edits"),
+)
+# 防滥用的护栏, 不是产品意义上的上限。
+MAP_EDIT_MAX_REGIONS = int(os.environ.get("NAVIBOT_MAP_EDIT_MAX_REGIONS", "200"))
+MAP_EDIT_MAX_VERTICES = int(os.environ.get("NAVIBOT_MAP_EDIT_MAX_VERTICES", "64"))
+
 CORS_ALLOW_ORIGINS = os.environ.get("NAVIBOT_CORS_ALLOW_ORIGINS", "*").split(",")
 
 # 单独起个常量: map_registry.py 激活地图前要检查这个服务是否在跑(见

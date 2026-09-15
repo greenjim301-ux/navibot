@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import "../../styles/map-detail-panel.css";
+import type { MapEditKind, MapEditRegion } from "../../types";
 
 type ViewMode = "3d" | "2d";
 
@@ -36,6 +37,21 @@ interface Props {
   onStartPreview: () => void;
   onFinishPreview: () => void;
   onClearPreview: () => void;
+  /** 地图编辑区域(见 backend/app/map_edit_store.py)。只在 2D 栅格图上画得了,
+   *  所以 canEditRegions 由页面按 viewMode 给。 */
+  /** 全部可选: 建图页(MappingPage)也复用这个面板, 那时还没有落盘的地图,
+   *  编辑区域无从谈起 —— 不传 onStartRegionDraft 整节就不渲染。 */
+  regions?: MapEditRegion[];
+  regionsVisible?: boolean;
+  onRegionsVisibleChange?: (visible: boolean) => void;
+  canEditRegions?: boolean;
+  regionDraftKind?: MapEditKind | null;
+  regionDraftCount?: number;
+  regionError?: string | null;
+  onStartRegionDraft?: (kind: MapEditKind) => void;
+  onFinishRegion?: () => void;
+  onDeleteRegion?: (id: string) => void;
+  onToggleRegion?: (id: string, enabled: boolean) => void;
   onCameraChange?: (preset: "跟随" | "自由" | "俯视" | "前视") => void;
   onPointDisplayChange?: (settings: { color: "高彩" | "深度" | "强度" | "灰色"; size: number; sample: number; opacity: number }) => void;
   onReferenceDisplayChange?: (settings: { axis: boolean; axisSize: number; grid: boolean; gridRadius: number; gridRadials: number; gridCircles: number; gridColor: string }) => void;
@@ -74,7 +90,6 @@ export function MapDetailPanel(props: Props) {
   const [sample, setSample] = useState(0);
   const [opacity, setOpacity] = useState(0.3);
   const [camera, setCamera] = useState("俯视");
-  const [forbidden, setForbidden] = useState(true);
   const [video, setVideo] = useState(false);
   const [videoMode, setVideoMode] = useState("左单目");
   useEffect(() => {
@@ -109,12 +124,51 @@ export function MapDetailPanel(props: Props) {
         <Toggle label="实时点云" checked={props.realtimeCloud} disabled={props.viewMode === "2d" || props.realtimeBusy} onChange={props.onRealtimeCloudChange} />
       </Section>
 
-      <Section title="禁行区">
-        <Toggle label="显示禁行区" checked={forbidden} onChange={setForbidden} />
-        <div className="map-detail-panel__row"><span>所有禁行区</span><div><em>0 个</em><button type="button">查看</button></div></div>
-        <div className="map-detail-panel__row"><span>绘制禁行区</span><button type="button">添加</button></div>
-        <p>至少添加 3 个顶点形成闭环</p>
-      </Section>
+      {/* 地图编辑: 人工圈出"这块其实能走"/"这块其实不能走", 补救 detect_structure
+          的误判。存的是世界坐标的矢量多边形, 不烘进 map_2d.pgm(预处理每次都会
+          重生成那张图), 全局规划时后端叠加; 重叠时禁行优先。
+          **只影响全局规划**, 管不住 SCAN-Planner 的局部避障。 */}
+      {props.onStartRegionDraft && <Section title="地图编辑">
+        <Toggle label="显示编辑区域" checked={props.regionsVisible ?? true} onChange={props.onRegionsVisibleChange ?? (() => {})} />
+        {!props.canEditRegions && <p>切到 2D 栅格图才能编辑</p>}
+        <div className="map-detail-panel__row"><span>绘制可通行区</span>
+          <button type="button" className={props.regionDraftKind === "passable" ? "active" : ""}
+            disabled={!props.canEditRegions}
+            title="把被误判成障碍的地方改回能走"
+            onClick={() => props.onStartRegionDraft?.("passable")}>
+            {props.regionDraftKind === "passable" ? "取消" : "添加"}
+          </button>
+        </div>
+        <div className="map-detail-panel__row"><span>绘制禁行区</span>
+          <button type="button" className={props.regionDraftKind === "blocked" ? "active" : ""}
+            disabled={!props.canEditRegions}
+            title="把被误判成可通行的地方改成不能走"
+            onClick={() => props.onStartRegionDraft?.("blocked")}>
+            {props.regionDraftKind === "blocked" ? "取消" : "添加"}
+          </button>
+        </div>
+        {props.regionDraftKind && <div className="map-detail-panel__row">
+          <span>已 {props.regionDraftCount ?? 0} 个顶点</span>
+          <button type="button" className="primary" disabled={(props.regionDraftCount ?? 0) < 3}
+            onClick={props.onFinishRegion}>完成</button>
+        </div>}
+        <p>至少添加 3 个顶点形成闭环{props.regionDraftKind ? " · 左键加点, 右键撤销" : ""}</p>
+        {props.regionError && <p style={{ color: "#f88" }}>{props.regionError}</p>}
+        <div className="map-detail-panel__row"><span>已有区域</span><div><em>{(props.regions ?? []).length} 个</em></div></div>
+        {(props.regions ?? []).map((r) => (
+          <div className="map-detail-panel__row" key={r.id}>
+            <span style={{ color: r.kind === "passable" ? "#18a66e" : "#d74747" }}>
+              {r.kind === "passable" ? "可通行" : "禁行"} · {r.points.length} 点{r.enabled ? "" : "(停用)"}
+            </span>
+            <div>
+              <button type="button" onClick={() => props.onToggleRegion?.(r.id, !r.enabled)}>
+                {r.enabled ? "停用" : "启用"}
+              </button>
+              <button type="button" className="danger" onClick={() => props.onDeleteRegion?.(r.id)}>删除</button>
+            </div>
+          </div>
+        ))}
+      </Section>}
 
       <Section title="摄像机" initiallyOpen={false}>
         <Toggle label="显示视频" checked={video} onChange={setVideo} />

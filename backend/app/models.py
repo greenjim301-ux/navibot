@@ -265,6 +265,49 @@ class RouteRecord(BaseModel):
     updated_at: float
 
 
+class MapEditKind(str, Enum):
+    PASSABLE = "passable"
+    """人工标"这块其实能走"——补救被误判成障碍的区域。"""
+    BLOCKED = "blocked"
+    """人工标"这块其实不能走"——补救被误判成可通行的区域。"""
+
+
+class MapEditRegion(BaseModel):
+    """地图上人工标注的一块多边形区域, 见 map_edit_store.py。
+
+    **points 是世界坐标 (m) 的顶点列表, 不是像素** —— 理由见 config.py 的
+    MAP_EDIT_DATA_DIR。首尾不重复(闭合是隐含的), 至少 3 个点。
+
+    自相交的多边形不拒绝: 栅格化用**偶奇规则**(even-odd), 结果是确定的
+    (内外交替), 只是语义上"里面"可能不是画的人直觉以为的那块。
+    """
+    id: str
+    kind: MapEditKind
+    points: List[XY] = Field(min_length=3)
+    note: str = ""
+    enabled: bool = True
+    """临时停用而不删除。比删了重画方便, 成本几乎为零。"""
+    created_at: float
+
+
+class MapEdits(BaseModel):
+    map_name: str
+    regions: List[MapEditRegion] = []
+    updated_at: float
+
+
+class CreateMapEditRequest(BaseModel):
+    kind: MapEditKind
+    points: List[XY] = Field(min_length=3)
+    note: str = ""
+
+
+class UpdateMapEditRequest(BaseModel):
+    """目前只用来开关 enabled; 要改形状就删了重画(顶点级编辑不值得为它做)。"""
+    enabled: Optional[bool] = None
+    note: Optional[str] = None
+
+
 class CreateRouteRequest(BaseModel):
     name: str
     map_name: str

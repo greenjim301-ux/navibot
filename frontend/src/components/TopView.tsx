@@ -3,7 +3,7 @@ import { Stage, Layer, Image as KonvaImage, Circle, Line, Text, RegularPolygon, 
 import useImage from "use-image";
 import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import type { NavStatus, PlannedRoutePoint, Topview2D, Waypoint, XY } from "../types";
+import type { MapEditKind, MapEditRegion, NavStatus, PlannedRoutePoint, Topview2D, Waypoint, XY } from "../types";
 import { mapAssetUrl } from "../api";
 import { pixelToWorld, worldToPixel } from "../types";
 
@@ -31,6 +31,16 @@ interface Props {
    *  独立的线、颜色不同(见下面 NAV_ROUTE_COLOR), 可能同时非空——跟
    *  PointCloudView 的同名 prop 语义一致, 不做互斥/优先级合并。 */
   navRoute?: PlannedRoutePoint[] | null;
+  /** "画编辑区域"模式: 非 null 时左键加顶点、右键删最后一个顶点, 跟 editable /
+   *  startGoalPickMode 三者互斥。草稿多边形的状态由调用方持有(跟 waypoints 一样
+   *  是受控的), 这里只负责手势和渲染。 */
+  regionDraftKind?: MapEditKind | null;
+  regionDraft?: XY[];
+  onChangeRegionDraft?: (points: XY[]) => void;
+  /** 已保存的编辑区域, 半透明填充: 绿=可通行, 红=禁行; 停用的画成虚线描边。 */
+  regions?: MapEditRegion[];
+  selectedRegionId?: string | null;
+  onSelectRegion?: (id: string | null) => void;
   status: NavStatus | null;
   maxWidth?: number;
   /** 画布可视高度上限, 内容超出的部分靠拖拽/缩放查看, 不传则不限制高度 */
@@ -101,6 +111,12 @@ const NAV_ROUTE_COLOR = "#ec4899";
 const ROBOT_RADIUS_PX = 10;
 const ROBOT_STROKE_PX = 1.5;
 const HOVER_RADIUS_PX = 4;
+// 编辑区域: 绿=可通行(把误判的障碍改回能走), 红=禁行(把误判的空地改成不能走)。
+// 填充压得很淡, 免得盖住底图上真正的障碍轮廓。
+const REGION_FILL = { passable: "rgba(24,166,110,0.28)", blocked: "rgba(215,71,71,0.28)" };
+const REGION_STROKE = { passable: "#18a66e", blocked: "#d74747" };
+const REGION_STROKE_PX = 1.5;
+const REGION_VERTEX_RADIUS_PX = 4;
 
 /**
  * 把展示画布的世界坐标范围扩展成以原点 (0,0) 对称的区间, 这样原点总是落在
@@ -123,6 +139,8 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
   showWaypointNumbers = true,
   startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
+  regionDraftKind = null, regionDraft = [], onChangeRegionDraft,
+  regions = [], selectedRegionId = null, onSelectRegion,
   maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight, defaultZoom = DEFAULT_ZOOM,
   showControls = true, onViewChange,
 }, ref) {
@@ -232,7 +250,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
 
   function handleClick(e: KonvaEventObject<MouseEvent>) {
-    if (!editable && !startGoalPickMode) return;
+    if (!editable && !startGoalPickMode && !regionDraftKind) return;
     if (!e.target.getStage()) return;
     // 在内容 Group 上取相对指针位置, 会自动把当前的缩放/拖拽/旋转都换算掉,
     // 拿到跟旋转前完全一样的内容坐标系坐标, 换算逻辑不用因为加了旋转而改变。
@@ -241,6 +259,11 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
     const col = pointer.x / baseScale;
     const row = pointer.y / baseScale;
     const { x, y } = pixelToWorld(centeredMeta, col, row);
+
+    if (regionDraftKind) {
+      onChangeRegionDraft?.([...regionDraft, { x, y }]);
+      return;
+    }
 
     if (startGoalPickMode) {
       const current = startGoal ?? { start: null, goal: null };
@@ -263,6 +286,11 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   // 用不着像途经点删除那样靠"点在标记上"来确定删哪个。
   function handleContextMenu(e: KonvaEventObject<PointerEvent>) {
     e.evt.preventDefault();
+    if (regionDraftKind) {
+      // 撤销最后一个顶点, 跟途经点"右键删"是同一个手势
+      if (regionDraft.length > 0) onChangeRegionDraft?.(regionDraft.slice(0, -1));
+      return;
+    }
     if (!startGoalPickMode) return;
     const current = startGoal ?? { start: null, goal: null };
     if (current.goal) {
@@ -311,7 +339,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
         // generate_map_assets.py export_topview_png 的注释: negate=0 时黑占据/
         // 白空闲/灰未知), 图里大片留白区域就是这个颜色——画布背景跟它对齐,
         // 图片边缘/画布没铺满的地方才不会露出一圈色差。
-        style={{ cursor: editable || startGoalPickMode ? "crosshair" : "default", background: "#cdcdcd" }}
+        style={{ cursor: editable || startGoalPickMode || regionDraftKind ? "crosshair" : "default", background: "#cdcdcd" }}
       >
         <Layer>
           <Group
@@ -356,6 +384,68 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               strokeWidth={ORIGIN_CROSS_STROKE_PX / zoom}
               listening={false}
             />
+
+            {/* 人工编辑的区域, 画在最底下(途经点/路线要压在它上面才看得清)。
+                半透明填充 + 实线描边; 停用的只画虚线描边不填充。 */}
+            {regions.map((region) => {
+              const pts = region.points.flatMap((pt) => {
+                const p = worldToPixel(centeredMeta, pt.x, pt.y);
+                return [p.col * baseScale, p.row * baseScale];
+              });
+              if (pts.length < 6) return null;
+              const selected = region.id === selectedRegionId;
+              return (
+                <Line
+                  key={region.id}
+                  points={pts}
+                  closed
+                  fill={region.enabled ? REGION_FILL[region.kind] : undefined}
+                  stroke={REGION_STROKE[region.kind]}
+                  strokeWidth={(selected ? REGION_STROKE_PX * 2 : REGION_STROKE_PX) / zoom}
+                  dash={region.enabled ? undefined : [6 / zoom, 4 / zoom]}
+                  onClick={(e) => { e.cancelBubble = true; onSelectRegion?.(selected ? null : region.id); }}
+                  onTap={(e) => { e.cancelBubble = true; onSelectRegion?.(selected ? null : region.id); }}
+                />
+              );
+            })}
+
+            {/* 正在画的那个: 虚线 + 顶点圆点, 3 点以上才闭合填充(让用户看出
+                "现在够不够成一个区域") */}
+            {regionDraftKind && regionDraft.length > 0 && (() => {
+              const pts = regionDraft.flatMap((pt) => {
+                const p = worldToPixel(centeredMeta, pt.x, pt.y);
+                return [p.col * baseScale, p.row * baseScale];
+              });
+              const closed = regionDraft.length >= 3;
+              return (
+                <Group listening={false}>
+                  {regionDraft.length >= 2 && (
+                    <Line
+                      points={pts}
+                      closed={closed}
+                      fill={closed ? REGION_FILL[regionDraftKind] : undefined}
+                      stroke={REGION_STROKE[regionDraftKind]}
+                      strokeWidth={REGION_STROKE_PX / zoom}
+                      dash={[6 / zoom, 4 / zoom]}
+                    />
+                  )}
+                  {regionDraft.map((pt, i) => {
+                    const p = worldToPixel(centeredMeta, pt.x, pt.y);
+                    return (
+                      <Circle
+                        key={i}
+                        x={p.col * baseScale}
+                        y={p.row * baseScale}
+                        radius={REGION_VERTEX_RADIUS_PX / zoom}
+                        fill={REGION_STROKE[regionDraftKind]}
+                        stroke="#fff"
+                        strokeWidth={1 / zoom}
+                      />
+                    );
+                  })}
+                </Group>
+              );
+            })()}
 
             {/* 途经点之间的直连虚线只表达顺序, 不代表真会走直线 */}
             {linePoints.length >= 4 && (
@@ -476,7 +566,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               />
             )}
 
-            {(editable || startGoalPickMode) && hover && (
+            {(editable || startGoalPickMode || regionDraftKind) && hover && (
               <Circle x={hover.x} y={hover.y} radius={HOVER_RADIUS_PX / zoom} fill="rgba(37,99,235,0.4)" listening={false} />
             )}
           </Group>
@@ -500,7 +590,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               background: "rgba(255,255,255,0.8)", padding: "1px 5px", borderRadius: 3,
             }}
           >
-            {Math.round(zoom * 100)}% · {rotation}° · 滚轮缩放 / 拖拽平移{editable ? " / 左键加点 · 右键删点" : startGoalPickMode ? " / 左键设起终点 · 右键撤销" : ""}
+            {Math.round(zoom * 100)}% · {rotation}° · 滚轮缩放 / 拖拽平移{editable ? " / 左键加点 · 右键删点" : startGoalPickMode ? " / 左键设起终点 · 右键撤销" : regionDraftKind ? " / 左键加顶点 · 右键撤销" : ""}
           </div>
         </>
       )}

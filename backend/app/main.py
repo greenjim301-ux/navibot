@@ -10,11 +10,14 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from . import config
+from .map_edit_store import MapEditStore
 from .map_registry import MapRegistry
 from .mapping_manager import MappingManager
 from .models import (
+    CreateMapEditRequest,
     CreateRouteRequest,
     GroundZRequest, GroundZResponse,
+    MapEditRegion, MapEdits,
     MapInfo, NavStatus,
     InflationMapRequest,
     MappingModeInfo, MappingStatus,
@@ -24,7 +27,7 @@ from .models import (
     ServiceInfo,
     StartMappingRequest,
     SurfCloudRequest,
-    UpdateRouteRequest,
+    UpdateMapEditRequest, UpdateRouteRequest,
 )
 from . import global_planner
 from . import path_planner
@@ -86,6 +89,7 @@ route_manager: Optional[RouteManager] = None
 mapping_manager: Optional[MappingManager] = None
 ros_bridge: Optional[RosBridge] = None
 map_registry = MapRegistry()
+map_edit_store = MapEditStore()
 route_store = RouteStore(map_registry)
 service_manager = ServiceManager()
 
@@ -247,6 +251,8 @@ async def plan_path(name: str, req: PlanPathRequest):
         raw_points = global_planner.plan_path(
             name, (req.start.x, req.start.y), (req.goal.x, req.goal.y),
             elevation_fn=elevations,
+            # 人工编辑的可通行/禁行区域(见 map_edit_store.py)。只取 enabled 的。
+            edit_regions=map_edit_store.active_regions(name),
         )
         delta = route_manager.get_altitude_calibration(name)
         out = []
@@ -355,6 +361,64 @@ async def delete_map(name: str):
         await run_in_threadpool(map_registry.delete_map, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # 人工编辑的区域跟着一起删: 删掉再用同名重建的话, 新图的坐标系(SLAM 原点)
+    # 可能完全不同, 旧编辑套上去会落在毫无关系的地方。放在这里而不是
+    # map_registry 里, 是为了避免 map_edit_store <-> map_registry 循环导入。
+    await run_in_threadpool(map_edit_store.delete_all, name)
+
+
+# ---- 地图编辑区域 (map_edit_store.py) ----
+# 人工圈出"这块其实能走"/"这块其实不能走", 补救 detect_structure 的误判。
+# **存的是矢量多边形(世界坐标), 不烘进 map_2d.pgm** —— 预处理每次都会把那张图
+# 整个重生成。全局规划时由 global_planner.plan_path 叠加, 见那边的
+# _apply_edit_regions。重叠时禁行优先。
+
+
+@app.get("/api/maps/{name}/edits", response_model=MapEdits)
+async def list_map_edits(name: str):
+    """没编辑过的地图返回空列表, 不是 404。"""
+    try:
+        return await run_in_threadpool(map_edit_store.get_edits, name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/maps/{name}/edits", response_model=MapEditRegion, status_code=201)
+async def add_map_edit(name: str, req: CreateMapEditRequest):
+    info = await run_in_threadpool(map_registry.get_map_info, name)
+    if info is None:
+        raise HTTPException(404, f"地图 '{name}' 不存在")
+    try:
+        return await run_in_threadpool(
+            map_edit_store.add_region, name, req.kind, req.points, req.note,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/maps/{name}/edits/{region_id}", response_model=MapEditRegion)
+async def update_map_edit(name: str, region_id: str, req: UpdateMapEditRequest):
+    """目前只用来开关 enabled(临时停用而不删除); 改形状请删了重画。"""
+    try:
+        return await run_in_threadpool(
+            map_edit_store.update_region, name, region_id, req.enabled, req.note,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/maps/{name}/edits/{region_id}", status_code=204)
+async def delete_map_edit(name: str, region_id: str):
+    try:
+        await run_in_threadpool(map_edit_store.delete_region, name, region_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
 
 
 # ---- 巡检路线 (route_store.py) ----
