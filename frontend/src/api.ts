@@ -1,5 +1,4 @@
 import type {
-  MapEditKind, MapEditRegion, MapEdits,
   MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint,
   RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, Waypoint, XY,
 } from "./types";
@@ -153,48 +152,6 @@ export async function planPath(
   });
   const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
   return { points: data.points, published: data.published, publishError: data.publish_error };
-}
-
-// ---- 地图编辑区域 (见 backend/app/map_edit_store.py) ----
-// 人工圈出"这块其实能走"/"这块其实不能走", 补救 detect_structure 的误判。
-// 存的是世界坐标的矢量多边形, 不烘进 map_2d.pgm(预处理每次都会重生成那张图),
-// 全局规划时由后端叠加。重叠时禁行优先。
-
-/** 没编辑过的地图返回空列表, 不是 404。 */
-export async function listMapEdits(mapName: string): Promise<MapEdits> {
-  return asJson(await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/edits`));
-}
-
-export async function addMapEdit(
-  mapName: string, kind: MapEditKind, points: XY[], note = "",
-): Promise<MapEditRegion> {
-  return asJson(
-    await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/edits`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind, points, note }),
-    }),
-  );
-}
-
-/** 目前只用来开关 enabled(临时停用); 改形状请删了重画。 */
-export async function updateMapEdit(
-  mapName: string, regionId: string, patch: { enabled?: boolean; note?: string },
-): Promise<MapEditRegion> {
-  return asJson(
-    await fetch(
-      `${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/edits/${encodeURIComponent(regionId)}`,
-      { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) },
-    ),
-  );
-}
-
-export async function deleteMapEdit(mapName: string, regionId: string): Promise<void> {
-  const res = await fetch(
-    `${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/edits/${encodeURIComponent(regionId)}`,
-    { method: "DELETE" },
-  );
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
 }
 
 // ---- 巡检路线 (存储型 CRUD, 见 backend/app/route_store.py) ----

@@ -6,23 +6,19 @@ import {
   MapPin, CircleCheck, Trash2, Play, Flag, OctagonX,
 } from "lucide-react";
 import {
-  addMapEdit, deleteMapEdit, estop, listMapEdits, listServices, planPath, setInflationMap,
-  setSelfInflation, setSurfCloud, startService, stopService, submitRoute, updateMapEdit,
+  estop, listServices, planPath, setInflationMap, setSelfInflation, setSurfCloud, startService, stopService,
+  submitRoute,
 } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
-import type {
-  MapEditKind, MapEditRegion,
-  PlannedRoutePoint, ServiceActiveState, ServiceInfo, TrailPoint, Waypoint, XY,
-} from "../types";
+import type { PlannedRoutePoint, ServiceActiveState, ServiceInfo, TrailPoint, Waypoint, XY } from "../types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import { MapDetailPanel } from "../components/map-detail/MapDetailPanel";
 
 const HEIGHT_LIMIT_STEP = 0.25;
 // 「自身膨胀」「膨胀地图」这两个图层开关先隐藏入口(订阅/渲染逻辑不动, 保留
@@ -225,14 +221,12 @@ export default function MapPreviewPage() {
   // 下用不上", 比直接消失更不容易让人以为是漏了什么。PointCloudView/TopView
   // 本身倒是按需整个装卸载(两边都可能是几百万点/整张大图, 没必要同时占着)。
   const [viewMode, setViewMode] = useState<ViewMode>("3d");
-  const [pointDisplay, setPointDisplay] = useState<{ color: "高彩" | "深度" | "强度" | "灰色"; size: number; sample: number; opacity: number }>({ color: "深度", size: 0.20, sample: 0, opacity: 0.3 });
-  const [referenceDisplay, setReferenceDisplay] = useState({ axis: true, axisSize: 0.5, grid: true, gridRadius: 50, gridRadials: 16, gridCircles: 5, gridColor: "#444444" });
 
   // 高度限制(世界系绝对 z, 米), 高于这个高度的点云不渲染, 由 PointCloudView
   // 用裁剪平面实现。滑杆范围钉在这份地图自己的 [z_min, z_max] 之间 —— 这两个
   // 值要等 topview_meta 加载完才知道, 所以初值是 null, 拿到 meta 后默认给
   // z_max(不裁剪, 显示全部点云)。
-  const [heightLimit, setHeightLimit] = useState<number | null>(1.0);
+  const [heightLimit, setHeightLimit] = useState<number | null>(null);
   // 是否处于"点选新中心点"模式, 由 PointCloudView 通过 onRecenterModeChange
   // 回调同步过来(点选成功 / resetView 都会自动关闭), 纯用来控制按钮高亮和
   // 提示条的显示, 不直接驱动任何 three.js 逻辑。
@@ -300,22 +294,6 @@ export default function MapPreviewPage() {
     start: null, goal: null,
   });
   const [startGoalPicking, setStartGoalPicking] = useState(false);
-
-  // 地图编辑区域(人工标"这块其实能走"/"这块其实不能走", 见
-  // backend/app/map_edit_store.py)。**只在 2D 视图里编辑** —— 多边形是画在
-  // 栅格图上的世界坐标, 3D 视图里没有对应的作图平面。
-  const [regions, setRegions] = useState<MapEditRegion[]>([]);
-  const [regionDraftKind, setRegionDraftKind] = useState<MapEditKind | null>(null);
-  const [regionDraft, setRegionDraft] = useState<XY[]>([]);
-  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
-  const [regionError, setRegionError] = useState<string | null>(null);
-  const [regionsVisible, setRegionsVisible] = useState(true);
-
-  const refreshRegions = useCallback(() => {
-    if (!name) return;
-    listMapEdits(name).then((e) => setRegions(e.regions)).catch(() => setRegions([]));
-  }, [name]);
-  useEffect(refreshRegions, [refreshRegions]);
   const [plannedRoute, setPlannedRoute] = useState<PlannedRoutePoint[] | null>(null);
   const [planning, setPlanning] = useState(false);
   const hasStartGoal = Boolean(startGoal.start || startGoal.goal);
@@ -365,7 +343,6 @@ export default function MapPreviewPage() {
     // 手势, 三者语义互斥, 进拾取前把另外两个都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (startGoalPicking) setStartGoalPicking(false);
-    cancelRegionDraft();
     setRouteEditing(true);
   }
 
@@ -377,67 +354,10 @@ export default function MapPreviewPage() {
     setWaypoints(next.slice(-1));
   }
 
-  function cancelRegionDraft() {
-    setRegionDraftKind(null);
-    setRegionDraft([]);
-    setRegionError(null);
-  }
-
-  /** 开始画一块区域。跟另外三个拾取模式互斥(它们在 2D/3D 里共用同一个左键手势)。 */
-  function handleStartRegionDraft(kind: MapEditKind) {
-    if (regionDraftKind === kind) { cancelRegionDraft(); return; }
-    if (recentering) pcRef.current?.toggleRecenter();
-    if (routeEditing) setRouteEditing(false);
-    if (startGoalPicking) setStartGoalPicking(false);
-    setSelectedRegionId(null);
-    setRegionDraft([]);
-    setRegionError(null);
-    setRegionDraftKind(kind);
-  }
-
-  /** 完成当前多边形。后端还会再挡一次(少于 3 点、围不出面积), 这里只做最基本的
-   *  拦截, 免得白跑一次请求。 */
-  async function handleFinishRegion() {
-    if (!name || !regionDraftKind || regionDraft.length < 3) return;
-    try {
-      await addMapEdit(name, regionDraftKind, regionDraft);
-      cancelRegionDraft();
-      refreshRegions();
-      // 编辑区域会改变全局规划的结果, 上一次算出来的预览路线已经不作数了。
-      setPlannedRoute(null);
-    } catch (e) {
-      setRegionError(String(e));
-    }
-  }
-
-  async function handleDeleteRegion(id: string) {
-    if (!name) return;
-    try {
-      await deleteMapEdit(name, id);
-      setSelectedRegionId(null);
-      refreshRegions();
-      setPlannedRoute(null);
-    } catch (e) {
-      setRegionError(String(e));
-    }
-  }
-
-  async function handleToggleRegion(id: string, enabled: boolean) {
-    if (!name) return;
-    try {
-      await updateMapEdit(name, id, { enabled });
-      refreshRegions();
-      setPlannedRoute(null);
-    } catch (e) {
-      setRegionError(String(e));
-    }
-  }
-
   function handleStartStartGoalPick() {
     // 同上, 进起终点拾取前把"点选新中心点"/"设置目标点"都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (routeEditing) setRouteEditing(false);
-    cancelRegionDraft();
     setStartGoalPicking(true);
   }
 
@@ -592,11 +512,11 @@ export default function MapPreviewPage() {
 
       {info?.status === "ready" && info.topview_meta && (() => {
         const { z_min: zMin, z_max: zMax } = info.topview_meta.world_bounds;
-        const effectiveHeightLimit = Math.min(zMax, Math.max(zMin, heightLimit ?? 1.0));
+        const effectiveHeightLimit = heightLimit ?? zMax;
         const topview2d = info.topview_meta.topview2d;
         return (
         <>
-          {viewMode === "3d" ? (<>
+          {viewMode === "3d" ? (
             <PointCloudView
               ref={pcRef}
               mapName={name}
@@ -608,17 +528,6 @@ export default function MapPreviewPage() {
               trail={isActive ? trail : null}
               optimalTraj={isActive && !optimalTrajHidden ? optimalTraj : null}
               heightLimit={effectiveHeightLimit}
-              displayPointSize={pointDisplay.size}
-              displayColorMode={pointDisplay.color}
-              displaySampleSize={pointDisplay.sample}
-              displayOpacity={pointDisplay.opacity}
-              referenceAxisVisible={referenceDisplay.axis}
-              referenceAxisSize={referenceDisplay.axisSize}
-              referenceGridVisible={referenceDisplay.grid}
-              referenceGridRadius={referenceDisplay.gridRadius}
-              referenceGridRadials={referenceDisplay.gridRadials}
-              referenceGridCircles={referenceDisplay.gridCircles}
-              referenceGridColor={referenceDisplay.gridColor}
               controlMode="fixed"
               enableFollow
               showFollowButton={false}
@@ -635,7 +544,7 @@ export default function MapPreviewPage() {
               inflationMap={inflationMap}
               surfCloud={surfCloud}
             />
-          </>) : topview2d ? (
+          ) : topview2d ? (
             <div className="flex size-full items-center justify-center">
               <TopView
                 ref={tvRef}
@@ -645,12 +554,6 @@ export default function MapPreviewPage() {
                 showWaypointNumbers={false}
                 onChangeWaypoints={handleChangeGoalPoint}
                 editable={routeEditing}
-                regionDraftKind={regionDraftKind}
-                regionDraft={regionDraft}
-                onChangeRegionDraft={setRegionDraft}
-                regions={regionsVisible ? regions : []}
-                selectedRegionId={selectedRegionId}
-                onSelectRegion={setSelectedRegionId}
                 startGoalPickMode={startGoalPicking}
                 startGoal={startGoal}
                 onChangeStartGoal={setStartGoal}
@@ -703,7 +606,7 @@ export default function MapPreviewPage() {
             </div>
           )}
 
-          {false && panelOpen && (
+          {panelOpen && (
             <div className="absolute top-0 right-0 z-10 flex h-full w-72 flex-col border-l border-white/10 bg-neutral-900/90 text-white/90 backdrop-blur-md">
               <div className="flex shrink-0 items-center justify-between border-b border-white/10 px-4 py-3">
                 <span className="text-sm font-medium">显示面板</span>
@@ -848,10 +751,10 @@ export default function MapPreviewPage() {
                     right={plannerService && (
                       <span className={cn(
                         "font-medium",
-                        PLANNER_SERVICE_STATE_DISPLAY[plannerService!.active_state].className,
+                        PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].className,
                       )}
                       >
-                        {PLANNER_SERVICE_STATE_DISPLAY[plannerService!.active_state].text}
+                        {PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].text}
                       </span>
                     )}
                   >
@@ -970,64 +873,8 @@ export default function MapPreviewPage() {
                     />
                   </div>
                 </PanelSection>
-
               </div>
             </div>
-          )}
-          {panelOpen && (
-            <MapDetailPanel
-              onClose={() => setPanelOpen(false)}
-              regions={regions}
-              regionsVisible={regionsVisible}
-              onRegionsVisibleChange={setRegionsVisible}
-              canEditRegions={viewMode === "2d"}
-              regionDraftKind={regionDraftKind}
-              regionDraftCount={regionDraft.length}
-              regionError={regionError}
-              onStartRegionDraft={handleStartRegionDraft}
-              onFinishRegion={handleFinishRegion}
-              onDeleteRegion={handleDeleteRegion}
-              onToggleRegion={handleToggleRegion}
-              viewMode={viewMode}
-              onViewModeChange={setViewMode}
-              height={effectiveHeightLimit}
-              minHeight={zMin}
-              maxHeight={zMax}
-              onHeightChange={setHeightLimit}
-              realtimeCloud={surfCloudEnabled}
-              realtimeBusy={surfCloudBusy}
-              onRealtimeCloudChange={handleToggleSurfCloud}
-              following={following}
-              canFollow={viewMode === "3d" && hasPose}
-              onFollowingChange={() => pcRef.current?.toggleFollow()}
-              recentering={recentering}
-              onToggleRecenter={() => pcRef.current?.toggleRecenter()}
-              onResetView={() => pcRef.current?.resetView()}
-              goalEditing={routeEditing}
-              canSetGoal={!navRunning && !startGoalPicking}
-              onToggleGoal={handleToggleGoalPick}
-              onClearGoal={() => {
-                setWaypoints([]);
-                setTrail([]);
-                setDispatchedRoute(null);
-                setOptimalTrajHidden(true);
-              }}
-              canClearGoal={waypoints.length > 0}
-              canStart={waypoints.length > 0 && hasPose}
-              busy={submitting}
-              navigating={navRunning}
-              onStart={handleStartNav}
-              onStop={handleStopNav}
-              previewEditing={startGoalPicking}
-              previewBusy={planning}
-              hasPreview={hasStartGoal || plannedRoute != null}
-              onStartPreview={handleStartStartGoalPick}
-              onFinishPreview={handleFinishStartGoalPick}
-              onClearPreview={handleClearPlannedRoute}
-              onCameraChange={(preset) => pcRef.current?.setCameraPreset(preset)}
-              onPointDisplayChange={setPointDisplay}
-              onReferenceDisplayChange={setReferenceDisplay}
-            />
           )}
         </>
         );

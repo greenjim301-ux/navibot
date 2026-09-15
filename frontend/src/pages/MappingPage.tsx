@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, Save } from "lucide-react";
+import { ArrowLeft, Crosshair, RefreshCw, Save, Target } from "lucide-react";
 import { cancelMapping, getMappingStatus, preprocessMap, saveMapping } from "../api";
 import { useMappingStatus } from "../useMappingStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
-import { MapDetailPanel } from "../components/map-detail/MapDetailPanel";
 import type { NavStatus, TopviewMeta } from "../types";
 import { Button } from "@/components/ui/button";
+import { Slider } from "@/components/ui/slider";
 import {
   AlertDialog, AlertDialogTrigger, AlertDialogContent, AlertDialogHeader,
   AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction,
@@ -14,7 +14,9 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 
+const HEIGHT_LIMIT_STEP = 0.25;
 // 没有真实点云数据前, 高度滑杆先给一个够用的默认范围, 收到 /surround_map_cloud
 // 数据后按观察到的 z 范围只扩不缩(见下面 zRange 状态)。
 const DEFAULT_Z_MIN = -2;
@@ -84,7 +86,7 @@ export default function MappingPage() {
     }
   }, [status?.state, checked, checkError, navigate, name]);
 
-  const [heightLimit, setHeightLimit] = useState<number | null>(1.0);
+  const [heightLimit, setHeightLimit] = useState<number | null>(null);
   const [zRange, setZRange] = useState({ min: DEFAULT_Z_MIN, max: DEFAULT_Z_MAX });
   useEffect(() => {
     if (surroundCloud.length < 3) return;
@@ -99,18 +101,13 @@ export default function MappingPage() {
     if (changed) setZRange({ min, max });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [surroundCloud]);
-  const effectiveHeightLimit = Math.min(zRange.max, Math.max(zRange.min, heightLimit ?? 1.0));
+  const effectiveHeightLimit = heightLimit ?? zRange.max;
 
   const [recentering, setRecentering] = useState(false);
   const [following, setFollowing] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
-  const [realtimeCloud, setRealtimeCloud] = useState(true);
-  const [pointDisplay, setPointDisplay] = useState<{ color: "高彩" | "深度" | "强度" | "灰色"; size: number; sample: number; opacity: number }>({ color: "深度", size: 0.20, sample: 0, opacity: 0.3 });
-  const [referenceDisplay, setReferenceDisplay] = useState({
-    axis: true, axisSize: 0.5, grid: true, gridRadius: 50, gridRadials: 16, gridCircles: 5, gridColor: "#444444",
-  });
 
   // 把 /tf 来的位姿包成 PointCloudView 认识的 NavStatus 形状, 好复用它已有的
   // 机器狗 marker 渲染逻辑——那段逻辑只读 status.robot_pose, 其余字段填中性值
@@ -124,19 +121,6 @@ export default function MappingPage() {
       updated_at: pose.stamp, reference_path_active: false,
     };
   }, [pose]);
-
-  // 覆盖范围采用建图坐标系中的 XY 包围盒；它来自当前真实点云，而不是根据高度
-  // 猜测。数据尚未到达时自然显示为 0。
-  const mappingStats = useMemo(() => {
-    const points = surfCloud.length >= 3 ? surfCloud : surroundCloud;
-    if (points.length < 3) return { count: 0, coverage: 0 };
-    let xMin = Infinity; let xMax = -Infinity; let yMin = Infinity; let yMax = -Infinity;
-    for (let index = 0; index + 2 < points.length; index += 3) {
-      xMin = Math.min(xMin, points[index]); xMax = Math.max(xMax, points[index]);
-      yMin = Math.min(yMin, points[index + 1]); yMax = Math.max(yMax, points[index + 1]);
-    }
-    return { count: Math.floor((surroundCloud.length + surfCloud.length) / 3), coverage: Math.max(0, (xMax - xMin) * (yMax - yMin)) };
-  }, [surroundCloud, surfCloud]);
 
   async function handleCancel() {
     setCancelling(true);
@@ -207,16 +191,8 @@ export default function MappingPage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      <div className="absolute bottom-3 left-3 z-10 min-w-64 rounded-md border border-white/20 bg-black/55 px-4 py-3 text-sm text-white/85 backdrop-blur">
-        <p className="mb-2 font-medium text-white">实时建图信息</p>
-        <div className="grid grid-cols-2 gap-x-5 gap-y-1 text-xs text-white/65">
-          <span>累计点云 <b className="ml-1 font-mono text-cyan-200">{mappingStats.count.toLocaleString()}</b></span>
-          <span>覆盖面积 <b className="ml-1 font-mono text-cyan-200">{mappingStats.coverage.toFixed(1)} m²</b></span>
-        </div>
-        <div className="mt-3 flex gap-2">
-          <Button size="sm" onClick={() => setSaveDialogOpen(true)} disabled={saving}><Save />{saving ? "保存中…" : "保存地图"}</Button>
-          <Button size="sm" variant="outline" onClick={handleCancel} disabled={cancelling}>{cancelling ? "取消中…" : "取消建图"}</Button>
-        </div>
+      <div className="absolute bottom-3 left-3 z-10 rounded-md border border-white/20 bg-black/40 px-3 py-1.5 text-sm text-white/80 backdrop-blur">
+        {name}
       </div>
 
       {(errorMessage || saveError) && (
@@ -231,8 +207,8 @@ export default function MappingPage() {
         meta={LIVE_META}
         liveOnly
         status={navStatus}
-        surroundCloud={realtimeCloud ? surroundCloud : []}
-        surfCloud={realtimeCloud ? surfCloud : []}
+        surroundCloud={surroundCloud}
+        surfCloud={surfCloud}
         heightLimit={effectiveHeightLimit}
         controlMode="fixed"
         robotMarkerStyle="tripod"
@@ -240,56 +216,67 @@ export default function MappingPage() {
         showFollowButton={false}
         onRecenterModeChange={setRecentering}
         onFollowingChange={setFollowing}
-        displayPointSize={pointDisplay.size}
-        displayColorMode={pointDisplay.color}
-        displaySampleSize={pointDisplay.sample}
-        displayOpacity={pointDisplay.opacity}
-        referenceAxisVisible={referenceDisplay.axis}
-        referenceAxisSize={referenceDisplay.axisSize}
-        referenceGridVisible={referenceDisplay.grid}
-        referenceGridRadius={referenceDisplay.gridRadius}
-        referenceGridRadials={referenceDisplay.gridRadials}
-        referenceGridCircles={referenceDisplay.gridCircles}
-        referenceGridColor={referenceDisplay.gridColor}
       />
 
-      <MapDetailPanel
-        onClose={handleCancel}
-        viewMode="3d"
-        onViewModeChange={() => {}}
-        height={effectiveHeightLimit}
-        minHeight={zRange.min}
-        maxHeight={zRange.max}
-        onHeightChange={setHeightLimit}
-        realtimeCloud={realtimeCloud}
-        realtimeBusy={false}
-        onRealtimeCloudChange={setRealtimeCloud}
-        following={following}
-        canFollow={Boolean(pose)}
-        onFollowingChange={() => pcRef.current?.toggleFollow()}
-        recentering={recentering}
-        onToggleRecenter={() => pcRef.current?.toggleRecenter()}
-        onResetView={() => pcRef.current?.resetView()}
-        goalEditing={false}
-        canSetGoal={false}
-        onToggleGoal={() => {}}
-        onClearGoal={() => {}}
-        canClearGoal={false}
-        canStart={false}
-        busy={false}
-        navigating={false}
-        onStart={() => {}}
-        onStop={() => {}}
-        previewEditing={false}
-        previewBusy={false}
-        hasPreview={false}
-        onStartPreview={() => {}}
-        onFinishPreview={() => {}}
-        onClearPreview={() => {}}
-        onCameraChange={(preset) => pcRef.current?.setCameraPreset(preset)}
-        onPointDisplayChange={setPointDisplay}
-        onReferenceDisplayChange={setReferenceDisplay}
-      />
+      <div className="absolute top-0 right-0 z-10 flex h-full w-64 flex-col gap-4 border-l border-white/10 bg-neutral-900/90 p-4 text-white/90 backdrop-blur-md">
+        <div>
+          <div className="mb-2 flex items-center justify-between text-xs text-white/70">
+            <span>高度限制</span>
+            <span className="font-mono">{effectiveHeightLimit.toFixed(2)}m</span>
+          </div>
+          <Slider
+            min={zRange.min}
+            max={zRange.max}
+            step={HEIGHT_LIMIT_STEP}
+            value={[effectiveHeightLimit]}
+            onValueChange={([v]) => setHeightLimit(v)}
+          />
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <button
+            type="button"
+            onClick={() => pcRef.current?.toggleFollow()}
+            disabled={!pose}
+            title={pose ? undefined : "还没有收到机器狗位姿"}
+            className={cn(
+              "flex items-center gap-2.5 rounded-md border px-3 py-2 text-left text-sm transition-colors disabled:opacity-40",
+              following
+                ? "border-cyan-400/40 bg-cyan-500/20 text-cyan-100"
+                : "border-white/10 bg-white/5 text-white/80 hover:bg-white/10",
+            )}
+          >
+            <Crosshair className="size-4 shrink-0" />
+            {following ? "跟随中" : "跟随机器狗"}
+          </button>
+          <button
+            type="button"
+            onClick={() => pcRef.current?.toggleRecenter()}
+            className={cn(
+              "flex items-center gap-2.5 rounded-md border px-3 py-2 text-left text-sm transition-colors",
+              recentering
+                ? "border-cyan-400/40 bg-cyan-500/20 text-cyan-100"
+                : "border-white/10 bg-white/5 text-white/80 hover:bg-white/10",
+            )}
+          >
+            <Target className="size-4 shrink-0" />
+            {recentering ? "点击点云取消" : "点选旋转中心"}
+          </button>
+          <button
+            type="button"
+            onClick={() => pcRef.current?.resetView()}
+            className="flex items-center gap-2.5 rounded-md border border-white/10 bg-white/5 px-3 py-2 text-left text-sm text-white/80 transition-colors hover:bg-white/10"
+          >
+            <RefreshCw className="size-4 shrink-0" />
+            重置视角
+          </button>
+        </div>
+
+        <Button className="mt-auto" onClick={() => setSaveDialogOpen(true)} disabled={saving}>
+          <Save />
+          {saving ? "保存中…" : "保存"}
+        </Button>
+      </div>
 
       <Dialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen}>
         <DialogContent className="sm:max-w-md">
