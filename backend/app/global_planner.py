@@ -575,6 +575,44 @@ def _enforce_min_spacing(path: List[RC], kept: List[int], free: np.ndarray, min_
     return out
 
 
+def _split_long_segments(points: List[XY], max_spacing: float) -> List[XY]:
+    """相邻途经点超过 max_spacing 就把这一段等分插点, 返回新的点列。
+
+    **为什么要有上限**(以及为什么这里以前写着"不要设上限")见 config 里
+    GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 的说明 —— 一句话: SCAN-Planner 的
+    navi_mode=2 一次只规划到下一个航点, 中间是一条两点五次曲线, 它偏离直线弦的
+    横向鼓包跟段长成正比, 所以**航点间距就是"允许局部规划器自由发挥的长度"**。
+
+    等分而不是"按 max_spacing 切完留个零头": 零头段会短很多, 既没必要也会让间距
+    分布变得没规律。ceil(L / max_spacing) 份, 每份长度 L/ceil(...) <= max_spacing。
+
+    插出来的点落在弦上, 而每一段弦都被 _prune_path/_enforce_min_spacing 用
+    _line_free 验证过无碰撞, 所以这一步不会引入碰撞。
+
+    z 不在这里管 —— 调用方对每个点单独查 ground_elevation(见 main.py 的
+    plan_path), 插出来的点拿到的是**它自己那个位置**的地面高度, 不是两端的线性
+    插值。所以插点会让 z 剖面更贴合真实地面, 但**不保证单段爬升变小**: 实测
+    save_map_small_1 末尾那段平面 2.26m、两端 z 只差 0.038m, 等分之后中点的地面
+    高度是 44.359 —— 中间实际凹下去 0.24m, 原来那一段只是采样太粗没看见。于是
+    "超过 max_climb 的段"从 1 个变成 2 个。这不是变差, 是原来在撒谎; 但改完之后
+    爬升超限会更容易被看到, 别误判成爬升判据回归了。
+
+    max_spacing <= 0 表示关掉这一步, 原样返回。
+    """
+    if max_spacing <= 0 or len(points) < 2:
+        return points
+
+    out: List[XY] = [points[0]]
+    for (x0, y0), (x1, y1) in zip(points[:-1], points[1:]):
+        dist = math.hypot(x1 - x0, y1 - y0)
+        n = int(math.ceil(dist / max_spacing)) if dist > max_spacing else 1
+        for k in range(1, n):
+            t = k / n
+            out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        out.append((x1, y1))
+    return out
+
+
 def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
                elevation_fn: Optional[Callable[[List[XY]], List[Optional[float]]]] = None,
                edit_regions: Optional[List[MapEditRegion]] = None,
@@ -663,5 +701,9 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
         raw, kept, free, config.GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M / resolution,
         ground_z=ground_z, max_climb=max_climb,
     )
-    return [_pixel_to_world(*raw[i], height=height, resolution=resolution,
-                             origin_x=origin_x, origin_y=origin_y) for i in kept]
+    points = [_pixel_to_world(*raw[i], height=height, resolution=resolution,
+                              origin_x=origin_x, origin_y=origin_y) for i in kept]
+    # 最后一步, 在世界坐标上做: 插点是纯几何的等分, 跟像素网格没关系, 也不该再回
+    # 去碰 raw 的下标(插出来的点本来就不在 A* 路径上)。放在最小间距兜底**之后** ——
+    # 那一步只删点不加点, 顺序上不冲突, 反过来先插再删会把刚插的点又删掉。
+    return _split_long_segments(points, config.GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M)

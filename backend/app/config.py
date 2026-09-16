@@ -99,11 +99,50 @@ GLOBAL_PLANNER_MAX_CLIMB_PER_SEGMENT_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_CLIMB_PER_SEGMENT_M", "0.20")
 )
 # 相邻途经点的硬下限(m)。低于 SCAN-Planner 的 0.2m 死区就生成不出轨迹
-# (planner_manager.cpp:94), 留一点余量取 0.25。**不要设上限** —— 间距该由代价
-# 门槛和几何决定, 人为插点只会白白截短 planner 的 5m 前瞻(mode 2 没有跨途经点的
-# min-snap, 均匀间距没有收益), 长段超过 4m 时 planner 自己会插点。
+# (planner_manager.cpp:94), 留一点余量取 0.25。
 GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M", "0.25")
+)
+# 相邻途经点的上限(m): 超过就把这一段等分插点。
+#
+# 这里以前写着"**不要设上限**, 人为插点只会白白截短 planner 的 5m 前瞻, 均匀间距
+# 没有收益"。**那个判断是错的**, 两条理由都站不住 —— 去读 SCAN-Planner 的
+# navi_mode=2 链路(scan_replan_fsm.cpp:254 planNextWaypoint):
+#
+# 1. 它**一次只规划到下一个航点**: planGlobalTraj(start, v0, 0, 航点, 0, 0), 两个
+#    点 → one_segment_traj_gen, 一条五次曲线。所谓"全局参考"从来不是我们下发的
+#    那条折线, 而是"当前位置 → 下一个航点"这一段曲线。
+# 2. getLocalTarget() 沿这条曲线走 planning_horizon_(5.0m)找局部目标, 但曲线全长
+#    就是航点间距。间距 < 5m 时走不满, local_target_pt_ 直接就是航点本身 ——
+#    **航点间距才是 mode 2 的有效前瞻**, 那个 5m 根本没生效, 谈不上"被截短"。
+#
+# 而五次曲线偏离直线弦的横向鼓包**跟段长成正比**(复刻 one_segment_traj_gen 实测,
+# max_vel=0.75, T=2L/max_vel, 狗以夹角 α 进入这一段):
+#
+#     段长      α=15°   30°    45°
+#     3.70m     0.38   0.73   1.03     <- 实测 save_map_small_1 上的最长段
+#     1.50m     0.15   0.30   0.42
+#     1.00m     0.10   0.20   0.28
+#
+# 同一条路线的走廊净空中位只有 0.54m(10 分位 0.41m)。3.70m 的段配 30° 入口就能
+# 鼓出 0.73m —— 参考曲线本身跑到可通行区外面去了, B 样条优化器拿着一条穿墙的初值
+# 去优化。窄路两边是沟的场景尤其危险: 沟是**负障碍**, detect_structure 的机体高度
+# 带判据和 planner 的实时 ESDF 都不一定看得见它, 没有把曲线拉回来的梯度。
+#
+# 取值窗口: 下限 ~0.5m(waypoint_arrival_radius_ 0.3m + reboundReplan 的 0.2m
+# 死区, 再密就是 4183847 修过的"点太密"), 上限按上表选。默认 1.0 把 45° 入口的
+# 鼓包压在 0.28m 以内。设成 0 或负数关掉这一步。
+#
+# 插的点落在弦上, 而每一段弦都被 _prune_path/_enforce_min_spacing 用 _line_free
+# 验证过无碰撞, 所以插点不改变几何、不引入新的碰撞风险; 而且等分之后同一条直线上
+# 相邻段的转角是 0, 鼓包直接归零(这也是为什么等分插值比"把 A* 原路径的点塞回去"
+# 更好 —— 后者会把 8 连通网格的锯齿重新引进来, 转角变大, 反而更鼓)。
+#
+# 一个副作用: 插出来的点各自查自己位置的 ground_elevation, z 剖面会更贴真实地面,
+# 于是**原来被粗采样掩盖的爬升会冒出来**(实测这条路线超 max_climb 的段 1 -> 2 个)。
+# 是原来在撒谎, 不是这一步把路弄陡了, 见 _split_long_segments 的说明。
+GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M", "1.0")
 )
 # 2D 栅格图里灰度 205("未知", map_pipeline/elevation.py 的 mark_known_region
 # 标的——离建图轨迹超过一定距离的 free 格子)不算不可通行(那是 occupied_thresh
