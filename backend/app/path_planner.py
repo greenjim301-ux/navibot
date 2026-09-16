@@ -96,6 +96,19 @@ def _load_trajectory(map_name: str) -> Optional[np.ndarray]:
     return resampled
 
 
+def mapping_trajectory(map_name: str) -> Optional[np.ndarray]:
+    """建图轨迹 xyz(N, 3), 没有这张图的 keyframe 文件就返回 None。
+
+    就是 ground_elevation 用的那一份 —— 已经滤掉定位失败帧、按 RESAMPLE_STEP_M
+    (0.2m)重采样过, 也走同一个 mtime 缓存。z 是**机体高度**(建图时 SLAM 输出的
+    位姿, 跟 3D 预览的点云同一个坐标系), 不是地面高程, 也不叠加 route_manager
+    的 Δ 标定 —— 那个 Δ 是给"规划出来的途经点"对齐实机 odom.z 用的, 这条线是
+    历史事实, 原样给出去。
+
+    直接返回内部缓存的数组, 调用方不要原地改它。"""
+    return _load_trajectory(map_name)
+
+
 def ground_elevation(map_name: Optional[str], x: float, y: float) -> Optional[float]:
     """(x, y) 最近的建图轨迹点的高度, 当作该点的地面高度近似(不区分楼层/不做
     多值检测, 见模块 docstring)——不设距离上限, 途经点很少正好落在机器狗走过

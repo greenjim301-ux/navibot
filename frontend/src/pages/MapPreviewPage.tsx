@@ -6,8 +6,8 @@ import {
   MapPin, CircleCheck, Trash2, Play, Flag, OctagonX,
 } from "lucide-react";
 import {
-  estop, listServices, planPath, setInflationMap, setSelfInflation, setSurfCloud, startService, stopService,
-  submitRoute,
+  estop, getMapTrajectory, listServices, planPath, setInflationMap, setSelfInflation, setSurfCloud,
+  startService, stopService, submitRoute,
 } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
@@ -234,6 +234,28 @@ export default function MapPreviewPage() {
   // 镜头是否跟随机器狗, 由 PointCloudView 通过 onFollowingChange 回调同步过来。
   const [following, setFollowing] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+
+  // 建图轨迹图层。静态数据, 开关第一次打开时才去拉(几百米的图约一两千个点),
+  // 拉到就一直留着, 关掉只是不画, 不重新请求。null = 还没拉过。
+  const [mappingTrailOn, setMappingTrailOn] = useState(false);
+  const [mappingTrail, setMappingTrail] = useState<TrailPoint[] | null>(null);
+  const [mappingTrailError, setMappingTrailError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!name || !mappingTrailOn || mappingTrail) return;
+    let cancelled = false;
+    getMapTrajectory(name)
+      .then((pts) => {
+        if (cancelled) return;
+        setMappingTrail(pts);
+        // 空数组不是错误, 是"这张图没有 keyframe_info_3d.txt"(见 api.ts), 但
+        // 开关开着却什么都没画会让人以为是坏了, 所以给一句说明。
+        setMappingTrailError(pts.length === 0 ? "这张地图没有建图轨迹数据" : null);
+      })
+      .catch((e) => {
+        if (!cancelled) setMappingTrailError(String(e));
+      });
+    return () => { cancelled = true; };
+  }, [name, mappingTrailOn, mappingTrail]);
 
   // TopView 是 Konva Stage, 要显式像素宽高, 不像 PointCloudView 那样能自己撑满
   // 容器——这页整个是 h-svh 铺满视口, 直接跟着 window 尺寸走就行, 不需要
@@ -526,6 +548,7 @@ export default function MapPreviewPage() {
               showWaypointNumbers={false}
               status={goalMarkerStatus}
               trail={isActive ? trail : null}
+              mappingTrail={mappingTrailOn ? mappingTrail : null}
               optimalTraj={isActive && !optimalTrajHidden ? optimalTraj : null}
               heightLimit={effectiveHeightLimit}
               controlMode="fixed"
@@ -559,6 +582,7 @@ export default function MapPreviewPage() {
                 onChangeStartGoal={setStartGoal}
                 plannedRoute={plannedRoute}
                 navRoute={isActive ? dispatchedRoute : null}
+                mappingTrail={mappingTrailOn ? mappingTrail : null}
                 status={goalMarkerStatus}
                 maxWidth={viewportSize.width}
                 maxHeight={viewportSize.height}
@@ -651,6 +675,21 @@ export default function MapPreviewPage() {
                       onValueChange={([v]) => setHeightLimit(v)}
                     />
                   </div>
+
+                  {/* 建图轨迹是地图自带的静态数据(不是 ROS 实时图层), 2D/3D
+                      都画得出来, 所以放在"地图"里而不是只对激活地图开放的
+                      "图层"里, 也不跟着 viewMode 置灰。 */}
+                  <label className="mt-4 flex items-center justify-between text-xs text-white/70">
+                    建图轨迹
+                    <Switch
+                      className={PANEL_SWITCH_CLASS}
+                      checked={mappingTrailOn}
+                      onCheckedChange={setMappingTrailOn}
+                    />
+                  </label>
+                  {mappingTrailOn && mappingTrailError && (
+                    <p className="mt-1.5 text-[11px] leading-relaxed text-amber-300/80">{mappingTrailError}</p>
+                  )}
                 </PanelSection>
 
                 {!isActive && (

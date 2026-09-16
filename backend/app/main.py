@@ -17,7 +17,7 @@ from .models import (
     CreateMapEditRequest,
     CreateRouteRequest,
     GroundZRequest, GroundZResponse,
-    MapEditRegion, MapEdits,
+    MapEditRegion, MapEdits, MapTrajectoryResponse,
     MapInfo, NavStatus,
     InflationMapRequest,
     MappingModeInfo, MappingStatus,
@@ -222,6 +222,24 @@ async def map_ground(name: str, req: GroundZRequest):
 
     zs = await run_in_threadpool(compute)
     return GroundZResponse(z=zs)
+
+
+@app.get("/api/maps/{name}/trajectory", response_model=MapTrajectoryResponse)
+async def map_trajectory(name: str):
+    """建图时机器狗走过的轨迹, 地图预览页的"建图轨迹"图层用。
+
+    没有 keyframe 文件时返回空列表而不是 404 —— "这张图没有轨迹数据"是个正常
+    状态(只导了点云的旧图就是这样), 前端把开关置灰即可, 不该弹错误提示。
+    """
+    def compute() -> List[dict]:
+        traj = path_planner.mapping_trajectory(name)
+        if traj is None:
+            return []
+        return [{"x": float(x), "y": float(y), "z": float(z)} for x, y, z in traj]
+
+    points = await run_in_threadpool(compute)
+    logger.info("map_trajectory: map=%s, %d 个点", name, len(points))
+    return MapTrajectoryResponse(points=points)
 
 
 @app.post("/api/maps/{name}/plan_path", response_model=PlanPathResponse)

@@ -1,6 +1,6 @@
 import type {
   MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint,
-  RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, Waypoint, XY,
+  RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, TrailPoint, Waypoint, XY,
 } from "./types";
 
 export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "http://localhost:8000";
@@ -152,6 +152,19 @@ export async function planPath(
   });
   const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
   return { points: data.points, published: data.published, publishError: data.publish_error };
+}
+
+/** 建图时机器狗走过的轨迹 (map 系, z 是机体高度不是地面高程, 不叠加 Δ 标定 ——
+ *  跟 3D 预览的点云和机器狗 marker 同一个坐标系)。
+ *
+ *  **返回空数组是正常状态**, 不是错误: 只导了点云、没有 keyframe_info_3d.txt
+ *  的旧地图就是这样, 调用方把开关置灰即可, 别弹报错。
+ *
+ *  后端已经按 0.2m 重采样过(见 path_planner.RESAMPLE_STEP_M), 几百米的图也就
+ *  一两千个点, 不用再抽稀。 */
+export async function getMapTrajectory(mapName: string): Promise<TrailPoint[]> {
+  const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/trajectory`);
+  return (await asJson<{ points: TrailPoint[] }>(res)).points;
 }
 
 // ---- 巡检路线 (存储型 CRUD, 见 backend/app/route_store.py) ----

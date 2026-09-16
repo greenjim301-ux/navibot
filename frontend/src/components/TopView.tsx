@@ -31,6 +31,10 @@ interface Props {
    *  独立的线、颜色不同(见下面 NAV_ROUTE_COLOR), 可能同时非空——跟
    *  PointCloudView 的同名 prop 语义一致, 不做互斥/优先级合并。 */
   navRoute?: PlannedRoutePoint[] | null;
+  /** 建图时机器狗走过的轨迹, 只读的背景参考线(琥珀色, 跟 PointCloudView 里
+   *  那条同色)。**画在最底下、最先渲染**, 途经点/路线都压在它上面 —— 它是
+   *  用来对照"哪些地方实地走过"的底图, 不是操作对象。只用 x/y, z 用不上。 */
+  mappingTrail?: XY[] | null;
   status: NavStatus | null;
   maxWidth?: number;
   /** 画布可视高度上限, 内容超出的部分靠拖拽/缩放查看, 不传则不限制高度 */
@@ -83,6 +87,8 @@ const WAYPOINT_STROKE_PX = 1.5;
 const WAYPOINT_LABEL_OFFSET_PX = { x: 9, y: -8 };
 const WAYPOINT_LABEL_FONT_PX = 13;
 const ROUTE_LINE_STROKE_PX = 2;
+const MAPPING_TRAIL_STROKE_PX = 1.5;
+const MAPPING_TRAIL_COLOR = "#f59e0b";
 const ROUTE_LINE_DASH_PX: [number, number] = [6, 4];
 // 起点/终点标记跟途经点同一套画法(圆点+编号位置的文字), 颜色/文字区分开:
 // 绿色"起", 红色"终"——跟 PointCloudView 的起终点标记同一套配色。
@@ -123,6 +129,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
   showWaypointNumbers = true,
   startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
+  mappingTrail = null,
   maxWidth = DEFAULT_MAX_STAGE_WIDTH, maxHeight, defaultZoom = DEFAULT_ZOOM,
   showControls = true, onViewChange,
 }, ref) {
@@ -286,6 +293,11 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
     return [p.col * baseScale, p.row * baseScale];
   });
 
+  const mappingTrailPoints = (mappingTrail ?? []).flatMap((q) => {
+    const p = worldToPixel(centeredMeta, q.x, q.y);
+    return [p.col * baseScale, p.row * baseScale];
+  });
+
   const btnStyle: CSSProperties = {
     width: 26, height: 26, lineHeight: "24px", padding: 0,
     background: "rgba(255,255,255,0.9)", border: "1px solid #ccc", borderRadius: 4,
@@ -338,6 +350,17 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
             offsetX={contentCenter.x} offsetY={contentCenter.y}
             rotation={rotation}
           >
+            {/* 建图轨迹画在最底下: 原点十字/途经点/路线都压在它上面 */}
+            {mappingTrailPoints.length >= 4 && (
+              <Line
+                points={mappingTrailPoints}
+                stroke={MAPPING_TRAIL_COLOR}
+                strokeWidth={MAPPING_TRAIL_STROKE_PX / zoom}
+                opacity={0.85}
+                listening={false}
+              />
+            )}
+
             <Line
               points={[
                 originPx.col * baseScale - ORIGIN_CROSS_ARM_PX / zoom, originPx.row * baseScale,

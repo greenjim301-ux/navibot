@@ -49,6 +49,17 @@ class PlanPathPoint(BaseModel):
     z: float
 
 
+class MapTrajectoryResponse(BaseModel):
+    """建图时机器狗走过的轨迹(map 系), 给地图预览页画一条参考线用。
+
+    z 是机体高度不是地面高程, 也不叠加 Δ 标定 —— 跟 3D 预览的点云、机器狗
+    marker 是同一个坐标系, 见 path_planner.mapping_trajectory。
+
+    points 为空表示这张图没有 keyframe_info_3d.txt(只导了点云的旧图), 不是
+    错误 —— 前端把开关置灰就行, 别弹报错。"""
+    points: List[PlanPathPoint]
+
+
 class PlanPathResponse(BaseModel):
     """global_planner.plan_path 规划出来的关键拐点(已经叠加 ground_elevation
     + Δ 补好 z, 不减 body_height_——见 global_planner.py), 跟实际下发给

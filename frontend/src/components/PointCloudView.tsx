@@ -27,6 +27,10 @@ interface Props {
   /** 机器狗实际走过的轨迹 (世界坐标, 含 z)。由页面按位姿累积后传进来 —— 这里
    *  只负责画, 不持有状态, 页面才知道什么时候该清空(比如开始新一轮导航)。 */
   trail?: TrailPoint[] | null;
+  /** 建图时机器狗走过的轨迹 (map 系, z 是机体高度), 静态数据, 跟 trail(实时
+   *  走过的路)是两回事: 这条是"当初建这张图的时候是怎么走的", 用来判断哪些
+   *  地方是实地验证过的。见 api.ts 的 getMapTrajectory。 */
+  mappingTrail?: TrailPoint[] | null;
   /** planner 当前正在跑的局部轨迹 (/scan_planner_node/optimal_list 原样转发),
    *  跟 rviz 里看到的是同一份数据, 纯展示, 不参与任何判断。 */
   optimalTraj?: OptimalTrajPoint[] | null;
@@ -200,6 +204,7 @@ function createAxesTripod(materials: [LineMaterial, LineMaterial, LineMaterial],
 
 export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function PointCloudView({
   mapName, meta, pointcloudMeta = null, waypoints = [], showWaypointNumbers = true, status = null, trail = null,
+  mappingTrail = null,
   optimalTraj = null, selfInflation = null, inflationMap = null, surfCloud = null, surroundCloud = null,
   liveOnly = false, enableFollow = false,
   showFollowButton = true, onFollowingChange,
@@ -264,6 +269,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   const pathGroupRef = useRef<THREE.Group | null>(null);
   const pathMarkersRef = useRef<THREE.Group | null>(null);
   const pathMaterialsRef = useRef<LineMaterial | null>(null);
+  const mappingTrailGroupRef = useRef<THREE.Group | null>(null);
+  const mappingTrailMaterialRef = useRef<LineMaterial | null>(null);
   const optimalGroupRef = useRef<THREE.Group | null>(null);
   const optimalMaterialRef = useRef<LineMaterial | null>(null);
   const selfInflationGroupRef = useRef<THREE.Group | null>(null);
@@ -544,6 +551,19 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     const pathMarkers = new THREE.Group();
     scene.add(pathMarkers);
     pathMarkersRef.current = pathMarkers;
+
+    // 建图轨迹: 跟实时走过的路(trailMaterial, 绿色)同一种画法, 换成琥珀色区分。
+    // depthTest 照样关掉 —— 这条线在机体高度上, 开着深度测试会被点云整条埋掉,
+    // 用户明确勾了"显示"却看不见。细一点、透明一点, 免得压住真正在跑的那些线。
+    const mappingTrailMaterial = new LineMaterial({
+      color: 0xf59e0b, linewidth: 1.6, transparent: true, opacity: 0.85, depthTest: false,
+    });
+    mappingTrailMaterial.resolution.set(width, height);
+    mappingTrailMaterialRef.current = mappingTrailMaterial;
+
+    const mappingTrailGroup = new THREE.Group();
+    scene.add(mappingTrailGroup);
+    mappingTrailGroupRef.current = mappingTrailGroup;
 
     // planner 局部轨迹: 逐点着色 (对齐 rviz 里那条红黄速度渐变线), 跟轨迹的
     // 纯色 trailMaterial 不能共用一个 material。
@@ -950,6 +970,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       needsRenderRef.current = true;
       renderer.setSize(w, h);
       trailMaterial.resolution.set(w, h);
+      mappingTrailMaterial.resolution.set(w, h);
       optimalMaterial.resolution.set(w, h);
       plannedRouteMaterial.resolution.set(w, h);
       navRouteMaterial.resolution.set(w, h);
@@ -974,6 +995,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       (points?.material as THREE.Material | undefined)?.dispose();
       pathGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       trailMaterial.dispose();
+      mappingTrailGroup.children.forEach((c) => (c as Line2).geometry.dispose());
+      mappingTrailMaterial.dispose();
       optimalGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       optimalMaterial.dispose();
       plannedRouteGroup.children.forEach((c) => (c as Line2).geometry.dispose());
@@ -1208,6 +1231,30 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     line.renderOrder = 10;
     group.add(line);
   }, [trail]);
+
+  // 建图轨迹: 静态数据, 一张图只会 fetch 一次, 关掉图层时外面传 null 就清空。
+  useEffect(() => {
+    const group = mappingTrailGroupRef.current;
+    const material = mappingTrailMaterialRef.current;
+    if (!group || !material) return;
+    needsRenderRef.current = true;
+
+    group.children.forEach((c) => (c as Line2).geometry.dispose());
+    group.clear();
+
+    if (!mappingTrail || mappingTrail.length < 2) return;
+
+    const flat: number[] = [];
+    mappingTrail.forEach((p) => flat.push(p.x, p.y, p.z));
+    const geometry = new LineGeometry();
+    geometry.setPositions(flat);
+    const line = new Line2(geometry, material);
+    line.computeLineDistances();
+    // renderOrder 比 trail(10)/参考路线低: 都关了深度测试, 靠这个决定谁压谁,
+    // 正在跑的东西应该盖在这条背景参考线上面。
+    line.renderOrder = 5;
+    group.add(line);
+  }, [mappingTrail]);
 
   // planner 局部轨迹 (/scan_planner_node/optimal_list): 每次重规划整条替换,
   // 跟 rviz 一样不做任何插值/平滑, 后端给什么就画什么。
