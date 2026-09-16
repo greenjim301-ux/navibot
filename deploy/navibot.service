@@ -37,7 +37,7 @@ EnvironmentFile=-/etc/default/navibot
 # systemd 不会 source bash 脚本, 所以显式起一个 shell 把 ROS 环境 source 进来再
 # exec。用 exec 是为了让 uvicorn 直接接管 PID, systemd 的信号/状态才对得上 ——
 # 不加的话 bash 是主进程, stop 会打到 bash 上, uvicorn 可能被留下。
-ExecStart=/bin/bash -c 'source /opt/ros/noetic/setup.bash && exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${NAVIBOT_PORT:-8000}"'
+ExecStart=/bin/bash -c 'source /home/cat/HandBot_bash/rosmaster.bash && exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${NAVIBOT_PORT:-8000}"'
 
 Restart=on-failure
 RestartSec=5
