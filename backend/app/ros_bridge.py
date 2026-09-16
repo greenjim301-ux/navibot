@@ -531,7 +531,7 @@ class RosBridge:
         坐标系用 config.MAP_FRAME("world"), 跟 hand-lio 的 world_frame_id 一致;
         点本来就是世界系的, 这里不做任何变换。
         """
-        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 6)
         if self._virtual_obstacle_pub is None:
             self._pending_virtual_obstacles = points
             logger.info("virtual_obstacles: ROS bridge 还没起来, 先记下 %d 个点, 连上后补发", len(points))
@@ -543,13 +543,19 @@ class RosBridge:
         msg.header.stamp = rospy.Time.now()
         msg.height = 1
         msg.width = len(points)
+        # normal_* 是给订阅方做背面剔除用的(见 virtual_obstacles.build_points):
+        # 这里发的是整圈闭合的墙, 全注入的话射向远侧墙面的光束会把近侧的墙投票
+        # 投没。字段名用 PCL 的约定(normal_x/y/z), pcl::PointNormal 能直接认。
         msg.fields = [
             PointField("x", 0, PointField.FLOAT32, 1),
             PointField("y", 4, PointField.FLOAT32, 1),
             PointField("z", 8, PointField.FLOAT32, 1),
+            PointField("normal_x", 12, PointField.FLOAT32, 1),
+            PointField("normal_y", 16, PointField.FLOAT32, 1),
+            PointField("normal_z", 20, PointField.FLOAT32, 1),
         ]
         msg.is_bigendian = False
-        msg.point_step = 12
+        msg.point_step = 24
         msg.row_step = msg.point_step * msg.width
         msg.is_dense = True
         msg.data = np.ascontiguousarray(points).tobytes()

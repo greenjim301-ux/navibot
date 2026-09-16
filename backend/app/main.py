@@ -439,7 +439,7 @@ def _republish_virtual_obstacles() -> None:
     try:
         active = map_registry.get_active()
         if active is None:
-            points = np.zeros((0, 3), dtype=np.float32)
+            points = np.zeros((0, 6), dtype=np.float32)
         else:
             points = virtual_obstacles.build_points(
                 active,
