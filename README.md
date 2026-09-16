@@ -92,9 +92,47 @@ mamba run -n ros_host python map_pipeline/generate_map_assets.py \
 # 3. 后端 (需要 roscore 已在跑)
 ./backend/run.sh
 
-# 4. 前端
+# 4. 前端 (开发模式, vite dev server 在 5173)
 cd frontend && npm install && npm run dev
 ```
+
+开发模式下 vite 有 proxy，把 `/api` `/map` `/ws` 转到 `localhost:8000`（见
+`frontend/vite.config.ts`），所以前端代码里全用**相对路径**、不需要 `.env.local`，
+也没有 CORS。要连别的机器（比如前端跑本地、后端跑板子）才需要 `.env.local` 里的
+`VITE_BACKEND_HTTP` / `VITE_BACKEND_WS` 覆盖。
+
+## 部署：后端自己 host 前端 + systemd
+
+板子上不用再跑 nginx 或 vite —— 后端直接把 `frontend/dist` 挂在 `/` 上，前后端同源：
+
+```bash
+cd frontend && npm ci && npm run build      # 产出 frontend/dist
+sudo cp deploy/navibot.service /etc/systemd/system/
+sudo cp deploy/navibot.env     /etc/default/navibot   # 按机器改路径/用户
+sudo systemctl daemon-reload && sudo systemctl enable --now navibot
+journalctl -u navibot -f
+```
+
+| | |
+|---|---|
+| `deploy/navibot.service` | unit 文件。`User` / `WorkingDirectory` 按"仓库在 `/home/cat/navibot`、用户是 `cat`"写的，换机器要改 |
+| `deploy/navibot.env` | 装到 `/etc/default/navibot`，端口和各种 `NAVIBOT_*` 路径都在这儿调，不用动 unit |
+
+`ExecStart` 显式起一个 shell 先 `source /opt/ros/noetic/setup.bash` 再 `exec uvicorn`
+（systemd 不会 source bash 脚本）。用 `exec` 是为了让 uvicorn 直接接管 PID，
+`systemctl stop` 的信号才打得到它身上，不会把进程留下。
+
+路由规则（`main.py` 末尾的 `_SpaStaticFiles`）：`/api` `/map` `/ws` `/assets` 开头的
+按真实文件/接口处理，**找不到就如实 404**；其余路径一律回落到 `index.html`，让前端
+的 React Router 接管（`/maps`、`/mapping/xxx` 这些路径在磁盘上没有对应文件，直接输
+地址或刷新页面时必须回落）。`assets/` 不回落是因为缺一个 js chunk 时回落成 HTML，
+浏览器只会报个 MIME 类型错误，把"这个 chunk 没构建出来"这个真实原因盖掉了。
+
+没有 `frontend/dist` 时不挂载，只提供接口，日志里会说明——只跑后端做开发不受影响。
+
+> **这套部署没有在真实板子上跑过**（开发机上没有 board 访问权限）。`systemd-analyze verify`
+> 通过、`ExecStart` 那行命令在开发机上验过能起来，但第一次上机大概率还要调路径和
+> `After=` 依赖。
 
 没有实机时，用模拟器验证整条链路（它刻意复刻了真 planner 的到达判据、跳点规则、急停悬停确认行为）：
 

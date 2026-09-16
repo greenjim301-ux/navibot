@@ -4,8 +4,16 @@ import type {
   RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, TrailPoint, Waypoint, XY,
 } from "./types";
 
-export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "http://localhost:8000";
-export const BACKEND_WS = import.meta.env.VITE_BACKEND_WS ?? "ws://localhost:8000";
+// 默认**同源**: 部署时前端是后端自己 host 的(见 backend/app/main.py 末尾那个
+// SPA mount), 写死 localhost:8000 的话浏览器会去连**自己这台机器**的 8000 而不是
+// 板子。空串让所有请求变成 /api/... 这样的相对路径, 自然跟着页面的来源走。
+//
+// 开发时 vite dev server 在 5173, 靠 vite.config.ts 里的 proxy 把 /api //map //ws
+// 转到 localhost:8000, 所以同源默认值在 dev 下也是对的, 不需要 .env.local。要连
+// 别的机器(比如本机开发、板子跑后端)才需要 .env.local 覆盖这两个。
+export const BACKEND_HTTP = import.meta.env.VITE_BACKEND_HTTP ?? "";
+export const BACKEND_WS = import.meta.env.VITE_BACKEND_WS
+  ?? `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}`;
 
 export function mapAssetUrl(mapName: string, file: string): string {
   return `${BACKEND_HTTP}/map/${encodeURIComponent(mapName)}/${file}`;

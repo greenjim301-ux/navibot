@@ -302,6 +302,14 @@ _REPO_ROOT = REPO_ROOT
 # <name>/ 下, 不带 2d_map/ 这层子目录, 跟下面 MAP_DATA_DIR 里那份区分开)。
 # 不落在 MAP_DATA_DIR 下的原因见那边的注释——这份是预处理产物, 会反复重新生成,
 # 不是"原始地图数据"。
+# 前端构建产物(`cd frontend && npm run build` 的输出)。后端直接 host 它, 板子上就
+# 不用再额外跑一个 nginx/vite —— 而且前后端同源, 前端所有请求都是 /api/... 这样的
+# 相对路径(见 frontend/src/api.ts), 不用配 CORS, 也不用告诉前端板子的 IP。
+#
+# **目录不存在时不挂载**(见 main.py 末尾), 只跑后端做开发不受影响: 那种情况下前端
+# 由 vite dev server 提供, 它自己有 proxy 把 /api 转过来。
+FRONTEND_DIST_DIR = os.environ.get("NAVIBOT_FRONTEND_DIST_DIR", os.path.join(_REPO_ROOT, "frontend", "dist"))
+
 MAP_ASSETS_DIR = os.environ.get("NAVIBOT_MAP_ASSETS_DIR", os.path.join(_REPO_ROOT, "web_assets", "map"))
 
 # 地图数据根目录: 地图列表不落 SQLite, 直接扫这个目录——每个直接子目录是一张

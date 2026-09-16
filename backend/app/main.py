@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -7,6 +8,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 # 不用 asyncio.to_thread: 那是 Python 3.9+ 的, 而机器上跑的是 ROS Noetic 自带的
 # 3.8。run_in_threadpool 来自 starlette (FastAPI 的依赖), 调用方式一模一样。
 from starlette.concurrency import run_in_threadpool
@@ -705,3 +707,44 @@ async def ws_nav(ws: WebSocket):
 
 
 app.mount("/map", StaticFiles(directory=config.MAP_ASSETS_DIR), name="map")
+
+
+class _SpaStaticFiles(StaticFiles):
+    """host 前端构建产物, 找不到的路径回落到 index.html。
+
+    前端是 React Router 的单页应用: /maps、/mapping/xxx、/routes/xxx 这些路径在
+    磁盘上**没有对应文件**, 由前端自己路由。用户直接输地址或者刷新页面时请求会打到
+    后端, 普通 StaticFiles 会 404, 所以要回落到 index.html 让前端接手。
+
+    但下面这几类前缀不回落:
+    - api/ map/ ws/: 真接口, 打错了就该如实 404。回落成 200 的 HTML 会让调用方把
+      首页当 JSON 解析, 报出来的错跟真实原因八竿子打不着。
+    - assets/: vite 带 hash 的构建产物。缺文件时必须 404 —— 回落成 HTML 的话浏览器
+      会拿到一个 Content-Type: text/html 的 "js", 报 MIME 类型错误, 同样掩盖了
+      "这个 chunk 没构建出来/是旧的" 这个真实原因。
+    """
+
+    _PASSTHROUGH = ("api/", "map/", "ws/", "assets/")
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404 or path.startswith(self._PASSTHROUGH):
+                raise
+            return await super().get_response("index.html", scope)
+
+
+# **必须放在最后**: 这个 mount 的前缀是 "/", 会吃掉所有没被上面匹配到的路径。
+# Starlette 按注册顺序匹配, 上面那些 @app.get/@app.websocket 已经先登记过了。
+#
+# 没构建过前端时不挂载(而不是挂一个空目录): 挂空目录的话所有路径都变成 404 HTML,
+# 反而看不出"是没构建"还是"接口写错了"。日志里说清楚。
+if os.path.isdir(config.FRONTEND_DIST_DIR):
+    app.mount("/", _SpaStaticFiles(directory=config.FRONTEND_DIST_DIR, html=True), name="frontend")
+    logger.info("host 前端: %s", config.FRONTEND_DIST_DIR)
+else:
+    logger.warning(
+        "没有前端构建产物(%s), 不 host 前端 —— 只跑后端做开发的话这是正常的, "
+        "部署时要先 cd frontend && npm run build", config.FRONTEND_DIST_DIR,
+    )

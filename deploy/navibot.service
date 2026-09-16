@@ -1,0 +1,51 @@
+# navibot 后端 (同时 host 前端页面)
+#
+# 安装:
+#   sudo cp deploy/navibot.service /etc/systemd/system/
+#   sudo cp deploy/navibot.env     /etc/default/navibot     # 按机器改里面的路径/用户
+#   sudo systemctl daemon-reload && sudo systemctl enable --now navibot
+#
+# **装之前先构建前端**: cd frontend && npm ci && npm run build
+# 没有 frontend/dist 的话后端只提供接口, 打开网页是 404(日志里会说)。
+#
+# 这个文件里的 User / WorkingDirectory / ExecStart 里的路径都按
+# "仓库在 /home/cat/navibot、跑服务的用户是 cat" 写的, 换机器要改。
+# 其余可调项都在 /etc/default/navibot 里, 不用动这个文件。
+#
+# **没有在真实板子上跑过**(开发机上没有 board 访问权限), 第一次上机大概率要调
+# 路径和 After= 依赖。
+
+[Unit]
+Description=navibot backend (REST + WebSocket + 前端页面)
+Documentation=https://github.com/greenjim301-ux/navibot
+# 后端一起来就 rospy.init_node 连 ROS master。master 没起来时 rospy 会一直阻塞在
+# 那儿等(不是立刻失败), 所以这里不是硬依赖 —— 但 roscore 如果也是个 unit, 把它
+# 加进 After=/Wants= 能少一段"启动了但连不上"的窗口期。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cat
+Group=cat
+WorkingDirectory=/home/cat/navibot/backend
+
+# 所有可调项(端口/ROS master/各种 NAVIBOT_* 路径)都从这里读。文件不存在也能起
+# (前面的 "-"), 那就全用代码里的默认值。
+EnvironmentFile=-/etc/default/navibot
+
+# systemd 不会 source bash 脚本, 所以显式起一个 shell 把 ROS 环境 source 进来再
+# exec。用 exec 是为了让 uvicorn 直接接管 PID, systemd 的信号/状态才对得上 ——
+# 不加的话 bash 是主进程, stop 会打到 bash 上, uvicorn 可能被留下。
+ExecStart=/bin/bash -c 'source /opt/ros/noetic/setup.bash && exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${NAVIBOT_PORT:-8000}"'
+
+Restart=on-failure
+RestartSec=5
+# 日志直接进 journal: journalctl -u navibot -f
+StandardOutput=journal
+StandardError=journal
+# 后端的日志是逐行 print/logging 出来的, 不关缓冲的话 journal 里会一卡一卡地出现
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
