@@ -257,6 +257,11 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
 
   function handleClick(e: KonvaEventObject<MouseEvent>) {
+    // **Konva 的 click 对右键也会触发**(跟 DOM 的 click 不一样, 它不按按键过滤)。
+    // 不挡住的话右键会同时跑 handleContextMenu(撤销)和这里(加点), 结果是"撤销完
+    // 立刻在鼠标位置又加了一个" —— 三种拾取模式的右键撤销全中招。PointCloudView
+    // 那边本来就按 e.button 分派(见它的 handleStartGoalClick), 这边漏了。
+    if (e.evt.button !== 0) return;
     if (!editable && !startGoalPickMode && !regionDraftKind) return;
     if (!e.target.getStage()) return;
     // 在内容 Group 上取相对指针位置, 会自动把当前的缩放/拖拽/旋转都换算掉,
