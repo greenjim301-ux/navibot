@@ -723,18 +723,34 @@ def clear_trajectory(
     轨迹上(离轨迹中位数 0.10m), 也就是全都是这个取整差造成的。
 
     现在改成: 半径用跟规划器同一个 `ceil`, 核用同一个圆盘(dr²+dc² <= R², 由
-    EDT <= R 精确表达)。这样能给出一条硬保证——**清出来的格子经过规划器那次
-    膨胀之后一定还在**: 任何 occupied 格子离轨迹格子的距离都 > R(否则它早被这
-    里清成 free 了), 而膨胀只吃距离 <= R 的格子。轨迹按 resolution/2 重采样,
-    相邻种子格连续, 所以活下来的是一整条连通的带, 不是一串孤岛。
+    EDT <= R 精确表达), **再加一格**。
+
+    为什么还要多加一格: 只清 R 的话保证的是"每个轨迹格自己活下来", 但没保证
+    这条带子**宽于一格**。障碍正好落在轨迹两侧 R+1 px 时, 轨迹格离它 R+1 > R
+    活下来, 而轨迹格旁边那一格离它只有 R, 被膨胀吃掉——于是只剩中心线一格宽。
+    中心线要是斜着走的, 就是一串只靠**对角**相连的格子, 正好撞上 _astar 那条
+    "两个正交邻格都是障碍就不许斜穿"(不然现实里会蹭墙角)。结果是图上看着通、
+    A* 说不通。实测 save_map_small_1: 起终点都在轨迹上、free 区 8 邻接算也连通,
+    但按规划器的规则从起点只够得着 12772/57906 格, 整条路要斜穿 8 个夹缝,
+    5 处全在轨迹上(离轨迹 0.00m, 净空 0.32~0.36m)。
+
+    清 R+1 就补上了这一条: 轨迹格的 4 个正交邻格离任何障碍都 > R(否则它们早被
+    这里清掉了), 所以也必定存活 —— 带子至少 3 格宽, 相邻轨迹格之间不可能只剩
+    对角相触。代价是在轨迹周围多认一格(0.1m/格的图上 0.1m)是空的, 而那是狗
+    实际走过的地方。实测 save_map_small_1: 轨迹上够不着的格子 2795 -> 0, 可走
+    格只多了 1024 个。
+
+    合起来这两条给出的保证是: **狗走过的整条轨迹, 规划器一定能从头走到尾**
+    (不只是"每个格子单独看是可走的")。tools/check_trajectory_clearance.py 验的
+    就是这个, 改动任何一边之后跑一遍。
 
     直接原地改 grid 并返回。
     """
     x_min, x_max, y_min, y_max = bounds
     height, width = grid.shape
     traj = resample_polyline(trajectory, resolution / 2)
-    # ceil 而不是 round: 见 docstring。max(1, ...) 也照抄规划器。
-    radius_px = max(1, int(np.ceil(radius / resolution)))
+    # ceil 而不是 round, 再 +1: 见 docstring。max(1, ...) 也照抄规划器。
+    radius_px = max(1, int(np.ceil(radius / resolution))) + 1
     col = np.clip(((traj[:, 0] - x_min) / resolution).astype(np.int32), 0, width - 1)
     row = np.clip(((y_max - traj[:, 1]) / resolution).astype(np.int32), 0, height - 1)
     seed = np.zeros((height, width), dtype=bool)
