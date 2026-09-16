@@ -287,6 +287,10 @@ async def plan_path(name: str, req: PlanPathRequest):
             elevation_fn=elevations,
             # 人工编辑的可通行/禁行区域(见 map_edit_store.py)。只取 enabled 的。
             edit_regions=map_edit_store.active_regions(name),
+            # 建图轨迹: 让规划优先贴着狗走过的路走, 而且轨迹压过膨胀余量
+            # (见 global_planner.plan_path 的说明)。没有轨迹数据时是 None,
+            # 退回改动前的纯代价 + 纯膨胀行为。
+            trajectory=path_planner.mapping_trajectory(name),
         )
         delta = route_manager.get_altitude_calibration(name)
         out = []

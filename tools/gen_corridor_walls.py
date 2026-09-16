@@ -176,6 +176,12 @@ def _check_still_plannable(map_name: str, regions) -> bool:
     free = ~gp._dilate_bool(blocked, radius_px)
 
     traj = path_planner.mapping_trajectory(map_name)
+    # 跟 global_planner.plan_path 用同一条规则: 轨迹格子(+1 圈)不被膨胀吃掉, 但仍然
+    # 挡不住明确的障碍。不同步的话这里会把 plan_path 其实规划得出来的情况误报成封死。
+    if config.GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION:
+        traj_mask = gp._trajectory_mask(traj, height, width, res, meta["origin_x"], meta["origin_y"])
+        free = free | (gp._dilate_bool(traj_mask, 1) & ~blocked)
+
     pts = elevation.resample_polyline(traj[:, :2], res / 2)
     col = np.clip(((pts[:, 0] - meta["origin_x"]) / res).astype(np.int32), 0, width - 1)
     row = np.clip(((meta["origin_y"] + height * res - pts[:, 1]) / res).astype(np.int32), 0, height - 1)
@@ -199,15 +205,22 @@ def _check_still_plannable(map_name: str, regions) -> bool:
                 q.append((nr, nc))
         reach = sum(1 for p in cells if not seen[p])
 
-    # 余量: 轨迹格离最近障碍还有多远, 减去膨胀半径。这个数直接说明 half_width 够
-    # 不够 —— 通过/不通过是个二值结果, 贴着边过和留一大截余量差别很大。
+    # 余量: 轨迹格离最近障碍还有多远, 减去膨胀半径。**开了"轨迹压过膨胀"之后这个数
+    # 是负的也没关系** —— 它说明的是"如果没有那条豁免, 会差多少", 留着当参考: 豁免
+    # 只保住轨迹本身那 3 格宽的带子, 余量为负意味着狗一偏出这条带子就贴到墙上了。
     from scipy.ndimage import distance_transform_edt
     edt = distance_transform_edt(~blocked) * res
     margin = min(edt[r, c] for r, c in cells) - radius_px * res
 
-    print(f"  复验(膨胀 {radius_px}px = {radius_px * res:.2f}m): 轨迹格 {len(cells)} 个, "
-          f"被膨胀吃掉 {eaten} 个, 规划器走不到 {reach if eaten == 0 else '(前一项非 0, 没查)'} 个; "
-          f"最窄处余量 {margin:+.3f}m")
+    beats = "开" if config.GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION else "关"
+    print(f"  复验(膨胀 {radius_px}px = {radius_px * res:.2f}m, 轨迹压过膨胀={beats}): "
+          f"轨迹格 {len(cells)} 个, 被吃掉 {eaten} 个, 规划器走不到 "
+          f"{reach if eaten == 0 else '(前一项非 0, 没查)'} 个; "
+          f"轨迹带外余量 {margin:+.3f}m")
+    if eaten == 0 and reach == 0 and margin < 0:
+        print("  注意: 复验过了是靠'轨迹压过膨胀'这条豁免撑住的(轨迹带外余量为负) —— "
+              "狗只要偏出轨迹那 3 格宽的带子就会贴到自己立的墙上。"
+              f"想留出真正的余量, half_width 取 {radius_px * res + 0.15:.2f} 以上。")
     if eaten or reach:
         suggest = radius_px * res + 0.15
         print(f"  !! 走廊被自己立的墙封死了。规划器规划前会把障碍按 {radius_px * res:.2f}m 膨胀回来, "

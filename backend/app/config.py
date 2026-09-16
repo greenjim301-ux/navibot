@@ -98,6 +98,40 @@ GLOBAL_PLANNER_PRUNE_ABS_SLACK_M = float(
 GLOBAL_PLANNER_MAX_CLIMB_PER_SEGMENT_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_CLIMB_PER_SEGMENT_M", "0.20")
 )
+# ---- 优先走建图轨迹 ----
+# 狗当初从哪儿走过来的, 那条线就是最可信的"这儿能走": 地面平整、宽度够、没有沟。
+# 离线建图的判据(detect_structure 的机体高度带)和 planner 的实时 ESDF 都看不见负
+# 障碍(沟), 所以"贴着走过的路走"本身就是一条独立于感知的安全信息。
+#
+# 两件事, 分开配:
+#
+# 1. **轨迹压过的那些格子本身**代价压回 1.0, 盖过"未知"惩罚和贴墙惩罚 —— 那两个都是
+#    "没验证过/可能蹭到"的估计, 而这里有实地走过这个更强的证据。
+#    **只认轨迹真正压过的格子, 不带半径。** 一开始做成"轨迹 0.5m 以内", 那等于把
+#    整条 1m 宽的带子都算成"走过", A* 在带子里走哪条线都一样便宜, 该贴的地方不贴
+#    —— 而沟就在带子边上。要的是 exact match: 狗的脚印落在哪一格, 哪一格才免罚。
+# 2. **其余格子代价乘 GLOBAL_PLANNER_OFF_TRAJECTORY_MULTIPLIER**, 于是 A* 只在
+#    "绕着走过的路"不超过这个倍数时才会绕。2.0 = 宁可多走一倍也贴着走过的路, 再远
+#    就走近路。设成 1.0 关掉这个偏好。
+#
+# **惩罚只能往上加, 不能给轨迹格子低于 1.0 的折扣**: _astar 的 _octile 启发式按
+# 权重恒为 1 估, 出现 <1 的格子会让它高估真实代价, A* 就不保证最优了(见 _astar
+# 的说明)。所以"偏好轨迹"是通过罚别处实现的, 不是奖励轨迹。
+GLOBAL_PLANNER_OFF_TRAJECTORY_MULTIPLIER = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_OFF_TRAJECTORY_MULTIPLIER", "2.0")
+)
+# 轨迹格子(以及紧挨着的一圈)**不受膨胀影响**: 狗的身子实实在在从那儿过去了, 那个
+# 安全余量在那里被实地证伪过。多留一圈是为了让这条带子至少 3 格宽 —— 只剩一格宽
+# 且斜着走的话会撞上 _astar 的"不许斜穿夹缝", 图上看着通、A* 说不通(踩过, 见
+# README「狗走过的整条轨迹, 规划器必须能从头走到尾」)。
+#
+# **但挡不住"明确的障碍"**: 只有膨胀出来的余量会被顶掉, 轨迹格子本身要是落在
+# detect_structure 判出的障碍里、或者落在人工圈的禁行区里, 照样不能走 —— 人工画
+# 的禁行区就是"这里现在不许走"(门关了、地塌了), 它必须压过历史上走过这个事实。
+GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION = os.environ.get(
+    "NAVIBOT_GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION", "1"
+) not in ("0", "false", "False")
+
 # 相邻途经点的硬下限(m)。低于 SCAN-Planner 的 0.2m 死区就生成不出轨迹
 # (planner_manager.cpp:94), 留一点余量取 0.25。
 GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M = float(

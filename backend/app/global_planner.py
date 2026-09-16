@@ -214,6 +214,39 @@ def _dilate_bool(mask: np.ndarray, radius_px: int) -> np.ndarray:
     return out
 
 
+def _trajectory_mask(trajectory: np.ndarray, height: int, width: int, resolution: float,
+                      origin_x: float, origin_y: float) -> np.ndarray:
+    """把建图轨迹烧成格子掩膜(轨迹**经过**的格子, 不含任何膨胀)。
+
+    相邻关键帧之间要补点: path_planner 给的轨迹是按 0.2m 重采样的, 0.05m/格的图上
+    两点之间会空 4 格, 直接打点会得到一串断开的孤岛, 后面无论是"压代价"还是"顶掉
+    膨胀"都会一段一段地漏。按 resolution/2 线性插值, 保证相邻采样点落在同一格或
+    相邻格。
+
+    只用 x/y —— z 在这里没有意义(2D 栅格图本来就不分层, 上下楼的轨迹会叠在一起,
+    那是 path_planner.ground_elevation 同一个已知局限, 这里不另做处理)。
+    """
+    mask = np.zeros((height, width), dtype=bool)
+    if trajectory is None or len(trajectory) < 1:
+        return mask
+
+    xy = np.asarray(trajectory, dtype=np.float64)[:, :2]
+    step = resolution / 2.0
+    pts = [xy[0]]
+    for a, b in zip(xy[:-1], xy[1:]):
+        dist = float(np.linalg.norm(b - a))
+        n = max(1, int(math.ceil(dist / step)))
+        for k in range(1, n + 1):
+            pts.append(a + (b - a) * (k / n))
+    dense = np.asarray(pts)
+
+    cols = np.floor((dense[:, 0] - origin_x) / resolution).astype(np.int64)
+    rows = np.floor((origin_y + height * resolution - dense[:, 1]) / resolution).astype(np.int64)
+    ok = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    mask[rows[ok], cols[ok]] = True
+    return mask
+
+
 def _world_to_pixel(x: float, y: float, height: int, resolution: float,
                      origin_x: float, origin_y: float) -> RC:
     """跟 _pixel_to_world 严格互逆(对着 _pixel_to_world 反解出来的, 别再手改
@@ -616,6 +649,7 @@ def _split_long_segments(points: List[XY], max_spacing: float) -> List[XY]:
 def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
                elevation_fn: Optional[Callable[[List[XY]], List[Optional[float]]]] = None,
                edit_regions: Optional[List[MapEditRegion]] = None,
+               trajectory: Optional[np.ndarray] = None,
                ) -> List[XY]:
     """在 <map_name> 的 2D 栅格图上规划一条全局路径, 按机身半径膨胀障碍后跑
     A*, 剪枝成关键拐点, 返回世界坐标系 (x, y) 列表(含起点和终点, 不含 z——z
@@ -624,6 +658,14 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
     起点/终点超出地图范围、落在膨胀后的障碍区里、或者两点之间根本没有可行
     路径时抛 ValueError——不做"自动挪到最近自由格子"这种静默纠偏, 规划失败
     应该原样告诉用户, 不能悄悄给一条他没画过的路线。
+
+    trajectory 是建图轨迹 (N, >=2) 的 xy(调用方从 path_planner.mapping_trajectory
+    取, 见 main.py)。传了就**优先贴着它走**, 而且它**压过膨胀**:
+      - **轨迹真正压过的那些格子**代价压回 1.0(exact match, 不带半径), 盖过
+        "未知"惩罚和贴墙惩罚;
+      - 其余格子代价乘 GLOBAL_PLANNER_OFF_TRAJECTORY_MULTIPLIER;
+      - 轨迹格子(+1 圈)不被膨胀吃掉, 但仍然挡不住明确的障碍/人工禁行区。
+    不传就是改动前的行为(纯代价 + 纯膨胀), 两者在单元测试里都要能跑。
     """
     map2d_dir = Path(config.MAP_ASSETS_DIR) / map_name
     pgm_path = map2d_dir / config.MAP_2D_PGM_FILENAME
@@ -659,6 +701,32 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
     # 又恰好在未知区域的格子不该被罚两次、代价乘出离谱的数字), 取较大的那个
     # 惩罚就够表达"这格不太受待见"。
     cost_weight = np.maximum(cost_weight, wall_weight)
+
+    # ---- 优先走建图轨迹(见 config 里那三个 GLOBAL_PLANNER_*TRAJECTORY* 的说明)----
+    # 狗当初从哪儿走过来的, 那条线就是最可信的"这儿能走" —— 而且它是独立于感知的:
+    # detect_structure 的机体高度带和 planner 的实时 ESDF 都看不见沟这类负障碍,
+    # "贴着走过的路走"能绕开它们看不见的东西。
+    if trajectory is not None and len(trajectory):
+        traj = _trajectory_mask(trajectory, height, width, resolution, origin_x, origin_y)
+
+        if config.GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION:
+            # 顶掉膨胀, 但顶不掉"明确的障碍": & ~blocked 把 detect_structure 判出的
+            # 障碍和人工圈的禁行区都排除在外 —— 人工画的禁行区是"这里现在不许走"
+            # (门关了、地塌了), 必须压过"历史上走过"这个事实。
+            # 多放一圈是为了这条带子至少 3 格宽, 不然只剩一格且斜着走时会撞上
+            # _astar 的"不许斜穿夹缝"。
+            free = free | (_dilate_bool(traj, 1) & ~blocked)
+
+        # 免罚的**只有轨迹真正压过的那些格子**, 不带半径(exact match)。带半径的话
+        # 整条带子都一样便宜, A* 在带子里走哪条线都无所谓, 该贴的地方就不贴了 ——
+        # 而沟正好在带子边上。注意这只影响**代价**, 不限制能走的范围: 上面 free 里
+        # 该能走的地方照样能走, 只是走出轨迹要多付 off_mult 倍。
+        #
+        # 先整体罚, 再把轨迹格压回 1.0 —— 顺序反了的话轨迹格会被 off 惩罚盖掉。
+        off_mult = config.GLOBAL_PLANNER_OFF_TRAJECTORY_MULTIPLIER
+        if off_mult > 1.0:
+            cost_weight = np.maximum(cost_weight, off_mult)
+        cost_weight[traj] = 1.0
 
     start_rc = _world_to_pixel(start_xy[0], start_xy[1], height, resolution, origin_x, origin_y)
     goal_rc = _world_to_pixel(goal_xy[0], goal_xy[1], height, resolution, origin_x, origin_y)
