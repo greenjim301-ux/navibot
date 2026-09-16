@@ -88,8 +88,10 @@ def _outward_normals(mask: np.ndarray, shell: np.ndarray) -> np.ndarray:
     rows, cols = np.nonzero(shell)
     n = acc[rows, cols]
     norm = np.linalg.norm(n, axis=1, keepdims=True)
-    # 理论上外壳格子至少有一个外侧邻居, 法向不会是零; 真遇到了(单格多边形之类)
-    # 给个任意方向, 让它总是被剔除掉比留下一个朝向未定义的点安全。
+    # 两侧都是"外面"时(比如只有一格厚的墙)偏移量会互相抵消, 法向退化成零向量。
+    # **零向量原样发出去**: 订阅方约定"没有法向就不剔除"(见 hand-lio 的
+    # appendVirtualObstacles), 于是这种点会被全量注入 —— 方向是"墙更结实", 而不是
+    # 悄悄少一段墙。归一化时把 0 当除数换成 1, 结果仍是零向量。
     n = np.divide(n, np.where(norm > 1e-9, norm, 1.0))
     return n
 

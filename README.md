@@ -597,6 +597,39 @@ navibot 后端 ──latched──> /navibot/virtual_obstacles (PointCloud2, wor
 合成数据验证（雷达在原点，x=2.0 和 x=2.5 两面墙）：远侧墙注入 **0** 点，近侧 123 个位置 ×
 **3** 份 = 369（`12/2² = 3` ✓）；把雷达挪到 x=5，剔除关系正确翻转。
 
+### 自动生成走廊墙：`tools/gen_corridor_walls.py`
+
+按"建图轨迹 ±`half_width` 之外不许走"批量生成禁行区，省得一段一段手画：
+
+```
+schroot -c focal -- python3 tools/gen_corridor_walls.py house --half-width 0.40 --dry-run
+schroot -c focal -- python3 tools/gen_corridor_walls.py house --half-width 0.40 --replace
+```
+
+生成的区域跟手画的完全一样（存进 `data/map_edits/<name>.json`），全局规划会绕开、局部避障也能
+看见、在面板里能逐个停用/删除。`note` 带 `auto:corridor-wall` 前缀，`--replace` 只重做这些，
+手画的不动。
+
+走廊边界取的是**距离场等值线**（"到轨迹的距离 == half_width"），不是逐点法向偏移。逐点偏移在
+轨迹折返、反复走同一片地方时会大面积失效——house 上 1354 个偏移点只活下来 296 个，墙碎成 80 段
+几厘米的小茬子。等值线天然就是"所有轨迹点的 half_width 圆盘的并集"的边界，折返/自交/绕圈都自动
+处理好。
+
+> **`half_width` 不能真取 0.3。** 墙立在 `half_width` 处，而规划器规划前会把障碍按
+> `GLOBAL_PLANNER_INFLATION_RADIUS_M`（0.25m，按分辨率向上取整）膨胀回来——走廊净宽只剩
+> `half_width` 减膨胀半径，再算上两次栅格化的取整就没了。实测 4 张图在 0.3m 下**全部被自己立的
+> 墙封死**：
+>
+> | 地图 | 分辨率 | 膨胀 | 0.30m | 0.35m | 0.40m | 0.45m |
+> |---|---|---|---|---|---|---|
+> | `house` | 0.05 | 0.25m | −0.050 | +0.000 | **+0.054** | +0.054 |
+> | `save_map_stairs` | 0.05 | 0.25m | −0.026 | | | |
+> | `save_map_small_1` | 0.10 | 0.30m | −0.100 | −0.076 | −0.017 | **+0.061** |
+> | `save_map_large_1` | 0.10 | 0.30m | −0.100 | | | |
+>
+> （"最窄处余量"，负数=封死）经验值 **`half_width ≥ 膨胀半径 + 0.15m`**。脚本每次都按规划器的
+> 真实判据复验并给建议值，封死时退出码 2。
+
 ### 关键风险：注入密度要压过真实光束
 
 `grid_map.cpp:664` 每个更新周期对每个体素投一次票：
