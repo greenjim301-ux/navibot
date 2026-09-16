@@ -256,6 +256,10 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
 
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
 
+  // 三种"在图上点一下"的模式, 语义互斥(调用方保证), 这里只关心"是不是有一种开着"
+  // —— 开着的时候图上的装饰性图元都不能拦事件, 否则点在它们上面就落不到 Stage。
+  const pickingOnMap = editable || startGoalPickMode || regionDraftKind != null;
+
   function handleClick(e: KonvaEventObject<MouseEvent>) {
     // **Konva 的 click 对右键也会触发**(跟 DOM 的 click 不一样, 它不按按键过滤)。
     // 不挡住的话右键会同时跑 handleContextMenu(撤销)和这里(加点), 结果是"撤销完
@@ -414,7 +418,13 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
             />
 
             {/* 人工编辑的区域, 画在最底下(途经点/路线要压在它上面才看得清)。
-                半透明填充 + 实线描边; 停用的只画虚线描边不填充。 */}
+                半透明填充 + 实线描边; 停用的只画虚线描边不填充。
+
+                **拾取模式下整个不接事件**(listening={false}): 它是带 fill 的闭合
+                多边形, 接事件的话点在区域**里面**会命中它、被 cancelBubble 挡住,
+                Stage 的 handleClick 根本收不到 —— 表现就是"可通行区里选不了起终
+                点"(用户报的), 而且设置目标点、以及在已有区域上再画一个新区域,
+                统统点不动。只有不在任何拾取模式时才让它可点(那时点它 = 选中)。 */}
             {regions.map((region) => {
               const pts = region.points.flatMap((pt) => {
                 const p = worldToPixel(centeredMeta, pt.x, pt.y);
@@ -431,6 +441,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
                   stroke={REGION_STROKE[region.kind]}
                   strokeWidth={(selected ? REGION_STROKE_PX * 2 : REGION_STROKE_PX) / zoom}
                   dash={region.enabled ? undefined : [6 / zoom, 4 / zoom]}
+                  listening={!pickingOnMap}
                   onClick={(e) => { e.cancelBubble = true; onSelectRegion?.(selected ? null : region.id); }}
                   onTap={(e) => { e.cancelBubble = true; onSelectRegion?.(selected ? null : region.id); }}
                 />
