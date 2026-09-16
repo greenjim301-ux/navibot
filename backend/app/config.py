@@ -103,6 +103,42 @@ GLOBAL_PLANNER_MAX_CLIMB_PER_SEGMENT_M = float(
 GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M = float(
     os.environ.get("NAVIBOT_GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M", "0.25")
 )
+# ---- 虚拟障碍点云(把人工圈的禁行区喂给 SCAN-Planner 的实时局部地图)----
+#
+# 背景: 地图编辑(map_edit_store.py)只影响**全局**规划 —— global_planner 叠加完
+# 多边形算出一条绕开的路线, 但 SCAN-Planner 的局部避障用的是它自己的实时 3D 栅格
+# 图(grid_map), 我们的禁行区它一无所知。最要命的场景是**沟**: 沟是负障碍, 雷达
+# 打到沟底那就是"地面, 只是矮一点", grid_map 里没有任何占据体素, 局部规划器既没
+# 有代价也没有梯度(而且它的 z 梯度还是被 setZero 的, 见 bspline_optimizer.cpp),
+# 于是狗可以大摇大摆地"飞"过沟口。
+#
+# 办法: 把禁行区采样成世界系的点, 混进喂给 grid_map 的那条点云里, 让它变成一个
+# 正儿八经的正障碍。这里只负责**发布点云**, 真正的混入在 hand-lio 那边做 ——
+# grid_map 的 cloudCallback 每次是**覆盖** md_.proj_points_ 而不是累加, 所以往
+# 同一个话题上另发一路会把真实雷达帧顶掉, 必须在同一条消息里带上。
+#
+# 点云是世界系的(hand-lio 的 /hand_lio/clouds_lidar 本来就发 map 系去畸变点,
+# grid_map 的 cloud_is_world=true), 所以这边不做任何坐标变换。
+VIRTUAL_OBSTACLE_TOPIC = os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_TOPIC", "/navibot/virtual_obstacles")
+VIRTUAL_OBSTACLE_ENABLED = os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_ENABLED", "1") not in ("0", "false", "False")
+# 采样步长(m)。**要按 SCAN-Planner 的 grid_map/resolution(0.05)来定**, 而且要比它
+# 细一档: grid_map 每个更新周期对每个体素做一次投票(grid_map.cpp:664),
+#     count_hit >= count_hit_and_miss - count_hit   ⟺   n_注入 >= n_真实光束穿过
+# 虚拟墙所在的位置现实里是空的, 每帧都有真实光束穿过去打到后面的地面, 每条贡献
+# 一个 miss。取 0.025 = 分辨率的一半, 一个 0.05m 体素里就有 2×2×2 = 8 个注入点,
+# 足以压过近处(约 1m)估算的 8 条穿过光束。**这个估算是按 Mid-360 约 2 万点/帧、
+# FOV 360°×59° 的包络算的, 没在真机上量过。**
+VIRTUAL_OBSTACLE_STEP_M = float(os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_STEP_M", "0.025"))
+# 垂直范围(m), 相对**该点的途经点高度**(ground_elevation + Δ, 跟 plan_path 发出去
+# 的 z 是同一个量)。局部轨迹的 z 就在这个高度上(planner 的 z 梯度被清零, 高度完全
+# 由我们下发的航点决定), 所以把墙套在这个高度上下才挡得住。±0.30 覆盖 grid_map 的
+# double_cylinder_radius(0.20)+ obstacles_inflation_z_up/down(0.1)。
+VIRTUAL_OBSTACLE_Z_LO_M = float(os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_Z_LO_M", "-0.30"))
+VIRTUAL_OBSTACLE_Z_HI_M = float(os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_Z_HI_M", "0.30"))
+# 点数上限。超了就把步长翻倍重采样(会削弱上面那个投票, 日志里会警告), 而不是截断
+# —— 截断会在墙上留洞, 比整体变粗危险得多。
+VIRTUAL_OBSTACLE_MAX_POINTS = int(os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_MAX_POINTS", "200000"))
+
 # 相邻途经点的上限(m): 超过就把这一段等分插点。
 #
 # 这里以前写着"**不要设上限**, 人为插点只会白白截短 planner 的 5m 前瞻, 均匀间距

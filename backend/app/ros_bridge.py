@@ -146,6 +146,10 @@ class RosBridge:
         self._wp_pub: Optional[rospy.Publisher] = None
         self._initial_path_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
+        self._virtual_obstacle_pub: Optional[rospy.Publisher] = None
+        # 最近一次发布的虚拟障碍点, 供 ROS 连上之后补发一次(latch 只对"已经发过"
+        # 的消息有效, bridge 还没起来时的那次调用得自己记着)。
+        self._pending_virtual_obstacles: Optional[np.ndarray] = None
         self._self_inflation_sub: Optional[rospy.Subscriber] = None
         self._inflation_map_sub: Optional[rospy.Subscriber] = None
         self._surf_cloud_sub: Optional[rospy.Subscriber] = None
@@ -179,6 +183,15 @@ class RosBridge:
             self._wp_pub = rospy.Publisher(config.PRESET_WAYPOINTS_TOPIC, Path, queue_size=1)
             self._initial_path_pub = rospy.Publisher(config.INITIAL_PATH_TOPIC, Path, queue_size=1)
             self._estop_pub = rospy.Publisher(config.EMERGENCY_STOP_TOPIC, Empty, queue_size=5)
+            # 这一条**要 latch**: 它是"哪些地方人工标了不能走"这种静态事实, 不是
+            # 一次性指令。hand-lio 后起/重启都要能立刻拿到当前这一份, 不然得等到
+            # 用户下次改禁行区才有 —— 跟上面几个话题不 latch 的理由正好相反
+            # (那几个 latch 会让 planner 重启后自己跑起来, 这个不会驱动任何动作)。
+            self._virtual_obstacle_pub = rospy.Publisher(
+                config.VIRTUAL_OBSTACLE_TOPIC, PointCloud2, queue_size=1, latch=True,
+            )
+            if self._pending_virtual_obstacles is not None:
+                self.publish_virtual_obstacles(self._pending_virtual_obstacles)
             rospy.Subscriber(config.ODOM_TOPIC, Odometry, self._handle_odom, queue_size=50)
             if self._on_optimal_traj is not None:
                 rospy.Subscriber(config.OPTIMAL_TRAJ_TOPIC, Marker, self._handle_optimal_traj, queue_size=5)
@@ -499,6 +512,50 @@ class RosBridge:
         self._wp_pub.publish(msg)
         logger.info("preset_waypoints published: %d points, z=%s",
                     len(msg.poses), [round(w["z"], 2) for w in waypoints])
+
+    def publish_virtual_obstacles(self, points: np.ndarray) -> None:
+        """发布人工禁行区采样出来的虚拟障碍点云(世界系 xyz float32)。
+
+        跟 publish_waypoints/publish_initial_path 有两点不一样, 都是故意的:
+
+        1. **latch, 而且不等订阅者。** 它是"哪些地方人工标了不能走"这种静态事实,
+           不是一次性指令 —— 没人订阅时发出去也不算失败(hand-lio 可能还没起),
+           latch 会让它后来连上时立刻拿到。反过来, 因为它不驱动任何动作, latch
+           也不会有 planner 那种"重启后自己跑起来"的风险。
+        2. **空点云也要发。** 空表示"现在没有虚拟障碍", 订阅方据此清掉上一批;
+           不发的话对方会一直留着已经被删掉的禁行区。
+
+        ROS bridge 还没起来时不抛异常, 先记下来, _spin 里建好 publisher 之后补发
+        —— 这个调用点在"用户改了禁行区"的路径上, 没连 ROS 不该让那个请求失败。
+
+        坐标系用 config.MAP_FRAME("world"), 跟 hand-lio 的 world_frame_id 一致;
+        点本来就是世界系的, 这里不做任何变换。
+        """
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        if self._virtual_obstacle_pub is None:
+            self._pending_virtual_obstacles = points
+            logger.info("virtual_obstacles: ROS bridge 还没起来, 先记下 %d 个点, 连上后补发", len(points))
+            return
+        self._pending_virtual_obstacles = points
+
+        msg = PointCloud2()
+        msg.header.frame_id = config.MAP_FRAME
+        msg.header.stamp = rospy.Time.now()
+        msg.height = 1
+        msg.width = len(points)
+        msg.fields = [
+            PointField("x", 0, PointField.FLOAT32, 1),
+            PointField("y", 4, PointField.FLOAT32, 1),
+            PointField("z", 8, PointField.FLOAT32, 1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = msg.point_step * msg.width
+        msg.is_dense = True
+        msg.data = np.ascontiguousarray(points).tobytes()
+        self._virtual_obstacle_pub.publish(msg)
+        logger.info("virtual_obstacles published: %d 个点 -> %s",
+                    len(points), config.VIRTUAL_OBSTACLE_TOPIC)
 
     def publish_initial_path(self, points: List[dict]) -> None:
         """下发 navi_mode=3 (REFERENCE_PATH) 用的全局参考路径 (/initial_path)。

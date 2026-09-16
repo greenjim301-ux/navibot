@@ -2,6 +2,8 @@ import asyncio
 import logging
 from typing import List, Optional
 
+import numpy as np
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +33,7 @@ from .models import (
 )
 from . import global_planner
 from . import path_planner
+from . import virtual_obstacles
 from .ros_bridge import RosBridge
 from .route_manager import RouteManager
 from .route_store import RouteStore, validate_route_id
@@ -141,6 +144,9 @@ async def on_startup() -> None:
     route_manager = RouteManager(ros_bridge, ws_manager)
     mapping_manager = MappingManager(ros_bridge, mapping_ws_manager, map_registry)
     ros_bridge.start()
+    # 开机就把当前激活地图的禁行区发一遍: 话题是 latched 的, 这样 hand-lio 不管
+    # 什么时候起来都能立刻拿到, 不用等用户下次改禁行区。
+    _republish_virtual_obstacles()
     logger.info("navibot backend started")
 
 
@@ -380,6 +386,9 @@ async def activate_map(name: str):
         await run_in_threadpool(map_registry.activate_map, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # 换图要重发虚拟障碍: 那份点云是按激活地图的坐标系算的, 不跟着换会把上一张图
+    # 的墙留在新图上(见 _republish_virtual_obstacles)。
+    await run_in_threadpool(_republish_virtual_obstacles)
     info = await run_in_threadpool(map_registry.get_map_info, name)
     if info is None:
         raise HTTPException(404, f"地图 '{name}' 不存在")
@@ -393,6 +402,9 @@ async def deactivate_map(name: str):
         await run_in_threadpool(map_registry.deactivate_map, name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # 换图要重发虚拟障碍: 那份点云是按激活地图的坐标系算的, 不跟着换会把上一张图
+    # 的墙留在新图上(见 _republish_virtual_obstacles)。
+    await run_in_threadpool(_republish_virtual_obstacles)
     info = await run_in_threadpool(map_registry.get_map_info, name)
     if info is None:
         raise HTTPException(404, f"地图 '{name}' 不存在")
@@ -409,6 +421,34 @@ async def delete_map(name: str):
     # 可能完全不同, 旧编辑套上去会落在毫无关系的地方。放在这里而不是
     # map_registry 里, 是为了避免 map_edit_store <-> map_registry 循环导入。
     await run_in_threadpool(map_edit_store.delete_all, name)
+    await run_in_threadpool(_republish_virtual_obstacles)
+
+
+def _republish_virtual_obstacles() -> None:
+    """把**当前激活地图**的禁行区重新采样并发布给 hand-lio(见 virtual_obstacles.py)。
+
+    只发激活地图的: 机器狗的位姿是在激活地图的坐标系里的, 把另一张图的多边形发
+    出去等于往毫无关系的位置凭空造墙。没有激活地图就发空的 —— 空表示"现在没有
+    虚拟障碍", 订阅方据此清掉上一批, 比什么都不发好(不发的话对方会一直留着)。
+
+    整个过程失败不该影响调用方那个请求(用户只是改了个禁行区), 所以吞掉异常只记
+    日志; ROS 没连上时 publish_virtual_obstacles 自己会先记下来等连上再补发。
+    """
+    if not config.VIRTUAL_OBSTACLE_ENABLED:
+        return
+    try:
+        active = map_registry.get_active()
+        if active is None:
+            points = np.zeros((0, 3), dtype=np.float32)
+        else:
+            points = virtual_obstacles.build_points(
+                active,
+                map_edit_store.get_edits(active).regions,
+                route_manager.get_altitude_calibration(active),
+            )
+        ros_bridge.publish_virtual_obstacles(points)
+    except Exception as e:
+        logger.warning("virtual_obstacles: 重新发布失败(不影响本次请求): %s", e)
 
 
 # ---- 地图编辑区域 (map_edit_store.py) ----
@@ -433,9 +473,11 @@ async def add_map_edit(name: str, req: CreateMapEditRequest):
     if info is None:
         raise HTTPException(404, f"地图 '{name}' 不存在")
     try:
-        return await run_in_threadpool(
+        region = await run_in_threadpool(
             map_edit_store.add_region, name, req.kind, req.points, req.note,
         )
+        await run_in_threadpool(_republish_virtual_obstacles)
+        return region
     except ValueError as e:
         raise HTTPException(400, str(e))
     except RuntimeError as e:
@@ -446,9 +488,11 @@ async def add_map_edit(name: str, req: CreateMapEditRequest):
 async def update_map_edit(name: str, region_id: str, req: UpdateMapEditRequest):
     """目前只用来开关 enabled(临时停用而不删除); 改形状请删了重画。"""
     try:
-        return await run_in_threadpool(
+        region = await run_in_threadpool(
             map_edit_store.update_region, name, region_id, req.enabled, req.note,
         )
+        await run_in_threadpool(_republish_virtual_obstacles)
+        return region
     except ValueError as e:
         raise HTTPException(400, str(e))
     except RuntimeError as e:
@@ -459,6 +503,7 @@ async def update_map_edit(name: str, region_id: str, req: UpdateMapEditRequest):
 async def delete_map_edit(name: str, region_id: str):
     try:
         await run_in_threadpool(map_edit_store.delete_region, name, region_id)
+        await run_in_threadpool(_republish_virtual_obstacles)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except RuntimeError as e:
