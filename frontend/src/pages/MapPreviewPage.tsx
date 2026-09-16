@@ -3,17 +3,21 @@ import { Link, useParams } from "react-router-dom";
 import {
   ArrowLeft, PanelRight, X, Target, RefreshCw,
   ZoomIn, ZoomOut, RotateCcw, RotateCw,
-  MapPin, CircleCheck, Trash2, Play, Flag, OctagonX,
+  MapPin, CircleCheck, Trash2, Play, Flag, OctagonX, Squircle, Ban, Check,
 } from "lucide-react";
 import {
-  estop, getMapTrajectory, listServices, planPath, setInflationMap, setSelfInflation, setSurfCloud,
-  startService, stopService, submitRoute,
+  addMapEdit, deleteMapEdit, estop, getMapTrajectory, listMapEdits, listServices, planPath,
+  setInflationMap, setSelfInflation, setSurfCloud, startService, stopService, submitRoute,
+  updateMapEdit,
 } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
-import type { PlannedRoutePoint, ServiceActiveState, ServiceInfo, TrailPoint, Waypoint, XY } from "../types";
+import type {
+  MapEditKind, MapEditRegion,
+  PlannedRoutePoint, ServiceActiveState, ServiceInfo, TrailPoint, Waypoint, XY,
+} from "../types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -316,6 +320,22 @@ export default function MapPreviewPage() {
     start: null, goal: null,
   });
   const [startGoalPicking, setStartGoalPicking] = useState(false);
+
+  // 地图编辑区域(人工标"这块其实能走"/"这块其实不能走", 见
+  // backend/app/map_edit_store.py)。**只在 2D 视图里编辑** —— 多边形是画在
+  // 栅格图上的世界坐标, 3D 视图里没有对应的作图平面。
+  const [regions, setRegions] = useState<MapEditRegion[]>([]);
+  const [regionDraftKind, setRegionDraftKind] = useState<MapEditKind | null>(null);
+  const [regionDraft, setRegionDraft] = useState<XY[]>([]);
+  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
+  const [regionError, setRegionError] = useState<string | null>(null);
+  const [regionsVisible, setRegionsVisible] = useState(true);
+
+  const refreshRegions = useCallback(() => {
+    if (!name) return;
+    listMapEdits(name).then((e) => setRegions(e.regions)).catch(() => setRegions([]));
+  }, [name]);
+  useEffect(refreshRegions, [refreshRegions]);
   const [plannedRoute, setPlannedRoute] = useState<PlannedRoutePoint[] | null>(null);
   const [planning, setPlanning] = useState(false);
   const hasStartGoal = Boolean(startGoal.start || startGoal.goal);
@@ -365,6 +385,7 @@ export default function MapPreviewPage() {
     // 手势, 三者语义互斥, 进拾取前把另外两个都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (startGoalPicking) setStartGoalPicking(false);
+    cancelRegionDraft();
     setRouteEditing(true);
   }
 
@@ -376,10 +397,67 @@ export default function MapPreviewPage() {
     setWaypoints(next.slice(-1));
   }
 
+  function cancelRegionDraft() {
+    setRegionDraftKind(null);
+    setRegionDraft([]);
+    setRegionError(null);
+  }
+
+  /** 开始画一块区域。跟另外三个拾取模式互斥(它们在 2D/3D 里共用同一个左键手势)。 */
+  function handleStartRegionDraft(kind: MapEditKind) {
+    if (regionDraftKind === kind) { cancelRegionDraft(); return; }
+    if (recentering) pcRef.current?.toggleRecenter();
+    if (routeEditing) setRouteEditing(false);
+    if (startGoalPicking) setStartGoalPicking(false);
+    setSelectedRegionId(null);
+    setRegionDraft([]);
+    setRegionError(null);
+    setRegionDraftKind(kind);
+  }
+
+  /** 完成当前多边形。后端还会再挡一次(少于 3 点、围不出面积), 这里只做最基本的
+   *  拦截, 免得白跑一次请求。 */
+  async function handleFinishRegion() {
+    if (!name || !regionDraftKind || regionDraft.length < 3) return;
+    try {
+      await addMapEdit(name, regionDraftKind, regionDraft);
+      cancelRegionDraft();
+      refreshRegions();
+      // 编辑区域会改变全局规划的结果, 上一次算出来的预览路线已经不作数了。
+      setPlannedRoute(null);
+    } catch (e) {
+      setRegionError(String(e));
+    }
+  }
+
+  async function handleDeleteRegion(id: string) {
+    if (!name) return;
+    try {
+      await deleteMapEdit(name, id);
+      setSelectedRegionId(null);
+      refreshRegions();
+      setPlannedRoute(null);
+    } catch (e) {
+      setRegionError(String(e));
+    }
+  }
+
+  async function handleToggleRegion(id: string, enabled: boolean) {
+    if (!name) return;
+    try {
+      await updateMapEdit(name, id, { enabled });
+      refreshRegions();
+      setPlannedRoute(null);
+    } catch (e) {
+      setRegionError(String(e));
+    }
+  }
+
   function handleStartStartGoalPick() {
     // 同上, 进起终点拾取前把"点选新中心点"/"设置目标点"都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (routeEditing) setRouteEditing(false);
+    cancelRegionDraft();
     setStartGoalPicking(true);
   }
 
@@ -577,6 +655,12 @@ export default function MapPreviewPage() {
                 showWaypointNumbers={false}
                 onChangeWaypoints={handleChangeGoalPoint}
                 editable={routeEditing}
+                regionDraftKind={regionDraftKind}
+                regionDraft={regionDraft}
+                onChangeRegionDraft={setRegionDraft}
+                regions={regionsVisible ? regions : []}
+                selectedRegionId={selectedRegionId}
+                onSelectRegion={setSelectedRegionId}
                 startGoalPickMode={startGoalPicking}
                 startGoal={startGoal}
                 onChangeStartGoal={setStartGoal}
@@ -647,7 +731,15 @@ export default function MapPreviewPage() {
                 <PanelSection title="地图">
                   <div className="mb-4 flex items-center justify-between text-xs text-white/70">
                     <span>显示方式</span>
-                    <Select value={viewMode} onValueChange={(v) => setViewMode(v as ViewMode)}>
+                    {/* 切到 3D 时把没画完的多边形丢掉: 草稿只能在 2D 栅格图上加点,
+                        留着它会让面板一直显示"取消绘制"却没地方画。 */}
+                    <Select
+                      value={viewMode}
+                      onValueChange={(v) => {
+                        if (v === "3d") cancelRegionDraft();
+                        setViewMode(v as ViewMode);
+                      }}
+                    >
                       <SelectTrigger
                         size="sm"
                         className="w-28 border-white/15 bg-white/5 text-white/90 hover:bg-white/10 focus-visible:ring-cyan-400/40 data-[size=sm]:h-7"
@@ -912,6 +1004,105 @@ export default function MapPreviewPage() {
                     />
                   </div>
                 </PanelSection>
+
+                {/* 地图编辑: 人工补救 detect_structure 的误判(见
+                    backend/app/map_edit_store.py)。**只能在 2D 栅格图上画** ——
+                    多边形存的是世界坐标, 3D 点云里没有对应的作图平面, 所以切到
+                    3D 时整节置灰(不改状态, 只是这个视图下用不上), 跟"图层"那节
+                    对 2D 的做法互为镜像。 */}
+                <PanelSection
+                  title="地图编辑"
+                  right={<span className="font-mono text-white/40">{regions.length} 个</span>}
+                >
+                  <label className="mb-2.5 flex items-center justify-between text-xs text-white/70">
+                    显示编辑区域
+                    <Switch
+                      className={PANEL_SWITCH_CLASS}
+                      checked={regionsVisible}
+                      onCheckedChange={setRegionsVisible}
+                    />
+                  </label>
+
+                  <div className={cn("flex flex-col gap-1.5 transition-opacity", viewMode === "3d" && "pointer-events-none opacity-40")}>
+                    <PanelButton
+                      icon={Squircle}
+                      label={regionDraftKind === "passable" ? "取消绘制" : "圈可通行区"}
+                      active={regionDraftKind === "passable"}
+                      disabled={viewMode === "3d"}
+                      title="把被误判成障碍的地方改回能走"
+                      onClick={() => handleStartRegionDraft("passable")}
+                    />
+                    <PanelButton
+                      icon={Ban}
+                      label={regionDraftKind === "blocked" ? "取消绘制" : "圈禁行区"}
+                      active={regionDraftKind === "blocked"}
+                      disabled={viewMode === "3d"}
+                      title="把被误判成可通行的地方改成不能走(比如路边的沟)"
+                      onClick={() => handleStartRegionDraft("blocked")}
+                    />
+                    {regionDraftKind && (
+                      <PanelButton
+                        icon={Check}
+                        label={`完成 (已 ${regionDraft.length} 个顶点)`}
+                        disabled={regionDraft.length < 3}
+                        onClick={handleFinishRegion}
+                      />
+                    )}
+                  </div>
+
+                  <p className="mt-2 text-[11px] leading-relaxed text-white/40">
+                    {viewMode === "3d"
+                      ? "切到 2D 栅格图才能编辑"
+                      : regionDraftKind
+                        ? "左键加顶点, 右键撤销上一个; 至少 3 个点才能闭合"
+                        : "只影响全局规划, 管不住局部避障"}
+                  </p>
+                  {regionError && (
+                    <p className="mt-1.5 text-[11px] leading-relaxed text-rose-300/90">{regionError}</p>
+                  )}
+
+                  {regions.length > 0 && (
+                    <div className="mt-3 flex flex-col gap-1">
+                      {regions.map((r) => (
+                        <div
+                          key={r.id}
+                          className={cn(
+                            "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+                            selectedRegionId === r.id
+                              ? "border-cyan-400/40 bg-cyan-500/10"
+                              : "border-white/10 bg-white/5",
+                          )}
+                        >
+                          <button
+                            type="button"
+                            className="min-w-0 flex-1 truncate text-left"
+                            onClick={() => setSelectedRegionId(selectedRegionId === r.id ? null : r.id)}
+                          >
+                            <span className={r.kind === "passable" ? "text-emerald-300" : "text-rose-300"}>
+                              {r.kind === "passable" ? "可通行" : "禁行"}
+                            </span>
+                            <span className="text-white/40"> · {r.points.length} 点{r.enabled ? "" : " · 已停用"}</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="shrink-0 rounded px-1.5 py-0.5 text-white/50 hover:bg-white/10 hover:text-white"
+                            onClick={() => handleToggleRegion(r.id, !r.enabled)}
+                          >
+                            {r.enabled ? "停用" : "启用"}
+                          </button>
+                          <button
+                            type="button"
+                            className="shrink-0 rounded px-1.5 py-0.5 text-rose-300/70 hover:bg-rose-500/15 hover:text-rose-200"
+                            onClick={() => handleDeleteRegion(r.id)}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </PanelSection>
+
               </div>
             </div>
           )}

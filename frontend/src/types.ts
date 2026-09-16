@@ -216,6 +216,33 @@ export interface MappingStatus {
   updated_at: number;
 }
 
+/** 地图上人工标注的一块多边形区域, 见 backend/app/map_edit_store.py。
+ *  - passable: "这块其实能走" —— 补救被误判成障碍的地方
+ *  - blocked:  "这块其实不能走" —— 补救被误判成可通行的地方
+ *
+ *  **points 是世界坐标 (m), 不是像素** —— 2D 图的分辨率会随地图跨度自动变,
+ *  存像素在重新预处理之后会整体错位。首尾不重复(闭合是隐含的), 至少 3 个点。
+ *
+ *  **只影响全局规划**, 管不住 SCAN-Planner 的局部避障(它有自己的实时 3D 栅格图)。
+ *  passable 尤其要注意: 它只能修正离线建图的误判, 修不了实时传感器看到的东西。 */
+export type MapEditKind = "passable" | "blocked";
+
+export interface MapEditRegion {
+  id: string;
+  kind: MapEditKind;
+  points: XY[];
+  note: string;
+  /** 临时停用而不删除 */
+  enabled: boolean;
+  created_at: number;
+}
+
+export interface MapEdits {
+  map_name: string;
+  regions: MapEditRegion[];
+  updated_at: number;
+}
+
 /** 巡检路线上的一个导航点, 见 backend/app/models.py 的 RoutePoint。
  *
  *  **故意继承 Waypoint**: TopView 的 waypoints/onChangeWaypoints 收发的是
