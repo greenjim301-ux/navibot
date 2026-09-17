@@ -249,6 +249,17 @@ def _dist_at(field, pts: np.ndarray) -> np.ndarray:
     return dist[r, c]
 
 
+def _poly_area(poly: np.ndarray) -> float:
+    """多边形面积(鞋带公式, 取绝对值)。
+
+    用来在写进 store 之前先把退化的多边形筛掉 —— map_edit_store.add_region 对
+    "围不出面积(共线或重合)"是直接抛 ValueError 的, 而它是在 --replace 已经删掉
+    旧区域**之后**才被调用, 抛出去就留下一个写了一半的状态(踩过)。
+    """
+    x, y = poly[:, 0], poly[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
 def _ribbon(inner: np.ndarray, field, thickness: float):
     """一段等值线 + 它朝外推 thickness 之后的那条线, 首尾相接成一个细长多边形。
 
@@ -476,7 +487,15 @@ def main() -> int:
                     chunk = line[i:i + max_pts]
                     if len(chunk) < 2:
                         continue
-                    out.append(_ribbon(chunk, field, args.thickness))
+                    # 简化 + 切段之后可能剩下一小截几乎重合的点, 铺出来是条零面积的
+                    # 线。store 那边会直接抛 ValueError, 而那时 --replace 已经把旧
+                    # 区域删了 —— 留下一个写了一半的状态。这里先筛掉。
+                    if np.linalg.norm(np.diff(chunk, axis=0), axis=1).sum() < args.thickness:
+                        continue
+                    poly = _ribbon(chunk, field, args.thickness)
+                    if _poly_area(poly) < args.thickness * args.thickness:
+                        continue
+                    out.append(poly)
         return out
 
     if args.close_ends:
@@ -521,6 +540,18 @@ def main() -> int:
         print("  --dry-run: 不写入, 下面的复验是把这批区域临时叠上去算的")
         check_regions = _as_regions(polygons)
     else:
+        # **先校验再动 store**: add_region 会对退化多边形/顶点过多抛异常, 而它是在
+        # --replace 删完旧区域之后才调用的, 中途抛出去就留下一个写了一半的状态。
+        bad = [
+            (i, poly) for i, poly in enumerate(polygons)
+            if len(poly) < 3 or len(poly) > config.MAP_EDIT_MAX_VERTICES
+            or _poly_area(poly) < 1e-6
+        ]
+        if bad:
+            print(f"  !! {len(bad)} 个区域不合法(顶点数或面积), 没有写入任何东西。"
+                  f"第一个: {len(bad[0][1])} 个顶点, 面积 {_poly_area(bad[0][1]):.2e}")
+            return 1
+
         if args.replace:
             old = [r for r in store.get_edits(args.name).regions if r.note.startswith(AUTO_NOTE)]
             for r in old:
