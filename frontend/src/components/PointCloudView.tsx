@@ -315,9 +315,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   useEffect(() => {
     onFollowingChangeRef.current?.(following);
   }, [following]);
-  const robotPosRef = useRef<{ x: number; y: number } | null>(null);
+  // 带 z: 镜头跟随要在三维上跟(见 updateFollow), 只跟 x/y 的话上下楼/上下坡时
+  // 视角中心会停在原来那个高度上, 狗越走越低(或越高)。
+  const robotPosRef = useRef<{ x: number; y: number; z: number } | null>(null);
   robotPosRef.current = status?.robot_pose
-    ? { x: status.robot_pose.x, y: status.robot_pose.y }
+    ? { x: status.robot_pose.x, y: status.robot_pose.y, z: status.robot_pose.z }
     : null;
 
   useEffect(() => {
@@ -939,11 +941,24 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 镜头跟随: 把 controls.target 和相机位置按同一个增量平移, 相对偏移不变,
     // 所以用户自己转到的视角和缩放都保留, 只是画面中心跟着机器狗走。每帧只
     // 追一小部分距离(而不是直接吸附), 机器狗移动时镜头是平滑跟过去的。
+    //
+    // **z 也要跟。** 原来 z 增量写死成 0(默认地面只有一个高度), 上下楼/上下坡时
+    // 视角中心就停在出发时那个高度上: save_map_large_1 从最高点走到最低点落差约
+    // 15m, 到终点时 target 悬在狗头顶 15m, 看着就是"镜头很高"; 而滚轮缩放是朝
+    // target 收的, minDistance 再小也只是贴近那个空中的点, 狗永远在 15m 外 ——
+    // 表现为"拉不近"(用户报的就是这个)。机器狗标记本来就画在真实的 pose.z 上
+    // (见下面那个 effect), 跟随不跟 z 是不自洽的。
+    //
+    // z 用 odom 的机体高度, 走路时那几厘米的起伏由下面 0.12 的插值吃掉, 看不出来。
     const followDelta = new THREE.Vector3();
     function updateFollow() {
       const robot = robotPosRef.current;
       if (!followingRef.current || !robot) return;
-      followDelta.set(robot.x - controls.target.x, robot.y - controls.target.y, 0);
+      followDelta.set(
+        robot.x - controls.target.x,
+        robot.y - controls.target.y,
+        robot.z - controls.target.z,
+      );
       if (followDelta.lengthSq() < 1e-6) return;
       followDelta.multiplyScalar(0.12);
       controls.target.add(followDelta);

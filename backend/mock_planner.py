@@ -54,8 +54,8 @@ from std_msgs.msg import ColorRGBA, Empty, Header
 from visualization_msgs.msg import Marker
 import tf.transformations as tft
 
-SPEED_M_S = 0.4
-CLIMB_SPEED_M_S = 0.15   # 爬升慢一些, 让"上楼梯"这段在时间上看得出来
+SPEED_M_S = 0.8
+CLIMB_SPEED_M_S = 0.3   # 爬升慢一些, 让"上楼梯"这段在时间上看得出来
 YAW_RATE_RAD_S = 1.5
 WAYPOINT_ARRIVAL_RADIUS_M = 0.3   # 对齐 fsm/waypoint_arrival_radius, 只用于途中点提前切换
 DEGENERATE_DIST_M = 0.05         # 对齐 kDegenerateDist, 只用于跳过和当前位置重合的点
