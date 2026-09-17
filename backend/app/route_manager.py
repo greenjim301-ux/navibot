@@ -3,7 +3,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
@@ -72,9 +72,14 @@ class RouteManager:
     STUCK_TIMEOUT_S = 60.0
     STUCK_PROGRESS_EPS_M = 0.15
 
-    def __init__(self, ros_bridge: RosBridge, ws_manager: WebSocketManager) -> None:
+    def __init__(self, ros_bridge: RosBridge, ws_manager: WebSocketManager,
+                 active_map_fn: Optional[Callable[[], Optional[str]]] = None) -> None:
         self._ros = ros_bridge
         self._ws = ws_manager
+        # "当前激活的是哪张图"。机器狗的 odom 只在激活地图的坐标系里有意义, 拿它
+        # 去给别的地图算高度标定 Δ 会得到一个纯垃圾值(见 _odom_delta)。传 None
+        # 就退回不做这个检查(单元测试/不关心地图的场景)。
+        self._active_map_fn = active_map_fn
         self._lock = threading.Lock()
 
         self._state = TaskState.IDLE
@@ -189,6 +194,18 @@ class RouteManager:
         轨迹点, 不再是 None, 见该函数的说明。
         """
         if not map_name or pose is None:
+            return None
+        # 位姿是"激活地图"坐标系里的量, 换一张图算 Δ 完全没有意义 —— ground_
+        # elevation 会拿狗在**别的图**里的 (x, y) 去 map_name 这张图上找最近的
+        # 轨迹点, 两个毫不相干的位置凑出来的差值可以差出几十米(实测: 狗在
+        # save_map_large_1 上走一圈, 对 save_map_small_1 算出的 Δ 在 -26.6 ~
+        # -0.2m 之间), 整条预览路线会被整体搬走, 跟点云完全对不上。
+        active = self._active_map_fn() if self._active_map_fn is not None else None
+        if self._active_map_fn is not None and map_name != active:
+            logger.warning(
+                "map=%s 不是当前激活地图(%s), 机器狗位姿不在这张图的坐标系里, 不做高度标定",
+                map_name, active,
+            )
             return None
         ground = path_planner.ground_elevation(map_name, pose.x, pose.y)
         return None if ground is None else pose.z - ground

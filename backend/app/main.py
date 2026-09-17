@@ -143,7 +143,9 @@ async def on_startup() -> None:
         on_mapping_pose=_on_mapping_pose, on_mapping_surround_cloud=_on_mapping_surround_cloud,
         on_mapping_surf_cloud=_on_mapping_surf_cloud,
     )
-    route_manager = RouteManager(ros_bridge, ws_manager)
+    # 传 map_registry.get_active: 机器狗位姿只在激活地图的坐标系里有意义, 预览
+    # 别的地图时不能拿它算高度标定 Δ(见 RouteManager._odom_delta)。
+    route_manager = RouteManager(ros_bridge, ws_manager, map_registry.get_active)
     mapping_manager = MappingManager(ros_bridge, mapping_ws_manager, map_registry)
     ros_bridge.start()
     # 开机就把当前激活地图的禁行区发一遍: 话题是 latched 的, 这样 hand-lio 不管
