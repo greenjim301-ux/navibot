@@ -80,6 +80,11 @@ class RouteManager:
         self._state = TaskState.IDLE
         # navi_mode=3(见 mark_reference_path_dispatched)是不是正有一条参考
         # 路线在跑, 跟上面 self._state 这套 navi_mode=2 状态机完全独立维护。
+        #
+        # **现在恒为 False**: 路线执行改走 navi_mode=2 之后, 前端两处 planPath 都传
+        # publish=false, mark_reference_path_dispatched 不会被调到。下面几处提到
+        # navi_mode=3 的地方(estop / on_planning_finished / get_status)讲的都是这条
+        # **还在但没人走**的链路 —— 逻辑没问题, 只是实际上跑不到。
         self._reference_path_active: bool = False
         self._waypoints: List[Waypoint] = []
         self._dispatched_z: List[float] = []
@@ -288,12 +293,16 @@ class RouteManager:
     def mark_reference_path_dispatched(self, map_name: Optional[str]) -> None:
         """navi_mode=3(/api/maps/{name}/plan_path, publish=true)成功下发
         /initial_path 之后调用(main.py 的 plan_path 端点里, published=True
-        时才调)。这条下发链路完全不经过 submit_route/self._state 那一套
-        navi_mode=2 状态机(见类文档), 单独用 self._reference_path_active
-        表示"navi_mode=3 现在是不是有一条在跑", 广播给前端——前端靠它决定
-        要不要显示"停止导航"按钮/禁用途经点编辑, 不依赖对 navi_mode=3 天生
-        不准的 self._state。跟 self._map_name 共用同一个字段(两条下发链路
-        不会同时跑, 单机同一时间只有一个任务)。"""
+        时才调)。
+
+        **现在没有调用方**: 路线执行改走 navi_mode=2 之后, 前端两处 planPath 都传
+        publish=false, published 恒为 False, 所以这里根本不会被调到。留着是因为
+        这条链路跟 mode 2 正交, 不碍事。
+
+        这条下发链路完全不经过 submit_route/self._state 那一套 navi_mode=2 状态机
+        (见类文档), 所以单独用 self._reference_path_active 表示"mode 3 是不是有
+        一条在跑"。跟 self._map_name 共用同一个字段(两条下发链路不会同时跑, 单机
+        同一时间只有一个任务)。"""
         with self._lock:
             self._reference_path_active = True
             self._map_name = map_name

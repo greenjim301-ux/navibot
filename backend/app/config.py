@@ -53,13 +53,16 @@ import os
 MAP_FRAME = os.environ.get("NAVIBOT_MAP_FRAME", "world")
 
 PRESET_WAYPOINTS_TOPIC = os.environ.get("NAVIBOT_WAYPOINTS_TOPIC", "/preset_waypoints")
-# navi_mode=3 (REFERENCE_PATH) 订阅的全局参考路径话题, 跟 preset_waypoints 是
-# 两条不同的下发链路——3 号模式吃的是稀疏关键点, 自己在 pathCallback 里内部
-# 抽稀+拟合成 min-snap 曲线当参考轨迹, 不是逐点下发的状态机(没有
-# waypoint_arrival_radius 那套途中点判定)。z 也不是"原样机体高度": pathCallback
-# 会在存入前给收到的 z 加上 body_height_(grid_map/body_height), 那是 planner
-# 自己的配置项, 我们发布时不用管。见 global_planner.py 和
-# RosBridge.publish_initial_path。
+# navi_mode=3 (REFERENCE_PATH) 订阅的全局参考路径话题。**现在没有调用方** ——
+# 路线执行走 navi_mode=2(上面那个 PRESET_WAYPOINTS_TOPIC), 前端两处 planPath 都传
+# publish=false。实测 mode 3 对全局路线的贴合度不稳定, 狗不一定真的顺着线走。
+#
+# 留着的这条链路跟 mode 2 完全独立: 3 号模式吃的是稀疏关键点, 自己在 pathCallback
+# 里**按 >=0.5m 抽稀**再拟合成 min-snap 曲线当参考轨迹, 没有 waypoint_arrival_radius
+# 那套逐点到达判定。**那条 0.5m 抽稀只存在于 mode 3**, mode 2 的
+# presetWaypointsCallback 一个点都不抽。z 也不是"原样机体高度": pathCallback 会在
+# 存入前给收到的 z 加上 body_height_(grid_map/body_height), 那是 planner 自己的
+# 配置项, 我们发布时不用管。见 RosBridge.publish_initial_path。
 INITIAL_PATH_TOPIC = os.environ.get("NAVIBOT_INITIAL_PATH_TOPIC", "/initial_path")
 # 跟 WAYPOINTS_SUB_WAIT_S 同理: /initial_path 不 latch, 发之前等订阅者连上
 INITIAL_PATH_SUB_WAIT_S = float(os.environ.get("NAVIBOT_INITIAL_PATH_WAIT_S", "5.0"))

@@ -252,20 +252,22 @@ async def map_trajectory(name: str):
 
 @app.post("/api/maps/{name}/plan_path", response_model=PlanPathResponse)
 async def plan_path(name: str, req: PlanPathRequest):
-    """基于 2D 栅格图规划一条全局路径(global_planner.plan_path), 补好 z 后
-    尝试下发给 navi_mode=3 (REFERENCE_PATH, /initial_path)。
+    """基于 2D 栅格图规划一条全局路径(global_planner.plan_path), 补好 z 返回。
 
-    跟 /api/route (navi_mode=2, preset_waypoints) 是完全不同的下发链路——不
-    经过 RouteManager 的状态机(navi_mode=3 没有逐点到达判定, 见
-    global_planner.py 模块 docstring)。规划本身失败(起点/终点太靠近障碍物、
-    两点之间没有可行路径)算 400, 是真正的失败; 但"下发"这一步不影响这个
-    接口的成功与否——ROS bridge 没起来、没有 planner 订阅 /initial_path 都
-    只在响应里标成 published=False + publish_error, 不让整个请求跟着报错。
-    这样前端拿到规划结果就能先把路线画出来, 不用因为机器狗那边没连上就连
-    "规划得对不对"都看不到; 想知道有没有真的发下去, 看 published 字段。
+    **实际用法是 publish=false**: 前端拿到这些拐点之后, 是把它们当
+    navi_mode=2 的途经点、走 submit_route(/preset_waypoints)下发的, 不走这里的
+    下发分支(见 MapPreviewPage 的 handleStartNav)。所以这个端点现在基本就是个
+    "算路线"接口。
 
-    req.publish=False 时直接跳过下发这一步(见 PlanPathRequest.publish 的
-    说明)——给"只看看规划结果, 不想真的让机器狗动"这种预览场景用。
+    publish=true 会把结果发到 /initial_path(navi_mode=3, REFERENCE_PATH)。
+    **那条链路还在, 但现在没有调用方** —— 实测 mode 3 对全局路线的贴合度不稳定,
+    狗不一定真的顺着这条线走, 所以改成了 mode 2。留着是因为它跟 mode 2 完全独立
+    (不经过 RouteManager 的状态机, 也没有逐点到达判定), 删不删都不影响 mode 2。
+
+    规划本身失败(起点/终点太靠近障碍物、两点之间没有可行路径)算 400, 是真正的
+    失败; 但"下发"这一步不影响这个接口的成功与否——ROS bridge 没起来、没有
+    planner 订阅 /initial_path 都只在响应里标成 published=False + publish_error,
+    不让整个请求跟着报错。想知道有没有真的发下去, 看 published 字段。
     """
     # 规划失败时前端只弹一句话, 现场没人能复现"当时点的到底是哪两个点"。请求一
     # 进来就把地图名和起终点原样打出来, 跟下面失败那条日志配成一对, 照着 log 就

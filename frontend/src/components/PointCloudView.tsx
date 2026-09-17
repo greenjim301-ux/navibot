@@ -109,7 +109,7 @@ interface Props {
   /** global_planner.plan_path 规划出来的参考路线(世界坐标 + 已补好的 z), 只
    *  负责画一条线, 不参与任何拾取逻辑——由页面在拿到 /plan_path 的响应后传入。 */
   plannedRoute?: PlannedRoutePoint[] | null;
-  /** 真的下发给机器狗、正在跑(或刚跑完)的那条路线(navi_mode=3, /initial_path)。
+  /** 真的下发给机器狗、正在跑(或刚跑完)的那条路线。
    *  跟 plannedRoute 是两条独立的线、颜色也不同(见下面 navRouteMaterial),
    *  两者可能同时非空——地图预览页允许"这趟导航正在跑"和"顺手预览另一条路线"
    *  同时显示, 不做互斥/优先级合并。 */

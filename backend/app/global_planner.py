@@ -1,5 +1,9 @@
-"""基于 2D 栅格图 (map-assets-dir/<name>/map_2d.pgm + .yaml) 的全局路径规划,
-给 SCAN-Planner navi_mode=3 (REFERENCE_PATH) 用。
+"""基于 2D 栅格图 (map-assets-dir/<name>/map_2d.pgm + .yaml) 的全局路径规划。
+
+**产出是给 navi_mode=2 (/preset_waypoints) 用的途经点。** 路线执行现在只走 mode 2:
+前端算完路线(plan_path, publish=false)之后, 把这里吐出来的稀疏拐点当途经点通过
+submit_route 下发(见 MapPreviewPage 的 handleStartNav)。实测 mode 3 对全局路线的
+贴合度不稳定, 狗不一定真的顺着这条线走。
 
 这份 pgm/yaml 是 map_pipeline/generate_map_assets.py 重新生成的版本, 落在
 navibot 自己独占的资源目录(config.MAP_ASSETS_DIR)下, 不是
@@ -9,12 +13,16 @@ generate_map_assets.py 模块 docstring), global_planner 这边自然也不该�
 它——它是按固定扫描高度切片判占据的旧图, 没有本脚本这条流水线里
 detect_structure/clear_trajectory/mark_known_region 这些修正。
 
-跟 navi_mode=2 (/preset_waypoints, route_manager.py) 是完全不同的下发链路:
-navi_mode=3 订阅 /initial_path, 只读每个点的 position (orientation 不看), 内部
-自己按 >=0.5m 抽稀再拟合成一条 min-snap 曲线当参考轨迹, 真正的避障靠它自己的
-局部重规划(对着 grid_map_ 跑 bspline 优化), 不要求这里给出的路径本身无碰撞、
-也不要求点很密——稀疏的关键拐点就够, 太密反而白算(参考
-src/planner/plan_manage/src/scan_replan_fsm.cpp::pathCallback)。
+**"稀疏的关键拐点就够"这条对 mode 2 同样成立, 但理由不一样**, 别混:
+
+- mode 2 (现在用的): planner 一次只规划到**下一个航点**, 中间是一条两点五次曲线
+  (scan_replan_fsm.cpp:254 planNextWaypoint -> one_segment_traj_gen)。避障靠它自己
+  对着 grid_map_ 跑 bspline 优化, 所以不要求这里给的路径本身无碰撞。但间距**有
+  上限**: 那条五次曲线偏离直线弦的横向鼓包跟段长成正比, 段太长狗就飘出去了 ——
+  见 config 的 GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 和 README 那一节。
+- mode 3 (/initial_path, 现在没有调用方): 它会把整串点按 >=0.5m 抽稀再拟合成一条
+  min-snap 曲线。**那条 0.5m 抽稀只存在于 mode 3**, mode 2 的 presetWaypointsCallback
+  一个点都不抽 —— 早期注释把这条写到 mode 2 身上过, 是错的。
 
 z 直接用 path_planner.ground_elevation + route_manager 的位姿标定 Δ (跟
 /preset_waypoints、/api/maps/{name}/ground 用的是同一套), 不减 body_height_ ——

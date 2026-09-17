@@ -37,10 +37,14 @@ class PlanPathRequest(BaseModel):
     start: XY
     goal: XY
     publish: bool = True
-    """是否把规划结果下发给 /initial_path (navi_mode=3)。默认 True 保持原行为；
-    前端"路线预览"这类只是想看看规划结果、不想真的让机器狗动的场景应该传
-    False——传 False 时 main.py 的 plan_path 直接跳过下发这一步, 响应里
-    published 恒为 False 且 publish_error 恒为 None(不是失败, 是没打算发)。"""
+    """是否把规划结果下发给 /initial_path (navi_mode=3)。
+
+    **前端两处调用都传 False。** 路线执行走的是 navi_mode=2: 拿到这些拐点之后
+    当途经点走 submit_route 下发(见 MapPreviewPage 的 handleStartNav)。默认值
+    True 是早期行为的遗留, 没有调用方依赖它。
+
+    传 False 时 main.py 的 plan_path 直接跳过下发这一步, 响应里 published 恒为
+    False 且 publish_error 恒为 None(不是失败, 是没打算发)。"""
 
 
 class PlanPathPoint(BaseModel):
@@ -62,13 +66,15 @@ class MapTrajectoryResponse(BaseModel):
 
 class PlanPathResponse(BaseModel):
     """global_planner.plan_path 规划出来的关键拐点(已经叠加 ground_elevation
-    + Δ 补好 z, 不减 body_height_——见 global_planner.py), 跟实际下发给
-    /initial_path 的内容一致, 给前端预览/确认用。
+    + Δ 补好 z, 不减 body_height_——见 global_planner.py)。
 
-    points 只要规划本身成功就一定有值, 不受下发影响: published 才是"有没有
-    真的发给 /initial_path"——ROS bridge 没起来/没有 navi_mode=3 订阅这类下发
-    失败不会让整个请求报错(见 main.py 的 plan_path), published=False 时
-    publish_error 是失败原因, 给前端做一条非阻塞的提示用。"""
+    前端拿 points 画预览, 用户确认后**把它们当 navi_mode=2 的途经点走
+    submit_route 下发**(见 MapPreviewPage 的 handleStartNav)。
+
+    published / publish_error 只跟 publish=true 那条 /initial_path(navi_mode=3)
+    分支有关, **现在没有调用方**(前端两处都传 publish=false, 所以 published 恒为
+    False)。留着的语义: 下发失败(ROS bridge 没起来/没人订阅)不让整个请求报错,
+    只在响应里标出来。"""
     points: List[PlanPathPoint]
     published: bool
     publish_error: Optional[str] = None
@@ -104,10 +110,14 @@ class NavStatus(BaseModel):
     updated_at: float
     reference_path_active: bool = False
     """navi_mode=3(/api/maps/{name}/plan_path, publish=true)是否正有一条参考
-    路线在跑——这条下发链路完全不经过 state/waypoints/current_index 这套
-    navi_mode=2 的状态机(见 route_manager.RouteManager 类文档), 但前端仍然
-    需要一个"现在是不是在跑"的信号来决定要不要显示停止导航按钮/禁用途经点
-    编辑, 所以单独给一个字段, 不往 state 里硬塞一个它本不认识的语义。"""
+    路线在跑。这条下发链路完全不经过 state/waypoints/current_index 这套
+    navi_mode=2 的状态机(见 route_manager.RouteManager 类文档), 所以单独给一个
+    字段, 不往 state 里硬塞一个它本不认识的语义。
+
+    **现在恒为 False, 前端也没有任何地方读它**: 路线执行改走 navi_mode=2 之后,
+    前端两处 planPath 都传 publish=false, 没有人再调那条下发链路。"是不是在跑"
+    现在直接看 state(见 MapPreviewPage 的 navRunning)。字段留着是因为它跟 mode 2
+    正交, 删了要动前后端两边的类型。"""
 
 
 class MapStatus(str, Enum):

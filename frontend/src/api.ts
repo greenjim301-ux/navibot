@@ -136,14 +136,20 @@ export async function groundZ(
 }
 
 /** 基于 2D 栅格图规划一条全局路径 (A* + line-of-sight 剪枝, 见
- *  backend/app/global_planner.py), 后端会尝试补好 z 下发给 navi_mode=3
- *  (REFERENCE_PATH, /initial_path)。规划本身失败(算不出可行路径)才会让这个
- *  调用抛错——"下发"这一步失败(ROS bridge 没起来、没有 planner 订阅)不影响
- *  这次调用的成功, 只反映在 published/publishError 上, 见 published 字段的
- *  说明(backend/app/models.py PlanPathResponse)。 */
+ *  backend/app/global_planner.py), 返回补好 z 的关键拐点。
+ *
+ *  **本项目两处调用都传 publish=false**: 拿到这些拐点之后是把它们当
+ *  navi_mode=2 的途经点、走 submitRoute(/preset_waypoints)下发的, 见
+ *  MapPreviewPage 的 handleStartNav。publish=true 会让后端发到 /initial_path
+ *  (navi_mode=3), 那条链路还在但没有调用方 —— 实测 mode 3 对全局路线的贴合度
+ *  不稳定。
+ *
+ *  规划本身失败(算不出可行路径)才会让这个调用抛错——"下发"那一步失败只反映在
+ *  published/publishError 上, 不影响本次调用。 */
 export interface PlanPathResult {
   points: PlannedRoutePoint[];
-  /** 是否真的发给了 /initial_path; false 时路线已经算出来了, 只是没送到机器狗。 */
+  /** 是否真的发给了 /initial_path。**恒为 false** —— 两处调用都传 publish=false,
+   *  路线是算出来之后当 navi_mode=2 途经点下发的, 不走这条。 */
   published: boolean;
   publishError: string | null;
 }

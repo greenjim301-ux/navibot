@@ -432,6 +432,12 @@ CRUD，完全不碰 ROS。两者现在**没有任何连接**。
 | `/planning/finished` | `scan_planner/PlanFinished` | planner → backend，整轮任务结束一次（`REACHED` 或 `EMERGENCY_STOP`） |
 | `/hand_lio/odom_vehicle` | `nav_msgs/Odometry` | → backend，位姿 + `covariance[0]` 定位质量 |
 
+> **只用 `navi_mode=2`。** 后端还留着一条 `navi_mode=3`（`/initial_path`，REFERENCE_PATH）的下发链路
+> ——`POST /api/maps/{name}/plan_path` 传 `publish=true` 会走它——但**没有调用方**：前端两处
+> `planPath` 都传 `publish=false`，拿到规划出来的拐点之后当 mode 2 的途经点走 `submitRoute` 下发。
+> 实测 mode 3 对全局路线的贴合度不稳定，狗不一定真的顺着线走。相应地
+> `NavStatus.reference_path_active` 恒为 `false`，前端也没有地方读它。
+
 **几条必须照抄 planner 行为的地方**，抄错任何一条都会静默错位：
 
 1. **途中点的到达判定是 3D 距离 < `waypoint_arrival_radius`（0.3 m）**，靠订阅 odom 自己推进度；最后一个点没有这条提前退出，精度更高的确认来自下面第 4 条的 `/planning/finished`。
@@ -802,10 +808,10 @@ log_odds = count_hit >= count_hit_and_miss - count_hit ? prob_hit_log_ : prob_mi
 - **`detect_structure` 分不掉建图时扫到的人。** 人的躯干正好落在机体区间里。射线投射、SLAM 自己的自由空间图、时间持久性这三类方法都实测排除了——**家具对激光是多孔的**（椅子桌子大半是空隙，射线常年穿过），任何基于"射线穿没穿过"的判据都会把家具连同人一起铲掉。详见 `tools/probe_detect_structure.py`。目前只能靠建图时别让人进场景。
 - **传感器离地高度（`estimate_sensor_height`）不是机器人常数。** 实测室内三张图一致（0.529~0.545），但室外的 `large` 是 0.476——多半是草地/植被的回波抬高了"地面"。所以每张图各自量，不写死；量不出来时退回 0.55 并打印警告，那种情况下整张图的障碍判定会系统性偏移。
 - **巡检路线只有增删改查，没有执行。** 存下来的路线**发不出去** —— 没有"把这条路线
-  下发给机器狗"的接口，`schedule` 也没有任何调度器在读（见"巡检路线"一节）。接执行
-  时要决定的第一件事是：走 navi_mode=2（`/api/route`，逐点判到达）还是先过一遍
-  `global_planner.plan_path`，以及 `action`/`stay` 这两个字段该由谁来实现——planner
-  侧不认识它们。
+  下发给机器狗"的接口，`schedule` 也没有任何调度器在读（见"巡检路线"一节）。下发方式
+  本身已经不用选了（地图预览页那条现成的链路：`plan_path` 算拐点 → `submitRoute` 走
+  navi_mode=2），剩下的问题是 `action`/`stay` 这两个字段该由谁来实现——planner 侧不
+  认识它们。
 - **路线数据在 `data/routes/` 下，被 `.gitignore` 排除。** 这是用户自己创作的数据，
   跟 `web_assets/`（能从源头重新生成）不一样，换机器/重装要自己带走，没有任何导入
   导出功能。
