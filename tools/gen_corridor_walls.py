@@ -127,6 +127,64 @@ def _corridor_contours(traj_xy: np.ndarray, half_width: float, cell: float):
     return out, (dist, x_min, y_max, cell)
 
 
+def _open_end_caps(contour: np.ndarray, traj_xy: np.ndarray, half_width: float):
+    """把闭合等值线上"轨迹两端的那两个盖子"去掉, 返回若干条**开口**折线。
+
+    等值线是整条走廊的闭合边界, 首尾自然各扣一个半圆盖 —— 照着它铺墙就把走廊两头
+    也封死了, 狗从起点出不去、也进不到终点那一侧。
+
+    判据(对首/尾各做一次): 一个边界点属于端盖, 当且仅当
+      1) 离它最近的轨迹采样点正好是**首(或尾)那一个**, 且
+      2) 它在那个端点的**外侧** —— 沿端点切向的投影为正(尾)/为负(首)。
+    第 2 条是必须的: 光看"最近点是端点"会把紧挨端点的两侧墙也算进去(它们的最近点
+    同样是端点), 一刀切下去墙会从端点往回缺掉一截。加上投影之后切出来的正好是那
+    个半圆。
+
+    轨迹自己绕回起点附近时(闭环路线), 两个盖子会挨在一起甚至重合, 这时候开口就是
+    一个 —— 也对: 那儿本来就是同一个进出口。
+
+    返回的是开口折线(不再首尾相接), 调用方照常切段铺墙即可。全被判成端盖(轨迹短到
+    只有一个点)时返回空列表。
+    """
+    if len(traj_xy) < 2 or len(contour) < 3:
+        return [contour]
+
+    cap = np.zeros(len(contour), dtype=bool)
+    for idx, nxt in ((0, 1), (len(traj_xy) - 1, len(traj_xy) - 2)):
+        end = traj_xy[idx]
+        tangent = end - traj_xy[nxt]          # 由内指向外
+        n = float(np.linalg.norm(tangent))
+        if n < 1e-9:
+            continue
+        tangent = tangent / n
+        # 最近的轨迹采样点是不是这个端点(用平方距离, 不开根)
+        d2 = ((contour[:, 0][:, None] - traj_xy[None, :, 0]) ** 2
+              + (contour[:, 1][:, None] - traj_xy[None, :, 1]) ** 2)
+        nearest_is_end = np.argmin(d2, axis=1) == idx
+        outward = (contour - end) @ tangent > 0.0
+        cap |= nearest_is_end & outward
+
+    if not cap.any():
+        return [contour]
+    if cap.all():
+        return []
+
+    # 闭合环上按 cap 切段: 先转到某个被切掉的点上, 再顺着收连续的保留段
+    start = int(np.argmax(cap))
+    order = np.roll(np.arange(len(contour)), -start)
+    runs, cur = [], []
+    for i in order:
+        if cap[i]:
+            if len(cur) >= 2:
+                runs.append(contour[cur])
+            cur = []
+        else:
+            cur.append(i)
+    if len(cur) >= 2:
+        runs.append(contour[cur])
+    return runs
+
+
 def _dist_at(field, pts: np.ndarray) -> np.ndarray:
     """在距离场上最近邻取值, 用来判断"往哪边是外面"(离轨迹越远越外)。"""
     dist, x_min, y_max, cell = field
@@ -247,6 +305,9 @@ def main() -> int:
                     help="距离场栅格(m), 决定墙的几何精度。默认 0.05")
     ap.add_argument("--simplify", type=float, default=0.05,
                     help="折线简化容差(m), 直接决定要写多少个区域。默认 0.05")
+    ap.add_argument("--close-ends", action="store_true",
+                    help="连轨迹两端也封起来(改动前的行为)。默认两端敞开 —— 等值线是整条走廊的"
+                         "闭合边界, 首尾各扣一个半圆盖, 照着铺墙会把走廊两头堵死, 狗从起点出不去")
     ap.add_argument("--replace", action="store_true",
                     help=f"先删掉之前自动生成的区域(note 以 '{AUTO_NOTE}' 开头的), 手画的不动")
     ap.add_argument("--dry-run", action="store_true", help="只统计和复验, 不写入")
@@ -266,16 +327,27 @@ def main() -> int:
           f"总长 {sum(np.linalg.norm(np.diff(c, axis=0), axis=1).sum() for c in contours):.1f}m")
 
     polygons = []
+    n_opened = 0
     for contour in contours:
-        line = _simplify(contour, args.simplify)
-        if len(line) < 2:
-            continue
-        # 闭合等值线首尾重合, 分段时让相邻段共享一个点, 墙才不会断开
-        for i in range(0, len(line) - 1, max_pts - 1):
-            chunk = line[i:i + max_pts]
-            if len(chunk) < 2:
+        # 默认把轨迹两端的盖子去掉, 让走廊两头是敞开的 —— 不然狗从起点出不去。
+        pieces = [contour] if args.close_ends else _open_end_caps(contour, xy, args.half_width)
+        if not args.close_ends and (len(pieces) != 1 or len(pieces[0]) != len(contour)):
+            n_opened += 1
+        for piece in pieces:
+            line = _simplify(piece, args.simplify)
+            if len(line) < 2:
                 continue
-            polygons.append(_ribbon(chunk, field, args.thickness))
+            # 分段时让相邻段共享一个点, 墙才不会断开
+            for i in range(0, len(line) - 1, max_pts - 1):
+                chunk = line[i:i + max_pts]
+                if len(chunk) < 2:
+                    continue
+                polygons.append(_ribbon(chunk, field, args.thickness))
+    if args.close_ends:
+        print("  --close-ends: 两端也封起来")
+    else:
+        print(f"  两端敞开: {n_opened} 条等值线被切开了端盖"
+              f"{'(没有找到端盖, 可能是闭环轨迹)' if n_opened == 0 else ''}")
 
     if not polygons:
         print("  没有生成任何区域(轨迹太短?)")
