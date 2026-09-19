@@ -508,7 +508,12 @@ def _prune_path(path: List[RC], free: np.ndarray, cost_weight: np.ndarray,
     就能只在"直连真的会穿过原路径绕开的高代价区域"时才保留拐点, 其余情况
     (包括软惩罚区域内部的锯齿)照样能拉直成少数几个关键点。"""
     if len(path) <= 2:
-        return path
+        # 返回的是**下标**不是坐标(见 docstring 最后一行和 _enforce_min_spacing
+        # 的同名参数)。这里以前写的是 return path, 于是起终点落在同一格/相邻格
+        # (A* 原始路径只有 1~2 个格子)时会把 RC 坐标元组当下标返回, 调用方
+        # raw[i] 直接 TypeError —— save_map_stairs / save_map_bedroom 这种"建图
+        # 绕一圈回到原地"的图, 拿建图起止点当起终点规划就会踩到。
+        return list(range(len(path)))
     # 原始路径每一步的加权代价前缀和, 跟候选直连的加权代价比较用——O(1) 查
     # 任意一段 [anchor, j] 的原始代价, 不用每次重新扫一遍。
     cum_cost = [0.0]
