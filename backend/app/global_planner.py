@@ -18,8 +18,10 @@ detect_structure/clear_trajectory/mark_known_region 这些修正。
 - mode 2 (现在用的): planner 一次只规划到**下一个航点**, 中间是一条两点五次曲线
   (scan_replan_fsm.cpp:254 planNextWaypoint -> one_segment_traj_gen)。避障靠它自己
   对着 grid_map_ 跑 bspline 优化, 所以不要求这里给的路径本身无碰撞。但间距**有
-  上限**: 那条五次曲线偏离直线弦的横向鼓包跟段长成正比, 段太长狗就飘出去了 ——
-  见 config 的 GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 和 README 那一节。
+  上限**: 那条五次曲线偏离直线弦的横向鼓包跟段长成正比, 段太长狗就飘出去了。
+  **下限更要紧**: 段太短的话狗每到一个航点都要减速重规划, 实机上平地一冲一冲、
+  上下楼梯左右摆动。所以剪枝完还要沿折线等距重采样一遍(_resample_polyline),
+  让每段长度一致 —— 见 config 的 GLOBAL_PLANNER_WAYPOINT_SPACING_M 和 README。
 - mode 3 (/initial_path, 现在没有调用方): 它会把整串点按 >=0.5m 抽稀再拟合成一条
   min-snap 曲线。**那条 0.5m 抽稀只存在于 mode 3**, mode 2 的 presetWaypointsCallback
   一个点都不抽 —— 早期注释把这条写到 mode 2 身上过, 是错的。
@@ -621,41 +623,140 @@ def _enforce_min_spacing(path: List[RC], kept: List[int], free: np.ndarray, min_
     return out
 
 
-def _split_long_segments(points: List[XY], max_spacing: float) -> List[XY]:
-    """相邻途经点超过 max_spacing 就把这一段等分插点, 返回新的点列。
+def _resample_polyline(pts: List[RC], step_px: float, free: np.ndarray) -> List[RC]:
+    """把剪枝后的折线按弧长等距重新撒点, 让**每一段长度尽量一致**。
 
-    **为什么要有上限**(以及为什么这里以前写着"不要设上限")见 config 里
-    GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 的说明 —— 一句话: SCAN-Planner 的
-    navi_mode=2 一次只规划到下一个航点, 中间是一条两点五次曲线, 它偏离直线弦的
-    横向鼓包跟段长成正比, 所以**航点间距就是"允许局部规划器自由发挥的长度"**。
+    为什么不再是"只切太长的段": 短段才是实机上真正出问题的东西。轮足狗每到一个
+    航点都要减速进 waypoint_arrival_radius_(0.3m)再重规划下一段, 航点一密就
+    平地一冲一冲、上下楼梯左右摆动(用户实机实测)。而原来的做法只管上限不管下限,
+    短段到处都是:
 
-    等分而不是"按 max_spacing 切完留个零头": 零头段会短很多, 既没必要也会让间距
-    分布变得没规律。ceil(L / max_spacing) 份, 每份长度 L/ceil(...) <= max_spacing。
+      save_map_stairs 爬楼梯(水平 3.49m / 22° 坡): 10 个点, 段长中位 0.30m
+          —— max_climb=0.20 在楼梯上把段长钉成一级台阶一个点
+      save_map_small_1 那条 270m: 450 个点, 中位 0.59m, **最小 0.10m**
+          —— _enforce_min_spacing 遇到"并段会穿墙/爬升超限"就放弃并留下密点;
+             0.10m 比 reboundReplan 的 0.2m TOO_CLOSE_TO_GOAL 硬线还短, 那些段
+             planner 根本不生成轨迹, 还要给 continuous_failures_count_ 加一
 
-    插出来的点落在弦上, 而每一段弦都被 _prune_path/_enforce_min_spacing 用
-    _line_free 验证过无碰撞, 所以这一步不会引入碰撞。
+    所以改成沿折线等距重采样: 折线的**几何形状**由上游的剪枝/最小间距/爬升判据
+    决定, 这一步只决定**在这条形状上怎么撒航点**, 两件事分开。于是 max_climb
+    可以继续管得很严(折线贴着楼梯走), 而航点密度完全由这里说了算。
 
-    z 不在这里管 —— 调用方对每个点单独查 ground_elevation(见 main.py 的
-    plan_path), 插出来的点拿到的是**它自己那个位置**的地面高度, 不是两端的线性
-    插值。所以插点会让 z 剖面更贴合真实地面, 但**不保证单段爬升变小**: 实测
-    save_map_small_1 末尾那段平面 2.26m、两端 z 只差 0.038m, 等分之后中点的地面
-    高度是 44.359 —— 中间实际凹下去 0.24m, 原来那一段只是采样太粗没看见。于是
-    "超过 max_climb 的段"从 1 个变成 2 个。这不是变差, 是原来在撒谎; 但改完之后
-    爬升超限会更容易被看到, 别误判成爬升判据回归了。
+    份数用 round 不用 ceil: ceil 会系统性地把实际间距压到目标值以下(3.49m 配
+    0.8m -> 5 段 0.70m), 而这次要治的就是"太短", 宁可略长。round 给 4 段 0.87m。
 
-    max_spacing <= 0 表示关掉这一步, 原样返回。
+    **拐角处理**: 等距撒出来的弦可能跨过折线拐点、把那个角切掉, 而 _line_free
+    只验过原折线的每一段。切了会穿墙的拐点, 做法是把**最近的那个样本吸附到拐点
+    上**, 而不是插一个新点 —— 实测 save_map_small_1 那条 270m 的路线上这种拐点
+    有 34 个, 离最近样本最远 0.383m(半个步长), 吸附之后相邻段长落在 0.8±0.38
+    之间, 一个短段都不会造出来; 而插点会插出 0.01m 这种(实测 16 段短过 planner
+    的 0.2m 硬线), 正好是这次要消灭的东西。
+
+    吸附完再整体复验一遍, 万一还有穿墙的弦(两个拐点抢同一个样本这种极端情况),
+    才退回插点 —— 宁可多一个短段, 也不能给出一条穿墙的路线。
+
+    起点和终点原样保留。终点尤其不能动: 它是整条路线里唯一有 /planning/finished
+    精确到达判定的点, 中途点只有 0.3m 的提前切换(见 _enforce_min_spacing)。
+
+    收发的都是浮点 RC(重采样点本来就不落在格心上); _line_free 是整数 Bresenham,
+    检查时四舍五入到格 —— 半格的误差跟这里其它判据用的是同一个量级。
+
+    step_px <= 0 表示关掉这一步, 原样返回。
     """
-    if max_spacing <= 0 or len(points) < 2:
-        return points
+    if step_px <= 0 or len(pts) < 2:
+        return pts
 
-    out: List[XY] = [points[0]]
-    for (x0, y0), (x1, y1) in zip(points[:-1], points[1:]):
-        dist = math.hypot(x1 - x0, y1 - y0)
-        n = int(math.ceil(dist / max_spacing)) if dist > max_spacing else 1
-        for k in range(1, n):
-            t = k / n
-            out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
-        out.append((x1, y1))
+    cum = [0.0]
+    for (r0, c0), (r1, c1) in zip(pts[:-1], pts[1:]):
+        cum.append(cum[-1] + math.hypot(r1 - r0, c1 - c0))
+    total = cum[-1]
+    if total <= 1e-9:
+        return [pts[0], pts[-1]]
+
+    def at(s: float) -> RC:
+        """弧长 s 处的坐标。"""
+        j = 0
+        while j < len(pts) - 2 and cum[j + 1] < s:
+            j += 1
+        seg = cum[j + 1] - cum[j]
+        u = 0.0 if seg < 1e-9 else (s - cum[j]) / seg
+        return (pts[j][0] + (pts[j + 1][0] - pts[j][0]) * u,
+                pts[j][1] + (pts[j + 1][1] - pts[j][1]) * u)
+
+    def chord_free(s0: float, s1: float) -> bool:
+        (r0, c0), (r1, c1) = at(s0), at(s1)
+        return _line_free(free, int(round(r0)), int(round(c0)),
+                          int(round(r1)), int(round(c1)))
+
+    def spanned(s0: float, s1: float) -> List[int]:
+        """弧长区间 (s0, s1) 里夹着的原折线拐点下标。"""
+        return [v for v in range(1, len(pts) - 1) if s0 < cum[v] < s1]
+
+    n = max(1, int(round(total / step_px)))
+    pos = [total * k / n for k in range(n + 1)]
+
+    # 1) 哪些原拐点被切掉了、而且切了会穿墙 —— 这些必须落上航点。
+    must: List[int] = []
+    for s0, s1 in zip(pos[:-1], pos[1:]):
+        vs = spanned(s0, s1)
+        if vs and not chord_free(s0, s1):
+            must.extend(vs)
+
+    # 2) 把最近的样本吸附过去(不动首尾, 保持弧长单调, 一个样本只认领一次)。
+    taken = set()
+    for v in must:
+        cv = cum[v]
+        k0 = min(max(int(round(cv / (total / n))), 1), n - 1)
+        # 只认领 k0 和它紧邻的两个 —— 再远就不是"吸附"了, 样本会被拖出半个步长
+        # 以外, 反而把相邻段拉成 2.5m 这种(实测踩过)。邻居都被占了就放着不管,
+        # 下面的复验会把这个拐点插回去。
+        for k in sorted({k0 - 1, k0, k0 + 1} & set(range(1, n)),
+                        key=lambda i: (abs(i - k0), i)):
+            if k in taken or not (pos[k - 1] < cv < pos[k + 1]):
+                continue
+            pos[k] = cv
+            taken.add(k)
+            break
+        # 一个样本都安排不下(两个拐点抢同一个位置这种极端情况)就什么都不做,
+        # 下面的复验会把它当成"还在穿墙"再插回去。
+
+    # 3) 复验。吸附之后仍然穿墙的弦(以及步骤 2 没安排下的拐点), 退回插点。
+    #    pinned 标记"这个点是拐点/端点, 不能丢", 给下面的收尾用。
+    out: List[RC] = [pts[0]]
+    pinned: List[bool] = [True]
+    for s0, s1 in zip(pos[:-1], pos[1:]):
+        vs = spanned(s0, s1)
+        if vs and not chord_free(s0, s1):
+            for v in vs:
+                out.append(pts[v])
+                pinned.append(True)
+        out.append(at(s1))
+        pinned.append(False)
+    out[-1] = pts[-1]
+    pinned[-1] = True
+
+    # 4) 收尾: 插点兜底会在拐点两侧留下短段(实测 270m 那条路线上还剩 2 段短过
+    #    planner 的 0.2m 硬线)。短段出现时优先丢掉**不是拐点**的那一端 —— 丢样本
+    #    不改变路线形状上任何必须经过的地方, 而且丢完要重新 _line_free 复验,
+    #    验不过就留着。两端都是拐点(真正的急折返)就只能留个短段。
+    floor = 0.5 * step_px
+    i = 1
+    while i < len(out) - 1:
+        (r0, c0), (r1, c1) = out[i - 1], out[i]
+        if math.hypot(r1 - r0, c1 - c0) >= floor:
+            i += 1
+            continue
+        for drop in (i, i - 1):
+            if pinned[drop] or drop == 0 or drop == len(out) - 1:
+                continue
+            (ra, ca), (rb, cb) = out[drop - 1], out[drop + 1]
+            if _line_free(free, int(round(ra)), int(round(ca)),
+                          int(round(rb)), int(round(cb))):
+                del out[drop], pinned[drop]
+                i = max(1, drop)
+                break
+        else:
+            i += 1
     return out
 
 
@@ -782,9 +883,14 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
         raw, kept, free, config.GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M / resolution,
         ground_z=ground_z, max_climb=max_climb,
     )
-    points = [_pixel_to_world(*raw[i], height=height, resolution=resolution,
-                              origin_x=origin_x, origin_y=origin_y) for i in kept]
+    # 等距重采样在**像素坐标**上做: _line_free 的拐角修补要用栅格, 换算到世界
+    # 坐标再换回来只会多一层误差。弧长 * resolution 就是米。
+    polyline = [(float(raw[i][0]), float(raw[i][1])) for i in kept]
+    polyline = _resample_polyline(
+        polyline, config.GLOBAL_PLANNER_WAYPOINT_SPACING_M / resolution, free)
+    points = [_pixel_to_world(r, c, height=height, resolution=resolution,
+                              origin_x=origin_x, origin_y=origin_y) for r, c in polyline]
     # 最后一步, 在世界坐标上做: 插点是纯几何的等分, 跟像素网格没关系, 也不该再回
     # 去碰 raw 的下标(插出来的点本来就不在 A* 路径上)。放在最小间距兜底**之后** ——
     # 那一步只删点不加点, 顺序上不冲突, 反过来先插再删会把刚插的点又删掉。
-    return _split_long_segments(points, config.GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M)
+    return points

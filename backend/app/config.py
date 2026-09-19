@@ -48,6 +48,7 @@ src/planner/plan_manage/src/scan_replan_fsm.cpp 核对过:
     DEGENERATE_DIST_M。
 """
 import os
+import warnings
 
 # SCAN-Planner 的固定坐标系名 (run.launch: world_frame_id=world)
 MAP_FRAME = os.environ.get("NAVIBOT_MAP_FRAME", "world")
@@ -202,21 +203,49 @@ VIRTUAL_OBSTACLE_MAX_POINTS = int(os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_MAX_P
 # 去优化。窄路两边是沟的场景尤其危险: 沟是**负障碍**, detect_structure 的机体高度
 # 带判据和 planner 的实时 ESDF 都不一定看得见它, 没有把曲线拉回来的梯度。
 #
-# 取值窗口: 下限 ~0.5m(waypoint_arrival_radius_ 0.3m + reboundReplan 的 0.2m
-# 死区, 再密就是 4183847 修过的"点太密"), 上限按上表选。默认 1.0 把 45° 入口的
-# 鼓包压在 0.28m 以内。设成 0 或负数关掉这一步。
+# 上面这张表说的是"段太长会鼓出去"。但实机跑下来, **真正出问题的是段太短**:
+# 轮足狗每到一个航点都要减速进 waypoint_arrival_radius_(0.3m)再重规划下一段,
+# 航点一密就平地一冲一冲、上下楼梯左右摆动(用户实测)。而原来的实现只管上限不管
+# 下限, 短段到处都是:
 #
-# 插的点落在弦上, 而每一段弦都被 _prune_path/_enforce_min_spacing 用 _line_free
-# 验证过无碰撞, 所以插点不改变几何、不引入新的碰撞风险; 而且等分之后同一条直线上
-# 相邻段的转角是 0, 鼓包直接归零(这也是为什么等分插值比"把 A* 原路径的点塞回去"
-# 更好 —— 后者会把 8 连通网格的锯齿重新引进来, 转角变大, 反而更鼓)。
+#   save_map_stairs 爬楼梯(水平 3.49m / 22° 坡): 10 个点, 段长中位 0.30m
+#       —— max_climb=0.20 在楼梯上把段长钉成一级台阶一个点
+#   save_map_small_1 那条 270m: 450 个点, 段长中位 0.59m, **最小 0.10m**
+#       —— _enforce_min_spacing 遇到"并段会穿墙/爬升超限"就放弃, 留下密点;
+#          0.10m 比 reboundReplan 的 0.2m TOO_CLOSE_TO_GOAL 硬线还短,
+#          那些段 planner 根本不生成轨迹, 还要给 continuous_failures_count_ 加一
 #
-# 一个副作用: 插出来的点各自查自己位置的 ground_elevation, z 剖面会更贴真实地面,
-# 于是**原来被粗采样掩盖的爬升会冒出来**(实测这条路线超 max_climb 的段 1 -> 2 个)。
-# 是原来在撒谎, 不是这一步把路弄陡了, 见 _split_long_segments 的说明。
-GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M = float(
-    os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M", "1.0")
+# 所以现在改成**沿剪枝后的折线等距重采样**(见 _resample_polyline): 折线的几何
+# 形状由剪枝/最小间距/爬升判据决定, 这一步只决定在那条形状上怎么撒航点, 两件事
+# 分开。于是 max_climb 可以继续管得很严(折线贴着楼梯走), 航点密度完全由这个值
+# 说了算, 平地和楼梯是同一套逻辑, 不需要为楼梯单独放宽什么。
+#
+# 0.8 的来历: 楼梯上每段爬升 0.8*tan(22°)=0.36m, 约两级台阶一个航点; 那条 270m
+# 的路线从 450 点降到约 340 点。**这是纸面推算, 手感要在真机上调** —— 还嫌密/
+# 还一冲一冲就往大调, 拐弯开始切角了就往小调。
+#
+# 下限参考 ~0.5m(waypoint_arrival_radius_ 0.3m + reboundReplan 的 0.2m 死区,
+# 再密就是 4183847 修过的"点太密")。设成 0 或负数关掉重采样, 退回"剪枝出来多少
+# 点就发多少点"。
+#
+# 重采样点落在折线上, 而折线的每一段都被 _prune_path/_enforce_min_spacing 用
+# _line_free 验证过无碰撞。唯一的新风险是**弦跨过拐点把角切掉**, 那种弦会重新
+# 验一遍, 真会穿墙才把原拐点补回来(见 _resample_polyline 的"拐角修补")。
+#
+# 一个副作用: 重采样点各自查自己位置的 ground_elevation, z 剖面会更贴真实地面,
+# 于是**原来被粗采样掩盖的爬升会冒出来**。是原来在撒谎, 不是这一步把路弄陡了。
+GLOBAL_PLANNER_WAYPOINT_SPACING_M = float(
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_WAYPOINT_SPACING_M", "0.8")
 )
+# 老名字 NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 语义变了(从"上限"变成
+# "目标间距"), 所以换了名字而不是沿用。部署机上要是还留着老的那个环境变量, 它
+# 现在**完全不起作用** —— 与其静悄悄地没效果, 不如启动时喊一声。
+if "NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M" in os.environ:
+    warnings.warn(
+        "NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 已经没用了, "
+        "改用 NAVIBOT_GLOBAL_PLANNER_WAYPOINT_SPACING_M(含义从'上限'变成'目标间距')",
+        RuntimeWarning,
+    )
 # 2D 栅格图里灰度 205("未知", map_pipeline/elevation.py 的 mark_known_region
 # 标的——离建图轨迹超过一定距离的 free 格子)不算不可通行(那是 occupied_thresh
 # 的事, 见 global_planner._blocked_mask), 只是全局规划走这类格子的单步代价要
