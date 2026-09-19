@@ -202,41 +202,20 @@ VIRTUAL_OBSTACLE_MAX_POINTS = int(os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_MAX_P
 # 去优化。窄路两边是沟的场景尤其危险: 沟是**负障碍**, detect_structure 的机体高度
 # 带判据和 planner 的实时 ESDF 都不一定看得见它, 没有把曲线拉回来的梯度。
 #
-# 上表整张可以用一个式子概括(9 个点最大偏差 0.017m, 见 global_planner 的
-# BULGE_PER_M):
-#
-#     鼓包 ≈ 0.4 * 段长 * sin(入口夹角 α)
-#
-# 关键是 **sin α 那一项**: 平地直线上 α=0, 鼓包本来就是 0, 那里切得再密也买不到
-# 任何安全性。而航点密是有实打实代价的 —— 轮足狗每到一个航点都要减速进
-# waypoint_arrival_radius_(0.3m)再重规划下一段, 一路走走停停上不了速度, 实机上
-# 表现为**全程用脚走, 不切轮子**(用户实测)。
-#
-# 所以切法改成按"鼓包预算"切, 而且不对称: 拐角之后只有第一小段是斜着切进来的,
-# 把它的长度压到 预算/(0.4*sin α) 就够了; 它之后插出来的点都落在同一条弦上,
-# 转角是 0、鼓包归零, 只受下面那个硬上限约束。详见 _split_long_segments。
-GLOBAL_PLANNER_MAX_BULGE_M = float(
-    os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_BULGE_M", "0.28")
-)
-# 硬上限: 就算 α 名义上是 0 也不敢放任的段长。为什么不能真的放到无穷 —— 狗是按
-# waypoint_arrival_radius_(0.3m)算"到达"的, 加上跟踪误差, 下一段的实际切入角
-# 永远不会真的是 0。按残留 10° 估: 0.4*L*sin(10°)=0.069*L, L=4.0 时鼓包 0.28m,
-# 跟上面的预算对齐。**这个 10° 是估的, 不是实测**, 真机上跑出来不对就调这个数。
-#
-# 改动前这里是 1.0 且无条件一刀切, 也就是把"45° 拐弯所需的密度"铺满了整条路线。
-# 下限 ~0.5m(waypoint_arrival_radius_ 0.3m + reboundReplan 的 0.2m 死区, 再密
-# 就是 4183847 修过的"点太密")。设成 0 或负数关掉整个插点步骤。
+# 取值窗口: 下限 ~0.5m(waypoint_arrival_radius_ 0.3m + reboundReplan 的 0.2m
+# 死区, 再密就是 4183847 修过的"点太密"), 上限按上表选。默认 1.0 把 45° 入口的
+# 鼓包压在 0.28m 以内。设成 0 或负数关掉这一步。
 #
 # 插的点落在弦上, 而每一段弦都被 _prune_path/_enforce_min_spacing 用 _line_free
-# 验证过无碰撞, 所以插点不改变几何、不引入新的碰撞风险(这也是为什么弦上插值比
-# "把 A* 原路径的点塞回去"更好 —— 后者会把 8 连通网格的锯齿重新引进来, 转角变大,
-# 反而更鼓)。
+# 验证过无碰撞, 所以插点不改变几何、不引入新的碰撞风险; 而且等分之后同一条直线上
+# 相邻段的转角是 0, 鼓包直接归零(这也是为什么等分插值比"把 A* 原路径的点塞回去"
+# 更好 —— 后者会把 8 连通网格的锯齿重新引进来, 转角变大, 反而更鼓)。
 #
 # 一个副作用: 插出来的点各自查自己位置的 ground_elevation, z 剖面会更贴真实地面,
 # 于是**原来被粗采样掩盖的爬升会冒出来**(实测这条路线超 max_climb 的段 1 -> 2 个)。
 # 是原来在撒谎, 不是这一步把路弄陡了, 见 _split_long_segments 的说明。
 GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M = float(
-    os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M", "4.0")
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M", "1.0")
 )
 # 2D 栅格图里灰度 205("未知", map_pipeline/elevation.py 的 mark_known_region
 # 标的——离建图轨迹超过一定距离的 free 格子)不算不可通行(那是 occupied_thresh

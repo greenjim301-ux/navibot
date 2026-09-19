@@ -18,11 +18,8 @@ detect_structure/clear_trajectory/mark_known_region 这些修正。
 - mode 2 (现在用的): planner 一次只规划到**下一个航点**, 中间是一条两点五次曲线
   (scan_replan_fsm.cpp:254 planNextWaypoint -> one_segment_traj_gen)。避障靠它自己
   对着 grid_map_ 跑 bspline 优化, 所以不要求这里给的路径本身无碰撞。但间距**有
-  上限**: 那条五次曲线偏离直线弦的横向鼓包 ≈ 0.4 * 段长 * sin(入口夹角), 段太长
-  狗就飘出去了。注意是**段长和夹角的乘积** —— 直线上夹角是 0, 鼓包本来就是 0,
-  所以只在拐角后面补短段就够, 直线段该多长多长(航点铺太密轮足狗会一路减速到点、
-  上不了速度, 干脆不切轮子, 全程用脚走)。见 config 的 GLOBAL_PLANNER_MAX_BULGE_M
-  / GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 和 README 那一节。
+  上限**: 那条五次曲线偏离直线弦的横向鼓包跟段长成正比, 段太长狗就飘出去了 ——
+  见 config 的 GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 和 README 那一节。
 - mode 3 (/initial_path, 现在没有调用方): 它会把整串点按 >=0.5m 抽稀再拟合成一条
   min-snap 曲线。**那条 0.5m 抽稀只存在于 mode 3**, mode 2 的 presetWaypointsCallback
   一个点都不抽 —— 早期注释把这条写到 mode 2 身上过, 是错的。
@@ -619,54 +616,16 @@ def _enforce_min_spacing(path: List[RC], kept: List[int], free: np.ndarray, min_
     return out
 
 
-def _entry_sin(prev: Optional[XY], p0: XY, p1: XY) -> float:
-    """狗从 prev->p0 拐进 p0->p1 这一段时, 入口夹角 α 的 sin。
+def _split_long_segments(points: List[XY], max_spacing: float) -> List[XY]:
+    """相邻途经点超过 max_spacing 就把这一段等分插点, 返回新的点列。
 
-    没有上一段(整条路线的第一段)时返回 1.0 —— 狗当前朝哪儿规划器不知道, 按最坏
-    情况(垂直切入)算, 代价只是把第一段切短一点。
+    **为什么要有上限**(以及为什么这里以前写着"不要设上限")见 config 里
+    GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 的说明 —— 一句话: SCAN-Planner 的
+    navi_mode=2 一次只规划到下一个航点, 中间是一条两点五次曲线, 它偏离直线弦的
+    横向鼓包跟段长成正比, 所以**航点间距就是"允许局部规划器自由发挥的长度"**。
 
-    α 超过 90° 的急拐弯 sin 会掉回来, 那是拟合公式外推出界了(那张表只测到 45°),
-    所以夹到 90° 封顶, 宁可切密一点。
-    """
-    if prev is None:
-        return 1.0
-    ax, ay = p0[0] - prev[0], p0[1] - prev[1]
-    bx, by = p1[0] - p0[0], p1[1] - p0[1]
-    na, nb = math.hypot(ax, ay), math.hypot(bx, by)
-    if na < 1e-9 or nb < 1e-9:
-        return 1.0
-    cos_a = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
-    return 1.0 if cos_a <= 0.0 else math.sqrt(1.0 - cos_a * cos_a)
-
-
-# 五次曲线偏离直线弦的横向鼓包 ≈ BULGE_PER_M * 段长 * sin(入口夹角)。系数是拿
-# config 里那张复刻 one_segment_traj_gen 实测出来的表反解的, 9 个点全部对得上
-# (最大偏差 0.017m, 见 GLOBAL_PLANNER_MAX_BULGE_M 的说明)。
-BULGE_PER_M = 0.4
-
-
-def _split_long_segments(points: List[XY], max_spacing: float,
-                          bulge_budget: float, min_spacing: float) -> List[XY]:
-    """把途经点之间的长段切短, 但**只切到"鼓包不超预算"为止**, 不是一刀切。
-
-    为什么不再按固定长度一刀切: 鼓包跟**段长和入口夹角的乘积**成正比(见上面
-    BULGE_PER_M 和 config 里那张表), 直线上 α=0, 鼓包本来就是 0 —— 那里切得再密
-    也买不到任何安全性, 只是白白多发一堆航点。而航点密了有实打实的代价: 轮足狗
-    每到一个航点都要减速进 waypoint_arrival_radius_(0.3m)再重规划下一段, 一路
-    走走停停就上不了速度, 实机上表现为**全程用脚走, 不切轮子**。
-
-    切法(关键是不对称): 拐角之后**只有第一小段**是斜着切进来的, 它之后插出来的
-    点都落在同一条弦上, 相邻段转角是 0、鼓包归零。所以:
-
-      第一段长度 = bulge_budget / (BULGE_PER_M * sin α)     <- 把这一次拐弯的鼓包压住
-      剩下的     = 按 max_spacing 等分                        <- 只受硬上限约束
-
-    于是平地直线上(α≈0)整段原样保留, 一个点都不多加; 只有真的拐了弯才在拐角后面
-    补一个短段。这正是原来那版等分切法做不到的 —— 等分会让直线段也跟着变密。
-
-    max_spacing 仍然是硬上限, 但含义变了: 它不再是"安全所需的段长", 而是"就算
-    α 名义上是 0 也不敢放任的长度" —— 狗到点是按 0.3m 半径算到达的, 加上跟踪误差,
-    实际切入角永远不会真的是 0, 见 config 里的说明。
+    等分而不是"按 max_spacing 切完留个零头": 零头段会短很多, 既没必要也会让间距
+    分布变得没规律。ceil(L / max_spacing) 份, 每份长度 L/ceil(...) <= max_spacing。
 
     插出来的点落在弦上, 而每一段弦都被 _prune_path/_enforce_min_spacing 用
     _line_free 验证过无碰撞, 所以这一步不会引入碰撞。
@@ -679,40 +638,18 @@ def _split_long_segments(points: List[XY], max_spacing: float,
     "超过 max_climb 的段"从 1 个变成 2 个。这不是变差, 是原来在撒谎; 但改完之后
     爬升超限会更容易被看到, 别误判成爬升判据回归了。
 
-    顺带: 坡上本来就不会出现长段 —— _prune_path/_enforce_min_spacing 拿
-    ground_z + max_climb 卡着, 爬升大的地方压根合并不起来。所以"平地"这个条件
-    上游已经满足了, 这里只需要管"直线"。
-
     max_spacing <= 0 表示关掉这一步, 原样返回。
     """
     if max_spacing <= 0 or len(points) < 2:
         return points
 
     out: List[XY] = [points[0]]
-    for i, ((x0, y0), (x1, y1)) in enumerate(zip(points[:-1], points[1:])):
+    for (x0, y0), (x1, y1) in zip(points[:-1], points[1:]):
         dist = math.hypot(x1 - x0, y1 - y0)
-        prev = points[i - 1] if i > 0 else None
-        sin_a = _entry_sin(prev, (x0, y0), (x1, y1))
-
-        # 拐角后的第一段: 把这一次拐弯的鼓包压进预算。α≈0 时是 inf, 也就是"不用
-        # 为拐弯切", 只剩下面的硬上限。下限夹一道 min_spacing, 防止极端预算配置下
-        # 切出一串比到达半径还短的点(默认值下 90° 拐弯是 0.28/0.4=0.70m, 夹不到)。
-        denom = BULGE_PER_M * sin_a
-        first = bulge_budget / denom if denom > 1e-9 else float("inf")
-        first = min(max(first, min_spacing), max_spacing)
-
-        if dist <= first:
-            out.append((x1, y1))
-            continue
-
-        ux, uy = (x1 - x0) / dist, (y1 - y0) / dist
-        out.append((x0 + ux * first, y0 + uy * first))
-        # 剩下的都跟这一段共线(α=0), 只受硬上限约束, 等分保持间距有规律。
-        rest = dist - first
-        n = int(math.ceil(rest / max_spacing))
+        n = int(math.ceil(dist / max_spacing)) if dist > max_spacing else 1
         for k in range(1, n):
-            d = first + rest * k / n
-            out.append((x0 + ux * d, y0 + uy * d))
+            t = k / n
+            out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
         out.append((x1, y1))
     return out
 
@@ -845,9 +782,4 @@ def plan_path(map_name: str, start_xy: XY, goal_xy: XY,
     # 最后一步, 在世界坐标上做: 插点是纯几何的等分, 跟像素网格没关系, 也不该再回
     # 去碰 raw 的下标(插出来的点本来就不在 A* 路径上)。放在最小间距兜底**之后** ——
     # 那一步只删点不加点, 顺序上不冲突, 反过来先插再删会把刚插的点又删掉。
-    return _split_long_segments(
-        points,
-        config.GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M,
-        config.GLOBAL_PLANNER_MAX_BULGE_M,
-        config.GLOBAL_PLANNER_MIN_WAYPOINT_SPACING_M,
-    )
+    return _split_long_segments(points, config.GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M)
