@@ -360,6 +360,10 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
         // generate_map_assets.py export_topview_png 的注释: negate=0 时黑占据/
         // 白空闲/灰未知), 图里大片留白区域就是这个颜色——画布背景跟它对齐,
         // 图片边缘/画布没铺满的地方才不会露出一圈色差。
+        //
+        // 注意 topview.png 现在是 RGB 不是灰度: 建图轨迹周围 0.25m 内本来就是
+        // free 的格子被染成了淡蓝灰(纯展示, 见 export_topview_png)。这里只是原样
+        // 贴图、不读像素值, 所以不受影响; 但别再假设它是单通道。
         style={{ cursor: editable || startGoalPickMode || regionDraftKind ? "crosshair" : "default", background: "#cdcdcd" }}
       >
         <Layer>

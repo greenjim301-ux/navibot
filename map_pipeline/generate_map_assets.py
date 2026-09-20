@@ -38,8 +38,10 @@
                            (MapStatus.READY), 不能改名/删掉, 否则地图列表会显示
                            "未处理"。
   topview.png              2D 占据栅格图转成的展示用 PNG(有 2D 源图才有这个文件)。
-                            跟 map_2d.pgm **逐像素一致**, 只是换了容器格式, 没有
-                            任何只给人看的改色 —— 见 export_topview_png
+                            灰度部分跟 map_2d.pgm **逐像素一致**, 唯一的修饰是把
+                            建图轨迹周围 --topview-trajectory-band(默认 0.25m)内
+                            **本来就是 free** 的格子染成淡蓝灰, 纯展示、不改 pgm、
+                            永远不盖 occupied/unknown —— 见 export_topview_png
   pointcloud.bin           降采样点云 (PCW1), 供前端 3D 预览
   pointcloud_meta.json
 
@@ -361,7 +363,15 @@ def bootstrap_map2d_from_slam(map2d_dir: Path, pgm_path: Path, yaml_path: Path) 
     return True
 
 
-def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
+# 建图轨迹带在 topview.png 上的颜色。选色的两个约束(用户要求): 跟 free(254 的
+# 近白)分得开, 但又不能太突出 —— 它只是"狗当初从这儿走过"的背景信息, 不该比真正
+# 的障碍还抢眼。淡蓝灰跟 free 的白、unknown 的 205 灰、occupied 的黑都不撞色。
+TRAJECTORY_BAND_RGB = (214, 228, 243)
+
+
+def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path,
+                        trajectory: "np.ndarray | None" = None,
+                        band_radius_m: float = 0.0) -> dict:
     """把 map_server 格式的 2D 占据栅格图 (pgm+yaml) 转成前端"设置路线"页面
     展示用的 topview.png。
 
@@ -372,11 +382,23 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
     时 pgm 原始灰度本来就是"黑占据/白空闲/灰未知", 直接展示即可, 这里只是
     看图选点, 不需要真的按 occupied_thresh/free_thresh 二值化。
 
-    **展示图跟规划图逐像素一致**, 没有任何只给人看的修饰。以前 --block-unscanned
+    **灰度部分跟规划图逐像素一致**, 没有任何只给人看的修饰。以前 --block-unscanned
     改判成 occupied 的格子在这里会被还原成"未知"灰(理由是"那不是真探测到的障碍,
     别让用户误认"), 结果是用户在"设置路线"/"地图编辑"页面看到的灰色区域,
     global_planner 那边其实是硬挡的黑——规划不出路线时图上根本找不到挡路的东西。
     宁可让"没扫到"跟"真障碍"长得一样黑, 也不要让图跟规划器说两套话。
+
+    **唯一的例外: band_radius_m > 0 时会把建图轨迹周围这个半径内的格子染成
+    TRAJECTORY_BAND_RGB**(纯展示, map_2d.pgm 不受影响)。这一条看着跟上面那段
+    原则相冲, 其实不冲 —— 上面禁的是"把不能走的地方画成能走的", 而这里只给
+    **本来就是 free 的格子**上色: 下面那句 `gray >= 250` 的掩膜保证染色永远不会
+    盖住 occupied 或 unknown, 所以图上"哪里挡路"的信息一个像素都没变, 只是多告诉
+    用户"狗当初从这儿走过"。改这段的时候别把那个掩膜去掉。
+
+    半径用的是**几何意义上的 band_radius_m**(EDT <= r/res), 不是
+    elevation.clear_trajectory 那个 `ceil(r/res)+1` —— 那多出来的一格是为了让规划
+    器在带子里能斜着走(见该函数 docstring), 是规划的需要, 展示图不该跟着虚胖。
+    所以这条带子会比 clear_trajectory 实际清出来的略窄一点, 这是有意的。
 
     pgm 的 (row, col) 像素网格跟 world_bounds 的对应关系是 ROS map_server 的
     约定: yaml 的 origin 是图像左下角像素的世界坐标, 而 pgm 文件本身是按常规
@@ -395,6 +417,25 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
 
     img = Image.open(pgm_path)
     orig_w, orig_h = img.size
+
+    if trajectory is not None and len(trajectory) and band_radius_m > 0:
+        gray = np.asarray(img.convert("L"))
+        height, width = gray.shape
+        y_max = origin_y + height * resolution
+        # 重采样到半格, 免得关键帧之间(约 5s 一个, 人能走 1~2m)留下断点 —— 跟
+        # elevation.clear_trajectory 是同一个理由、同一个步长。
+        traj = elevation.resample_polyline(trajectory, resolution / 2)
+        col = np.clip(((traj[:, 0] - origin_x) / resolution).astype(np.int32), 0, width - 1)
+        row = np.clip(((y_max - traj[:, 1]) / resolution).astype(np.int32), 0, height - 1)
+        seed = np.zeros((height, width), dtype=bool)
+        seed[row, col] = True
+        band = ndimage.distance_transform_edt(~seed) <= (band_radius_m / resolution)
+        # 只染 free —— 见 docstring, 这道掩膜是"展示图不许改写通行性"的保证。
+        band &= gray >= 250
+        rgb = np.dstack([gray, gray, gray])
+        rgb[band] = TRAJECTORY_BAND_RGB
+        img = Image.fromarray(rgb, mode="RGB")
+
     img.save(out_path)
 
     return {
@@ -626,6 +667,12 @@ def main():
                           "但**实测关掉之后规划基本不可用**(save_map_small_1 上 47% 的轨迹格"
                           "被膨胀吃掉, 轨迹上随机取 12 对起终点 0 对能规划出来), 见 README"
                           "「为什么沟沿的安全余量不能靠关掉这两个开关拿回来」")
+    ap.add_argument("--topview-trajectory-band", type=float, default=0.25,
+                     help="在展示用的 topview.png 上, 把建图轨迹周围这个半径(m)内的"
+                          "**free** 格子染成淡蓝灰(TRAJECTORY_BAND_RGB), 让人一眼看出"
+                          "狗当初从哪儿走过。**只影响 topview.png, 不影响 map_2d.pgm**,"
+                          "也永远不会盖住 occupied/unknown(见 export_topview_png)。"
+                          "传 0 关掉, 回到纯灰度的逐像素一致。")
     ap.add_argument("--block-unscanned", action=_BooleanOptionalAction, default=True,
                      help="把 map_2d_raw.pgm(handbot slam 自己建图时跑 ray casting 算出"
                           "的原图)里标'未知'的格子, 在新图里也标 occupied(0), 不让全局"
@@ -699,8 +746,10 @@ def main():
         map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max = x_min, x_max, y_min, y_max
         print("      没有 map_2d_raw.pgm(+.yaml), 2D 栅格图边界退回点云统计 (robust_xy_bounds)")
 
+    # 提到 if 外面加载: 除了下面生成 2D 栅格图要用, 后面导出 topview.png 画建图
+    # 轨迹带也要用, 而那一步在 --no-gen-2d-map(沿用已有 pgm)时照样会跑。
+    trajectory = elevation.load_trajectory(in_path.parent)
     if args.gen_2d_map:
-        trajectory = elevation.load_trajectory(in_path.parent)
         if trajectory is None:
             print(f"      {in_path.parent} 下没有 keyframe_info_3d.txt(或 keyframe_pos_3d.pcd), "
                   f"没法从点云生成占据栅格图, 跳过——沿用已有文件(如果有)")
@@ -789,9 +838,17 @@ def main():
     # 情况, 不能假设它总存在。
     topview2d = None
     if pgm_path.is_file() and yaml_path.is_file():
-        topview2d = export_topview_png(pgm_path, yaml_path, out_dir / "topview.png")
+        topview2d = export_topview_png(
+            pgm_path, yaml_path, out_dir / "topview.png",
+            trajectory=trajectory, band_radius_m=args.topview_trajectory_band,
+        )
+        band = ""
+        if trajectory is not None and len(trajectory) and args.topview_trajectory_band > 0:
+            band = f", 建图轨迹带 {args.topview_trajectory_band}m(仅展示, 不改 pgm)"
+        elif args.topview_trajectory_band > 0:
+            band = ", 没有建图轨迹数据, 不画轨迹带"
         print(f"      {pgm_path} -> topview.png: {topview2d['width']}x{topview2d['height']}px, "
-              f"分辨率 {topview2d['resolution_m_per_px']:.4f}m/px")
+              f"分辨率 {topview2d['resolution_m_per_px']:.4f}m/px{band}")
     else:
         print(f"      {pgm_path} 不存在, 跳过(这份地图没有 2D 栅格图, "
               f"前端\"设置路线\"/全局规划功能对这份地图不可用)")
