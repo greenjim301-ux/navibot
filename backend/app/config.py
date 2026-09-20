@@ -583,6 +583,63 @@ SERVICE_PARAM_SCHEMAS = {
             },
         ],
     },
+    "planner": {
+        "env_var": "NAVIBOT_NAVI_PLANNER_LAUNCH",
+        # 这个不是 yaml 而是 roslaunch XML, 键就是 name 属性的完整值, 改的是同一个
+        # 标签里的 value=/default= —— 见 service_params 模块 docstring。
+        "format": "roslaunch",
+        "file": os.environ.get(
+            "NAVIBOT_NAVI_PLANNER_LAUNCH",
+            "/home/lisi/Documents/work/ros1/src/SCAN-Planner/src/planner/"
+            "plan_manage/launch/advanced_param.xml",
+        ),
+        "params": [
+            {
+                "key": "max_vel", "label": "最大速度", "type": "float",
+                "unit": "m/s", "min": 0.0, "max": 2.0, "step": 0.05,
+                "help": "规划器的速度上限。注意它在 launch 里被引用了三处 ——"
+                        "manager/max_vel、optimization/max_vel, 以及"
+                        "closed_loop_controller/max_vx(闭环控制器的前向限速跟着它走),"
+                        "改这一个会同时影响这三处。",
+            },
+            {
+                "key": "max_acc", "label": "最大加速度", "type": "float",
+                "unit": "m/s²", "min": 0.0, "max": 5.0, "step": 0.1,
+                "help": "同样被 manager/max_acc 和 optimization/max_acc 两处引用。",
+            },
+            {
+                "key": "grid_map/double_cylinder_radius", "label": "碰撞半径", "type": "float",
+                "unit": "m", "min": 0.0, "max": 1.0, "step": 0.05,
+                "help": "机器狗的碰撞模型是前后两个圆柱(grid_map.h 的 "
+                        "getInflateOccupancy), 这是每个圆柱的半径, 也就是障碍物膨胀"
+                        "半径(rebuildInflationOffsets 拿它算膨胀模板)。配大了窄路走不"
+                        "进去, 配小了会蹭墙。",
+            },
+            {
+                "key": "grid_map/double_cylinder_offset", "label": "碰撞圆柱前后偏移",
+                "type": "float", "unit": "m", "min": 0.0, "max": 1.0, "step": 0.05,
+                "help": "前后两个碰撞圆柱的中心各自离机体中心多远。所以机身包络长约 "
+                        "2×(offset+radius)、宽约 2×radius —— 默认 0.10/0.20 对应 "
+                        "0.6m×0.4m。",
+            },
+            {
+                "key": "closed_loop_controller/max_vy", "label": "闭环控制器 · 侧向限速",
+                "type": "float", "unit": "m/s", "min": 0.0, "max": 1.0, "step": 0.05,
+                "help": "★ 跟底盘的步态死区有冲突: 默认 0.35 恰好等于云深处 0x1001 "
+                        "标准-基础步态的 Y 轴下界(区间 [-1.0,-0.35]∪[0.35,1.0]), "
+                        "侧向指令会几乎全部落在死区里被吃掉。要让狗真的会横移就得把"
+                        "这个值调到 0.35 以上。",
+                "warn_on_change": True,
+            },
+            {
+                "key": "closed_loop_controller/max_vyaw", "label": "闭环控制器 · 偏航限速",
+                "type": "float", "unit": "rad/s", "min": 0.0, "max": 2.0, "step": 0.05,
+                "help": "闭环跟踪时的偏航角速度上限。这是控制器自己的限速, 跟 "
+                        "deep_bridge 的 max_vyaw(下发给底盘前的安全限速)是两道独立的闸,"
+                        "取两者更小的那个才是实际生效值。",
+            },
+        ],
+    },
 }
 
 # 启动/停止服务需要特权, 用 sudo -n(非交互——没配免密的话直接报错, 不会卡在等

@@ -253,6 +253,35 @@ float 的上下界取自厂商《各个步态的有效速度范围》表的区�
 Elevator-LIO 实测用的是 0.8。关掉 `enable_virtual_obstacles` 之后，地图上圈的禁行区
 只在全局规划里生效，局部规划器不知道它们的存在。
 
+### `planner`（SCAN-Planner）
+
+**这个不是 yaml，是 roslaunch XML**（`SCAN-Planner/.../launch/advanced_param.xml`），
+schema 里 `format: "roslaunch"`。键就是 `name` 属性的完整值。
+
+| 键 | 类型 | 说明 |
+|---|---|---|
+| `max_vel` | float | 最大速度 [m/s]，0 ~ 2.0 |
+| `max_acc` | float | 最大加速度 [m/s²]，0 ~ 5.0 |
+| `grid_map/double_cylinder_radius` | float | 碰撞半径 [m]，0 ~ 1.0 |
+| `grid_map/double_cylinder_offset` | float | 碰撞圆柱前后偏移 [m]，0 ~ 1.0 |
+| `closed_loop_controller/max_vy` | float | 闭环控制器侧向限速 [m/s]，0 ~ 1.0 |
+| `closed_loop_controller/max_vyaw` | float | 闭环控制器偏航限速 [rad/s]，0 ~ 2.0 |
+
+几条值得记住的联动：
+
+- **`max_vel` 在 launch 里被引用三处** —— `manager/max_vel`、`optimization/max_vel`、
+  以及 `closed_loop_controller/max_vx`（闭环控制器的前向限速跟着它走），改一个影响三处。
+- **碰撞模型是前后两个圆柱**（`grid_map.h` 的 `getInflateOccupancy`：圆心在
+  `pos ± offset·heading`，半径 `radius`），所以机身包络长约 `2×(offset+radius)`、
+  宽约 `2×radius` —— 默认 0.10/0.20 对应 0.6m×0.4m。`radius` 同时也是
+  `rebuildInflationOffsets` 用的障碍物膨胀半径。
+- **`closed_loop_controller/max_vy` 默认 0.35 跟底盘步态死区打架**（带
+  `warn_on_change` 标记）：云深处 0x1001 标准-基础步态的 Y 轴有效区间是
+  `[-1.0,-0.35]∪[0.35,1.0]`，0.35 恰好压在下界上，侧向指令几乎全落进死区被吃掉。
+  要让狗真的会横移就得调到 0.35 以上。
+- `closed_loop_controller/max_vyaw` 跟 `deep_bridge` 的 `max_vyaw` 是**两道独立的闸**
+  （控制器自己的限速 vs 下发给底盘前的安全限速），取两者更小的才是实际生效值。
+
 接口：`GET /api/services/{id}/params`（schema + 当前值）、
 `PUT /api/services/{id}/params`（只传要改的键）、
 `POST /api/services/{id}/restart`。`GET /api/services` 的每条多了个
@@ -278,8 +307,23 @@ blind:
 (b) 只认第一个"缩进且有实际内容"的行当值；中间的空行和纯注释行跳过；一旦遇到
 不缩进的行就判定这个键没有标量值（说明它是个 map/list 或者空值），不乱猜。
 
+roslaunch XML 同一套路子，改的是同一个标签里的 `value=` 或 `default=`：
+
+```xml
+<arg   name="max_vel"                         default="0.75"/>
+<param name="grid_map/double_cylinder_radius" value="0.20" />
+```
+
+`name` 是**精确匹配**的，所以 `max_vel` 不会误伤同一个文件里的
+`<param name="manager/max_vel" value="$(arg max_vel)"/>` —— 那是引用不是定义。
+值是 `$(arg ...)` / `$(eval ...)` 这类替换表达式时，读出来当"读不出当前值"，
+写则**直接拒绝**：那个位置存的是一条引用，拿字面量盖掉会把 launch 里原本的联动
+关系悄悄拆掉。
+
 实测：`deep_bridge.yaml` 90 行改 6 个键 diff 只有 6 行、`hand_lio.yaml` 84 行改
-2 个键 diff 只有 2 行，改完 `yaml.safe_load` 都仍能正常解析。
+2 个键 diff 只有 2 行、`advanced_param.xml` 113 行改 6 个键 diff 只有 6 行，改完
+`yaml.safe_load` / `ElementTree.parse` 都仍能正常解析，三处 `$(arg max_vel)` 引用
+一个都没被误伤。
 
 代价是这个解析器**很窄**——只处理顶层键的标量值，不处理嵌套结构。schema 里声明的
 键在文件里找不到时直接报错而不是追加一行（追加多半是缩进/命名空间写错了，静默追加
@@ -295,6 +339,7 @@ blind:
 ```
 NAVIBOT_DEEP_BRIDGE_CONFIG=/home/cat/ros1_ws/src/deep_bridge/config/deep_bridge.yaml
 NAVIBOT_HAND_LIO_CONFIG=/home/cat/ros1_ws/src/hand-lio/config/hand_lio.yaml
+NAVIBOT_NAVI_PLANNER_LAUNCH=/home/cat/ros1_ws/src/SCAN-Planner/src/planner/plan_manage/launch/advanced_param.xml
 ```
 
 默认值是开发机上的路径。**路径没配对不算接口失败**——`GET` 照样返回 200，schema
@@ -1005,8 +1050,9 @@ log_odds = count_hit >= count_hit_and_miss - count_hit ? prob_hit_log_ : prob_mi
   要求的行为（每个服务单独管理），但**实机上这些组合都没试过**——见「服务之间
   没有关系，每个服务单独管理」一节。
 - **参数配置页没有在真实机器上验证过。** 读/写/校验/重启端点都是在开发机上对着
-  `deep_bridge.yaml` / `hand_lio.yaml` 的副本跑通的，但**没有在板子上验证过后端用户
-  对那些 yaml 有没有写权限** —— 写不动的话是 500 + "权限?" 的提示，不是静默失败。重启走的 stop + start
+  `deep_bridge.yaml` / `hand_lio.yaml` / `advanced_param.xml` 的副本跑通的，但**没有在
+  板子上验证过后端用户对那些文件有没有写权限**（`advanced_param.xml` 还在 SCAN-Planner
+  的源码树里，改它等于在那个 git 仓库里留下本地改动） —— 写不动的话是 500 + "权限?" 的提示，不是静默失败。重启走的 stop + start
   也没在真机上试过。
 - **`deep_bridge` / `unitree_bridge` 两个新服务只核对过 unit 文件，没跑过。**
   unit 名和 `ExecStart` 取自 `navi-planner-bringup/systemd/`，但这两条对应的

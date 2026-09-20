@@ -22,9 +22,23 @@ value 那一段**, 行内注释、缩进、空行、文件里其它所有内容�
 纯注释行跳过; 一旦遇到不缩进的行就判定这个键没有标量值(说明它是个 map/list 或者
 空值), 不乱猜。
 
-代价是这个解析器**很窄**: 只处理顶层键的标量值, 不处理嵌套结构。schema 里声明的
-键如果在文件里找不到, 直接报错而不是追加一行——追加的键很可能是缩进/命名空间
-写错了, 静默追加只会得到一个永远不生效的配置。
+roslaunch XML 也是同一套路子(schema 里 `format: "roslaunch"`), 键就是 name 属性的
+完整值, 改的是它同一个标签里的 value= 或 default= :
+
+    <arg   name="max_vel"                        default="0.75"/>
+    <param name="grid_map/double_cylinder_radius" value="0.20" />
+
+name 是**精确匹配**的, 所以 `max_vel` 不会误伤同一个文件里的
+`<param name="manager/max_vel" value="$(arg max_vel)"/>` —— 那是引用, 不是定义。
+
+值是 `$(arg ...)` / `$(eval ...)` 这类替换表达式时, 读出来当"读不出当前值"(返回
+None), 写则直接拒绝: 那个位置存的是一条引用, 拿字面量盖掉会把 launch 文件里
+原本的联动关系悄悄拆掉。
+
+代价是这两个解析器都**很窄**: yaml 只处理顶层键的标量值、不处理嵌套结构;
+roslaunch 只处理写在同一行里的 name/value 属性对。schema 里声明的键如果在文件里
+找不到, 直接报错而不是追加一行——追加的键很可能是缩进/命名空间写错了, 静默追加
+只会得到一个永远不生效的配置。
 """
 import logging
 import os
@@ -89,6 +103,38 @@ def _locate(lines: List[str], key: str) -> Optional[Tuple[int, str, str, str]]:
     return None
 
 
+# roslaunch: `<arg name="KEY" ... default="V"/>` 或 `<param name="KEY" ... value="V"/>`。
+# name 用精确匹配(带上闭合引号), 否则 `max_vel` 会撞上 `manager/max_vel`。
+def _xml_attr_re(key: str, attr: str) -> "re.Pattern":
+    return re.compile(
+        r'^(?P<head>.*<\s*(?:arg|param)\b[^>]*?\bname\s*=\s*"' + re.escape(key) + r'"'
+        r'[^>]*?\b' + attr + r'\s*=\s*")'
+        r'(?P<value>[^"]*)'
+        r'(?P<tail>".*)$'
+    )
+
+
+def _locate_xml(lines: List[str], key: str) -> Optional[Tuple[int, str, str, str]]:
+    """roslaunch 版的 _locate。`<param>` 用 value=, `<arg>` 用 default= —— 两个都
+    试一遍, 哪个匹配上用哪个(同一个标签不会同时有这两个属性, 不存在歧义)。"""
+    patterns = [_xml_attr_re(key, "value"), _xml_attr_re(key, "default")]
+    for idx, line in enumerate(lines):
+        for pattern in patterns:
+            match = pattern.match(line)
+            if match:
+                return idx, match.group("head"), match.group("value"), match.group("tail")
+    return None
+
+
+# 替换表达式: $(arg x) / $(eval ...) / $(find pkg)。这种位置存的是引用不是字面量。
+_SUBSTITUTION_RE = re.compile(r"\$\(")
+
+
+def _locator(schema: Dict[str, Any]):
+    """按 schema 声明的文件格式挑定位函数。默认 yaml(先接的两个服务都是)。"""
+    return _locate_xml if schema.get("format") == "roslaunch" else _locate
+
+
 def _schema(service_id: str) -> Dict[str, Any]:
     schema = config.SERVICE_PARAM_SCHEMAS.get(service_id)
     if schema is None:
@@ -106,6 +152,10 @@ def _parse_scalar(spec: Dict[str, Any], raw: str) -> Any:
     调用方(read_params)据此如实告诉前端"这个键当前读不出值", 而不是瞎猜一个
     默认值糊过去。"""
     text = raw.strip().strip('"').strip("'")
+    # $(arg ...) 这类替换表达式不是字面量, 解不出数值 —— 如实返回 None, 页面
+    # 会显示成"读不出当前值", 好过瞎猜一个数。
+    if _SUBSTITUTION_RE.search(text):
+        return None
     kind = spec["type"]
     try:
         if kind == "bool":
@@ -193,8 +243,9 @@ def get_params(service_id: str) -> Dict[str, Any]:
         logger.warning("get_params(%s): %s", service_id, file_error)
         lines = []
 
+    locate = _locator(schema)
     for spec in specs:
-        found = _locate(lines, spec["key"])
+        found = locate(lines, spec["key"])
         if found is not None:
             values[spec["key"]] = _parse_scalar(spec, found[2])
 
@@ -233,16 +284,26 @@ def write_params(service_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
     # 先全文找一遍行号, 确认每个要改的键都在, 再统一改 —— 边找边改的话, 中途
     # 发现某个键不存在时前面几个已经改过了。
     stripped = [line.rstrip("\n") for line in lines]
+    locate = _locator(schema)
     hits: Dict[str, Tuple[int, str, str, str]] = {}
     for key in checked:
-        found = _locate(stripped, key)
+        found = locate(stripped, key)
         if found is not None:
             hits[key] = found
     missing = [k for k in checked if k not in hits]
     if missing:
         raise RuntimeError(
-            f"配置文件 {path} 里找不到这些键的标量值(只支持顶层键, 一行式或跨行式): "
-            f"{', '.join(sorted(missing))}"
+            f"配置文件 {path} 里找不到这些键的标量值: {', '.join(sorted(missing))}"
+        )
+
+    # 原来存的是 $(arg ...) 这类引用, 拿字面量盖掉会把 launch 里原本的联动关系
+    # 悄悄拆掉(比如 closed_loop_controller/max_vx 跟着 max_vel 走)。宁可报错。
+    referenced = [k for k, (_i, _h, old_value, _t) in hits.items()
+                  if _SUBSTITUTION_RE.search(old_value)]
+    if referenced:
+        raise RuntimeError(
+            "这些键当前存的是 $(...) 替换表达式而不是字面量, 不能从这里改"
+            f"(会拆掉 launch 文件里的联动): {', '.join(sorted(referenced))}"
         )
 
     for key, (idx, head, _old, tail) in hits.items():
