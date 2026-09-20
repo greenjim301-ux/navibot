@@ -22,9 +22,10 @@ detect_structure/clear_trajectory/mark_known_region 这些修正。
   **下限更要紧**: 段太短的话狗每到一个航点都要减速重规划, 实机上平地一冲一冲、
   上下楼梯左右摆动。所以剪枝完还要沿折线等距重采样一遍(_resample_polyline),
   让每段长度一致 —— 见 config 的 GLOBAL_PLANNER_WAYPOINT_SPACING_M 和 README。
-- mode 3 (/initial_path, 现在没有调用方): 它会把整串点按 >=0.5m 抽稀再拟合成一条
-  min-snap 曲线。**那条 0.5m 抽稀只存在于 mode 3**, mode 2 的 presetWaypointsCallback
-  一个点都不抽 —— 早期注释把这条写到 mode 2 身上过, 是错的。
+- mode 3 (/initial_path): planner 那边还支持, 但 **navibot 这边整套删掉了**(实测
+  mode 3 对全局路线的贴合度不稳定)。提一句是因为它会把整串点按 >=0.5m 抽稀再拟合成
+  一条 min-snap 曲线 —— **那条 0.5m 抽稀只存在于 mode 3**, mode 2 的
+  presetWaypointsCallback 一个点都不抽, 早期注释把这条写到 mode 2 身上过, 是错的。
 
 z 直接用 path_planner.ground_elevation + route_manager 的位姿标定 Δ (跟
 /preset_waypoints、/api/maps/{name}/ground 用的是同一套), 不减 body_height_ ——

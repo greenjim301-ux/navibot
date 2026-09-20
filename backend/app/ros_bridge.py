@@ -144,7 +144,6 @@ class RosBridge:
         self._on_mapping_surround_cloud = on_mapping_surround_cloud
         self._on_mapping_surf_cloud = on_mapping_surf_cloud
         self._wp_pub: Optional[rospy.Publisher] = None
-        self._initial_path_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
         self._virtual_obstacle_pub: Optional[rospy.Publisher] = None
         # 最近一次发布的虚拟障碍点, 供 ROS 连上之后补发一次(latch 只对"已经发过"
@@ -181,7 +180,6 @@ class RosBridge:
             # queue_size=1 + 不 latch: 对齐 planner 侧的订阅方式。latch 在这里是有害的 ——
             # planner 重启后会立刻收到上一轮的路线并自己跑起来, 用户没下任何指令。
             self._wp_pub = rospy.Publisher(config.PRESET_WAYPOINTS_TOPIC, Path, queue_size=1)
-            self._initial_path_pub = rospy.Publisher(config.INITIAL_PATH_TOPIC, Path, queue_size=1)
             self._estop_pub = rospy.Publisher(config.EMERGENCY_STOP_TOPIC, Empty, queue_size=5)
             # 这一条**要 latch**: 它是"哪些地方人工标了不能走"这种静态事实, 不是
             # 一次性指令。hand-lio 后起/重启都要能立刻拿到当前这一份, 不然得等到
@@ -209,9 +207,9 @@ class RosBridge:
                 # rospy.Timer 决定, 这里只是提前把监听器建好。
                 self._tf_listener = tf.TransformListener()
             logger.info(
-                "ROS bridge started: waypoints=%s initial_path=%s estop=%s odom=%s optimal_traj=%s "
+                "ROS bridge started: waypoints=%s estop=%s odom=%s optimal_traj=%s "
                 "planning_finished=%s frame=%s mapping_pose=%s->%s",
-                config.PRESET_WAYPOINTS_TOPIC, config.INITIAL_PATH_TOPIC, config.EMERGENCY_STOP_TOPIC,
+                config.PRESET_WAYPOINTS_TOPIC, config.EMERGENCY_STOP_TOPIC,
                 config.ODOM_TOPIC, config.OPTIMAL_TRAJ_TOPIC, config.PLANNING_FINISHED_TOPIC, config.MAP_FRAME,
                 config.MAPPING_TF_MAP_FRAME, config.MAPPING_TF_BODY_FRAME,
             )
@@ -516,7 +514,7 @@ class RosBridge:
     def publish_virtual_obstacles(self, points: np.ndarray) -> None:
         """发布人工禁行区采样出来的虚拟障碍点云(世界系 xyz float32)。
 
-        跟 publish_waypoints/publish_initial_path 有两点不一样, 都是故意的:
+        跟 publish_waypoints 有两点不一样, 都是故意的:
 
         1. **latch, 而且不等订阅者。** 它是"哪些地方人工标了不能走"这种静态事实,
            不是一次性指令 —— 没人订阅时发出去也不算失败(hand-lio 可能还没起),
@@ -562,45 +560,6 @@ class RosBridge:
         self._virtual_obstacle_pub.publish(msg)
         logger.info("virtual_obstacles published: %d 个点 -> %s",
                     len(points), config.VIRTUAL_OBSTACLE_TOPIC)
-
-    def publish_initial_path(self, points: List[dict]) -> None:
-        """下发 navi_mode=3 (REFERENCE_PATH) 用的全局参考路径 (/initial_path)。
-
-        orientation 不填(单位四元数即可)——pathCallback 只读 position, 见
-        config.py 里 INITIAL_PATH_TOPIC 的说明。z 原样发, 不做任何 body_height_
-        相关的加减: 那是 SCAN-Planner 自己的配置项, 它收到之后自己会加, 我们
-        这边发的应该是跟 preset_waypoints 一样的"标定后的地面高度"
-        (route_manager.get_altitude_calibration), 不用我们操心 body_height_。
-
-        跟 publish_waypoints 一样: 话题不 latch 且订阅队列只有 1, 先等 planner
-        连上再发, 等不到就原样报错, 不能显示成"已下发"。
-        """
-        if self._initial_path_pub is None:
-            raise RuntimeError("ROS bridge 尚未启动")
-
-        deadline = time.time() + config.INITIAL_PATH_SUB_WAIT_S
-        while self._initial_path_pub.get_num_connections() == 0:
-            if time.time() > deadline:
-                raise RuntimeError(
-                    f"{config.INITIAL_PATH_SUB_WAIT_S:.0f}s 内没有节点订阅 "
-                    f"{config.INITIAL_PATH_TOPIC}, SCAN-Planner (navi_mode=3) 在跑吗?"
-                )
-            time.sleep(0.05)
-
-        msg = Path()
-        msg.header.frame_id = config.MAP_FRAME
-        msg.header.stamp = rospy.Time.now()
-        for p in points:
-            ps = PoseStamped()
-            ps.header = msg.header
-            ps.pose.position.x = p["x"]
-            ps.pose.position.y = p["y"]
-            ps.pose.position.z = p["z"]
-            ps.pose.orientation.w = 1.0
-            msg.poses.append(ps)
-        self._initial_path_pub.publish(msg)
-        logger.info("initial_path published: %d points, z=%s",
-                    len(msg.poses), [round(p["z"], 2) for p in points])
 
     def emergency_stop(self) -> None:
         """急停: 让 planner 悬停并作废当前任务 (userEmergencyStopCallback), 恢复

@@ -608,11 +608,17 @@ CRUD，完全不碰 ROS。两者现在**没有任何连接**。
 | `/planning/finished` | `scan_planner/PlanFinished` | planner → backend，整轮任务结束一次（`REACHED` 或 `EMERGENCY_STOP`） |
 | `/hand_lio/odom_vehicle` | `nav_msgs/Odometry` | → backend，位姿 + `covariance[0]` 定位质量 |
 
-> **只用 `navi_mode=2`。** 后端还留着一条 `navi_mode=3`（`/initial_path`，REFERENCE_PATH）的下发链路
-> ——`POST /api/maps/{name}/plan_path` 传 `publish=true` 会走它——但**没有调用方**：前端两处
-> `planPath` 都传 `publish=false`，拿到规划出来的拐点之后当 mode 2 的途经点走 `submitRoute` 下发。
-> 实测 mode 3 对全局路线的贴合度不稳定，狗不一定真的顺着线走。相应地
-> `NavStatus.reference_path_active` 恒为 `false`，前端也没有地方读它。
+> **只用 `navi_mode=2`。** 曾经还有一条 `navi_mode=3`（`/initial_path`，REFERENCE_PATH）的下发
+> 链路（`POST /api/maps/{name}/plan_path` 传 `publish=true` 走它），**整套已经删掉了** —— 实测
+> mode 3 对全局路线的贴合度不稳定，狗不一定真的顺着线走，早就改成拿规划出来的拐点当 mode 2 的
+> 途经点走 `submitRoute` 下发，前端两处调用长期都传 `publish=false`，是彻底的死代码。
+> 一并删掉的还有：`PlanPathRequest.publish`、`PlanPathResponse.published/publish_error`、
+> `NavStatus.reference_path_active`、`RosBridge.publish_initial_path`、
+> `RouteManager.mark_reference_path_dispatched`、`INITIAL_PATH_TOPIC` /
+> `INITIAL_PATH_SUB_WAIT_S`（环境变量 `NAVIBOT_INITIAL_PATH_TOPIC` /
+> `NAVIBOT_INITIAL_PATH_WAIT_S` 随之失效）。要找回来看 git 历史。
+>
+> `plan_path` 现在**只负责算，不负责发**，响应体只剩 `points`。
 
 **几条必须照抄 planner 行为的地方**，抄错任何一条都会静默错位：
 

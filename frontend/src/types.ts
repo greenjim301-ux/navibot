@@ -36,13 +36,6 @@ export interface NavStatus {
   message: string | null;
   robot_pose: RobotPose | null;
   updated_at: number;
-  /** navi_mode=3(/api/maps/{name}/plan_path, publish=true)是否正有一条参考
-   *  路线在跑——跟 state/waypoints/current_index 那套 navi_mode=2 状态机完全
-   *  独立, 见 backend/app/route_manager.py 的 mark_reference_path_dispatched。
-   *
-   *  **恒为 false, 前端没有任何地方读它做判断**: 路线执行走 navi_mode=2,
-   *  "是不是在跑"直接看 state(见 MapPreviewPage 的 navRunning)。 */
-  reference_path_active: boolean;
 }
 
 /** 机器狗实际走过的一个位置 (odom 系, z 是机体高度) */

@@ -217,11 +217,11 @@ export default function MapPreviewPage() {
 
   // 导航控制: 直接在当前视图(3D 点云或 2D 栅格, 两边都支持, 跟 viewMode 无关)
   // 点选设置一个目标点(只要一个, 不是多途经点路线), 点「开始导航」时以机器狗
-  // 当前位置为起点、这个点为终点调用 plan_path(publish=false, 只要规划结果,
-  // 不走 navi_mode=3 下发), 再把规划出来的稀疏拐点当 navi_mode=2 的途经点
-  // 通过 submit_route 下发(见 handleStartNav)——实测 navi_mode=3
-  // (REFERENCE_PATH/initial_path)对全局路线的贴合度不稳定, 狗不一定真的顺着
-  // 那条参考线走, navi_mode=2 是逐点下发、逐点判到达的, 贴合度更可控。
+  // 当前位置为起点、这个点为终点调用 plan_path(它只负责算), 再把规划出来的
+  // 稀疏拐点当 navi_mode=2 的途经点通过 submit_route 下发(见 handleStartNav)
+  // ——实测 navi_mode=3(REFERENCE_PATH/initial_path)对全局路线的贴合度不稳定,
+  // 狗不一定真的顺着那条参考线走, navi_mode=2 是逐点下发、逐点判到达的, 贴合度
+  // 更可控, 所以那条链路已经整套删掉了。
   // waypoints 复用 Waypoint[] 类型但语义上只有 0 或 1 个元素——onChangeWaypoints
   // 每次都只保留最新点选的那个(见下面 handleChangeGoalPoint), 右键删除时清空;
   // 这只是"用户点的目标在哪", 不是真正下发给 planner 的那份途经点列表(那份是
@@ -244,7 +244,7 @@ export default function MapPreviewPage() {
   // 状态因此也会跟着自动复位, 不需要额外的信号。
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
-  // plan_path(publish=false)规划出来、再通过 submit_route(navi_mode=2)下发
+  // plan_path 规划出来、再通过 submit_route(navi_mode=2)下发
   // 下去的那条参考路线, 单纯用来在地图上画出来(跟"是不是正在跑"是两回事,
   // 那个用上面的 navRunning)——完成/失败之后仍然留着当"最近一次下发的路线"看,
   // 不跟着自动清空; 只有换地图、点"停止导航"或"清空目标点"才清, 做法跟上面的
@@ -253,8 +253,7 @@ export default function MapPreviewPage() {
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
   // 独立的另一条链路——起终点在 2D 栅格图上跑 A* 规划(global_planner.py),
-  // 算出来的参考路线补好 z 画出来看, 调用 planPath 时 publish 传 false, 不会
-  // 下发给 navi_mode=3(/initial_path), 也不经过 RouteManager 的状态机, 所以
+  // 算出来的参考路线补好 z 画出来看, 不经过 RouteManager 的状态机, 所以
   // 这里的 planning/plannedRoute 跟上面的 submitting/navRunning 是两套互不
   // 干扰的状态。3D 点云(PointCloudView)/2D 栅格(TopView)都支持拾取, 跟
   // viewMode 无关, 语义/手势两边完全一致(参考"导航控制"的 waypoints)。
@@ -404,10 +403,9 @@ export default function MapPreviewPage() {
   }
 
   /** "设置完成": 起终点都选好了就调用全局规划, 把返回的参考路线画出来看;
-   *  没选够两个点就只是单纯退出拾取模式。publish 传 false——这是"路线预览",
-   *  只想看看规划结果, 不需要、也不应该真的下发给机器狗(见 planPath 调用)。
-   *  规划本身失败(算不出路径)才会让下面这个 await 抛错; published 恒为
-   *  false(没打算发), publishError 也恒为 None, 不会弹下发失败提示。 */
+   *  没选够两个点就只是单纯退出拾取模式。purpose 传 "preview"——这是"路线预览",
+   *  只想看看规划结果, 不会接着调 submitRoute 下发(purpose 只影响后端日志详略,
+   *  见 models.PlanPurpose)。规划本身失败(算不出路径)才会让下面这个 await 抛错。 */
   async function handleFinishStartGoalPick() {
     if (!startGoal.start || !startGoal.goal) {
       setStartGoalPicking(false);
@@ -416,7 +414,7 @@ export default function MapPreviewPage() {
     setPlanning(true);
     setNavError(null);
     try {
-      const result = await planPath(name, startGoal.start, startGoal.goal, false, "preview");
+      const result = await planPath(name, startGoal.start, startGoal.goal, "preview");
       setPlannedRoute(result.points);
       setStartGoalPicking(false);
     } catch (e) {
@@ -436,8 +434,8 @@ export default function MapPreviewPage() {
    *  ——不按地图过滤, 见 hasPose 声明处的注释), 终点是面板里点选的那个目标点。
    *
    *  跟"路线预览"的 handleFinishStartGoalPick 共用同一个 plan_path 接口
-   *  (global_planner.py 的 A* + line-of-sight 剪枝, 见该模块 docstring), 但
-   *  publish 传 false——不走 navi_mode=3(/initial_path)下发, 只要规划结果。
+   *  (global_planner.py 的 A* + line-of-sight 剪枝, 见该模块 docstring), 只是
+   *  purpose 传 "navigate"(让后端少刷一份重复的途经点明细)。
    *  规划出来的 points 本身就已经是剪枝后的稀疏关键拐点(不是密集网格路径,
    *  navi_mode=3 的剪枝逻辑对 navi_mode=2 同样适用: 都是"给关键拐点, 不需要
    *  密集重采样"), 直接当 navi_mode=2 的途经点通过 submit_route 下发:
@@ -463,7 +461,7 @@ export default function MapPreviewPage() {
       // purpose=navigate: 途经点明细由随后的 submitRoute 在后端打(那边还能带上
       // 机器狗当前位姿/z 的来历), 这里让后端少刷一份重复的。
       const planned = await planPath(
-        name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, false, "navigate",
+        name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, "navigate",
       );
       const corners = planned.points.slice(1);
       const toDispatch = corners.length > 0 ? corners : planned.points.slice(-1);
@@ -882,9 +880,9 @@ export default function MapPreviewPage() {
                 )}
 
                 {/* 独立于上面的"导航控制": 两边都是 global_planner.plan_path
-                    算出参考路线补好 z, 调用 planPath 时 publish 都传 false——
-                    区别是这里起终点要手动点选两个, 且规划结果只用来看, 不会像
-                    "导航控制"那样接着调 submit_route 真的下发让机器狗动。
+                    算出参考路线补好 z —— 区别是这里起终点要手动点选两个, 且规划
+                    结果只用来看, 不会像"导航控制"那样接着调 submit_route 真的
+                    下发让机器狗动。
                     3D/2D 都支持拾取(见 startGoalPickMode 相关的 PointCloudView/
                     TopView props)。 */}
                 <PanelSection title="路线预览">

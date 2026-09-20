@@ -118,7 +118,7 @@ export default function MappingPage() {
       state: "idle", waypoints: [], current_index: -1, label: null, map_name: null,
       message: null,
       robot_pose: { x: pose.x, y: pose.y, z: pose.z, yaw: pose.yaw, stamp: pose.stamp, cov: 0 },
-      updated_at: pose.stamp, reference_path_active: false,
+      updated_at: pose.stamp,
     };
   }, [pose]);
 

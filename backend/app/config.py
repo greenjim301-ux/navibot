@@ -54,19 +54,6 @@ import warnings
 MAP_FRAME = os.environ.get("NAVIBOT_MAP_FRAME", "world")
 
 PRESET_WAYPOINTS_TOPIC = os.environ.get("NAVIBOT_WAYPOINTS_TOPIC", "/preset_waypoints")
-# navi_mode=3 (REFERENCE_PATH) 订阅的全局参考路径话题。**现在没有调用方** ——
-# 路线执行走 navi_mode=2(上面那个 PRESET_WAYPOINTS_TOPIC), 前端两处 planPath 都传
-# publish=false。实测 mode 3 对全局路线的贴合度不稳定, 狗不一定真的顺着线走。
-#
-# 留着的这条链路跟 mode 2 完全独立: 3 号模式吃的是稀疏关键点, 自己在 pathCallback
-# 里**按 >=0.5m 抽稀**再拟合成 min-snap 曲线当参考轨迹, 没有 waypoint_arrival_radius
-# 那套逐点到达判定。**那条 0.5m 抽稀只存在于 mode 3**, mode 2 的
-# presetWaypointsCallback 一个点都不抽。z 也不是"原样机体高度": pathCallback 会在
-# 存入前给收到的 z 加上 body_height_(grid_map/body_height), 那是 planner 自己的
-# 配置项, 我们发布时不用管。见 RosBridge.publish_initial_path。
-INITIAL_PATH_TOPIC = os.environ.get("NAVIBOT_INITIAL_PATH_TOPIC", "/initial_path")
-# 跟 WAYPOINTS_SUB_WAIT_S 同理: /initial_path 不 latch, 发之前等订阅者连上
-INITIAL_PATH_SUB_WAIT_S = float(os.environ.get("NAVIBOT_INITIAL_PATH_WAIT_S", "5.0"))
 # 全局规划器(global_planner.py)膨胀障碍物用的机身半径(m)。取 SCAN-Planner 自己
 # 的 grid_map/double_cylinder_radius=0.25(advanced_param.xml 里配的"双圆柱"自身
 # 膨胀半径)——用同一个数, 全局路径判定的"安全"标准才跟机器狗局部自身膨胀判定

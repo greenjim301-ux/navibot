@@ -258,20 +258,18 @@ async def map_trajectory(name: str):
 async def plan_path(name: str, req: PlanPathRequest):
     """基于 2D 栅格图规划一条全局路径(global_planner.plan_path), 补好 z 返回。
 
-    **实际用法是 publish=false**: 前端拿到这些拐点之后, 是把它们当
-    navi_mode=2 的途经点、走 submit_route(/preset_waypoints)下发的, 不走这里的
-    下发分支(见 MapPreviewPage 的 handleStartNav)。所以这个端点现在基本就是个
-    "算路线"接口。
+    **这个端点只负责算, 不负责发。** 前端拿到这些拐点之后, 是把它们当
+    navi_mode=2 的途经点、走 submit_route(/preset_waypoints)单独下发的(见
+    MapPreviewPage 的 handleStartNav)。
 
-    publish=true 会把结果发到 /initial_path(navi_mode=3, REFERENCE_PATH)。
-    **那条链路还在, 但现在没有调用方** —— 实测 mode 3 对全局路线的贴合度不稳定,
-    狗不一定真的顺着这条线走, 所以改成了 mode 2。留着是因为它跟 mode 2 完全独立
-    (不经过 RouteManager 的状态机, 也没有逐点到达判定), 删不删都不影响 mode 2。
+    以前这里还有个 publish 参数, 传 true 会把结果发到 /initial_path
+    (navi_mode=3, REFERENCE_PATH)。**那条链路整套已经删掉了** —— 实测 mode 3 对
+    全局路线的贴合度不稳定, 狗不一定真的顺着那条线走, 所以早就改成了 mode 2,
+    前端两处调用长期都传 publish=false, 是彻底的死代码。要找回来看 git 历史。
 
-    规划本身失败(起点/终点太靠近障碍物、两点之间没有可行路径)算 400, 是真正的
-    失败; 但"下发"这一步不影响这个接口的成功与否——ROS bridge 没起来、没有
-    planner 订阅 /initial_path 都只在响应里标成 published=False + publish_error,
-    不让整个请求跟着报错。想知道有没有真的发下去, 看 published 字段。
+    规划失败(起点/终点太靠近障碍物、两点之间没有可行路径)是 400。
+
+    purpose 只影响日志详略, 不影响规划结果, 见 models.PlanPurpose。
     """
     # 规划失败时前端只弹一句话, 现场没人能复现"当时点的到底是哪两个点"。请求一
     # 进来就把地图名和起终点原样打出来, 跟下面失败那条日志配成一对, 照着 log 就
@@ -376,40 +374,7 @@ async def plan_path(name: str, req: PlanPathRequest):
             seg = "" if i == 1 else "  段长 %.2fm" % segs[i - 2]
             logger.info("  #%d  x=%.3f y=%.3f z=%.3f%s", i, pt["x"], pt["y"], pt["z"], seg)
 
-    publish_error: Optional[str] = None
-    if not req.publish:
-        # 措辞要当心: 这条**每次规划都会打** —— 前端两处 planPath 调用都传
-        # publish=False(见 api.ts 的说明, published 恒为 false), navi_mode=3 的
-        # /initial_path 早就没有调用方了。以前写的是"跳过下发 /initial_path",
-        # 读起来像"这次路线没发下去", 实际跟下发成不成功一点关系都没有 ——
-        # 真正的下发是调用方紧接着的 submit_route(navi_mode=2), 在另一个请求里,
-        # 日志是 "route submitted: ..."。
-        logger.info(
-            "plan_path: 规划结果已返回(publish=False, 正常)。navi_mode=3 的 "
-            "/initial_path 没有调用方, 这里什么都不发; 真正的下发看调用方随后的 "
-            "submit_route, 日志是 'route submitted'"
-        )
-    else:
-        try:
-            await run_in_threadpool(ros_bridge.publish_initial_path, points)
-        except Exception as e:
-            # 故意接 Exception 而不是只接 publish_initial_path 自己会抛的
-            # RuntimeError: ros_bridge 都可能因为还没连上 ROS 而是 None(见模块级
-            # 变量声明), 这时候是 AttributeError, 不是 RuntimeError——这里就是要
-            # "不管下发那步炸成什么样都不能带崩这个接口的成功返回", 所以兜个底。
-            publish_error = str(e)
-            logger.warning("plan_path: 规划成功, 但下发 /initial_path 失败(不影响本次返回): %s", e)
-        else:
-            # 真的发下去了才标记"navi_mode=3 有一条在跑"(见
-            # route_manager.mark_reference_path_dispatched)——发失败的话机器狗
-            # 根本没收到, 不能广播成"正在导航"误导前端。
-            route_manager.mark_reference_path_dispatched(name)
-
-    return PlanPathResponse(
-        points=[PlanPathPoint(**p) for p in points],
-        published=req.publish and publish_error is None,
-        publish_error=publish_error,
-    )
+    return PlanPathResponse(points=[PlanPathPoint(**p) for p in points])
 
 
 @app.get("/api/maps", response_model=List[MapInfo])

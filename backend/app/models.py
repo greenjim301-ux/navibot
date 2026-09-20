@@ -53,15 +53,6 @@ class PlanPathRequest(BaseModel):
     goal: XY
     purpose: PlanPurpose = PlanPurpose.PREVIEW
     """见 PlanPurpose。默认 preview —— 老调用方不传也不会丢日志, 最多是多打一份。"""
-    publish: bool = True
-    """是否把规划结果下发给 /initial_path (navi_mode=3)。
-
-    **前端两处调用都传 False。** 路线执行走的是 navi_mode=2: 拿到这些拐点之后
-    当途经点走 submit_route 下发(见 MapPreviewPage 的 handleStartNav)。默认值
-    True 是早期行为的遗留, 没有调用方依赖它。
-
-    传 False 时 main.py 的 plan_path 直接跳过下发这一步, 响应里 published 恒为
-    False 且 publish_error 恒为 None(不是失败, 是没打算发)。"""
 
 
 class PlanPathPoint(BaseModel):
@@ -88,13 +79,8 @@ class PlanPathResponse(BaseModel):
     前端拿 points 画预览, 用户确认后**把它们当 navi_mode=2 的途经点走
     submit_route 下发**(见 MapPreviewPage 的 handleStartNav)。
 
-    published / publish_error 只跟 publish=true 那条 /initial_path(navi_mode=3)
-    分支有关, **现在没有调用方**(前端两处都传 publish=false, 所以 published 恒为
-    False)。留着的语义: 下发失败(ROS bridge 没起来/没人订阅)不让整个请求报错,
-    只在响应里标出来。"""
+    这个接口**只负责算**, 不负责发 —— 下发是调用方随后单独调 submit_route。"""
     points: List[PlanPathPoint]
-    published: bool
-    publish_error: Optional[str] = None
 
 
 class TaskState(str, Enum):
@@ -125,16 +111,6 @@ class NavStatus(BaseModel):
     message: Optional[str] = None
     robot_pose: Optional[Pose] = None
     updated_at: float
-    reference_path_active: bool = False
-    """navi_mode=3(/api/maps/{name}/plan_path, publish=true)是否正有一条参考
-    路线在跑。这条下发链路完全不经过 state/waypoints/current_index 这套
-    navi_mode=2 的状态机(见 route_manager.RouteManager 类文档), 所以单独给一个
-    字段, 不往 state 里硬塞一个它本不认识的语义。
-
-    **现在恒为 False, 前端也没有任何地方读它**: 路线执行改走 navi_mode=2 之后,
-    前端两处 planPath 都传 publish=false, 没有人再调那条下发链路。"是不是在跑"
-    现在直接看 state(见 MapPreviewPage 的 navRunning)。字段留着是因为它跟 mode 2
-    正交, 删了要动前后端两边的类型。"""
 
 
 class MapStatus(str, Enum):

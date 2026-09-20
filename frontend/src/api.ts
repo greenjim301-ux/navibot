@@ -139,27 +139,18 @@ export async function groundZ(
 /** 基于 2D 栅格图规划一条全局路径 (A* + line-of-sight 剪枝, 见
  *  backend/app/global_planner.py), 返回补好 z 的关键拐点。
  *
- *  **本项目两处调用都传 publish=false**: 拿到这些拐点之后是把它们当
- *  navi_mode=2 的途经点、走 submitRoute(/preset_waypoints)下发的, 见
- *  MapPreviewPage 的 handleStartNav。publish=true 会让后端发到 /initial_path
- *  (navi_mode=3), 那条链路还在但没有调用方 —— 实测 mode 3 对全局路线的贴合度
- *  不稳定。
- *
- *  规划本身失败(算不出可行路径)才会让这个调用抛错——"下发"那一步失败只反映在
- *  published/publishError 上, 不影响本次调用。 */
+ *  **这个接口只负责算, 不负责发**: 拿到这些拐点之后是把它们当 navi_mode=2 的
+ *  途经点、走 submitRoute(/preset_waypoints)单独下发的, 见 MapPreviewPage 的
+ *  handleStartNav。(以前还有个 publish 参数能让后端直接发到 /initial_path,
+ *  navi_mode=3 —— 那条链路前后端都已经删掉了。) */
 export interface PlanPathResult {
   points: PlannedRoutePoint[];
-  /** 是否真的发给了 /initial_path。**恒为 false** —— 两处调用都传 publish=false,
-   *  路线是算出来之后当 navi_mode=2 途经点下发的, 不走这条。 */
-  published: boolean;
-  publishError: string | null;
 }
 
 export async function planPath(
   mapName: string,
   start: XY,
   goal: XY,
-  publish: boolean = true,
   /** 这次规划是"路线预览"还是"真实导航"。只影响后端日志详略, 不影响规划结果:
    *  navigate 的途经点明细由随后的 submitRoute 打, 避免同一串点刷两遍。 */
   purpose: PlanPurpose = "preview",
@@ -167,11 +158,12 @@ export async function planPath(
   const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/plan_path`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ start, goal, publish, purpose }),
+    body: JSON.stringify({ start, goal, purpose }),
   });
-  const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
-  return { points: data.points, published: data.published, publishError: data.publish_error };
+  const data = await asJson<{ points: PlannedRoutePoint[] }>(res);
+  return { points: data.points };
 }
+
 
 /** 建图时机器狗走过的轨迹 (map 系, z 是机体高度不是地面高程, 不叠加 Δ 标定 ——
  *  跟 3D 预览的点云和机器狗 marker 同一个坐标系)。
