@@ -199,7 +199,7 @@ export interface ServiceInfo {
 }
 
 /** 一个可配置参数的类型, 决定前端渲染什么控件。 */
-export type ServiceParamType = "bool" | "enum" | "float";
+export type ServiceParamType = "bool" | "enum" | "float" | "vec3" | "mat3";
 
 export interface ServiceParamOption {
   value: number;
@@ -219,7 +219,10 @@ export interface ServiceParamSpec {
   min?: number | null;
   max?: number | null;
   step?: number | null;
-  /** 改这个值有连带影响, 要额外提醒用户(目前只有 gait_on_start)。 */
+  /** mat3 专用: 这个矩阵是旋转矩阵, 后端保存时会校验正交性, 前端顺带显示等效的
+   *  roll/pitch/yaw 方便核对。 */
+  rotation?: boolean | null;
+  /** 改这个值有连带影响, 要额外提醒用户。 */
   warn_on_change: boolean;
 }
 

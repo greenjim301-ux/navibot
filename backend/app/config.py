@@ -575,6 +575,25 @@ SERVICE_PARAM_SCHEMAS = {
                         "障碍一起丢掉, 调小会把支架反射当成障碍。",
             },
             {
+                "key": "lidar_R_body", "label": "雷达→机体 旋转", "type": "mat3",
+                "rotation": True, "min": -1.0, "max": 1.0, "step": 0.001,
+                "help": "行优先 3x3 旋转矩阵, 满足 p_lidar = R · p_body + t。这是"
+                        "手持设备绑在机器狗背上的机械安装关系, **装好后必须自己标定** ——"
+                        "现在很可能还是占位单位阵, 那样 /hand_lio/odom_vehicle 给出的是"
+                        "雷达的位姿而不是机体中心的。雷达如果是斜着装的(比如前倾), "
+                        "倾角就体现在这里。保存时会校验它确实是个旋转矩阵(各行两两正交、"
+                        "模长为 1), 不是就直接拒绝。",
+                "warn_on_change": True,
+            },
+            {
+                "key": "lidar_t_body", "label": "雷达→机体 平移", "type": "vec3",
+                "unit": "m", "min": -5.0, "max": 5.0, "step": 0.001,
+                "help": "跟上面配套的平移向量 [x, y, z], 同样满足 "
+                        "p_lidar = R · p_body + t。占位值是 [0, 0, 0], 也就是"
+                        "\"雷达就在机体中心\" —— 实际装在背上会有几十厘米的偏移, "
+                        "不标的话机器狗的位置会一直差这么多。",
+            },
+            {
                 "key": "enable_virtual_obstacles", "label": "注入虚拟障碍", "type": "bool",
                 "help": "把 navibot 发过来的人工禁行区采样点云混进输出点云, 让"
                         "SCAN-Planner 的局部避障也看得见(见 backend/app/"

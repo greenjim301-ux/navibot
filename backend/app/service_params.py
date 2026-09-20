@@ -35,6 +35,16 @@ name 是**精确匹配**的, 所以 `max_vel` 不会误伤同一个文件里的
 None), 写则直接拒绝: 那个位置存的是一条引用, 拿字面量盖掉会把 launch 文件里
 原本的联动关系悄悄拆掉。
 
+列表型的键(vec3 / mat3)另走一套: 定位 `key: [`, 把 `[` 到 `]` 之间的内容整段取出
+来按逗号切。写回时整段重新渲染 —— 3x3 矩阵按原样铺成三行、续行缩进对齐到 `[`,
+所以值没变的时候写回去跟原文**逐字节相同**(有回归测试盯着这条)。
+
+    # prettier-ignore
+    lidar_R_body: [1.0, 0.0, 0.0,
+                   0.0, 1.0, 0.0,
+                   0.0, 0.0, 1.0]
+    lidar_t_body: [0.0, 0.0, 0.0]
+
 代价是这两个解析器都**很窄**: yaml 只处理顶层键的标量值、不处理嵌套结构;
 roslaunch 只处理写在同一行里的 name/value 属性对。schema 里声明的键如果在文件里
 找不到, 直接报错而不是追加一行——追加的键很可能是缩进/命名空间写错了, 静默追加
@@ -135,6 +145,100 @@ def _locator(schema: Dict[str, Any]):
     return _locate_xml if schema.get("format") == "roslaunch" else _locate
 
 
+LIST_TYPES = ("vec3", "mat3")
+_LIST_LEN = {"vec3": 3, "mat3": 9}
+# mat3 当旋转矩阵用时的正交性容差(见 _validate_list 的说明)。
+_ROTATION_TOL = 1e-3
+
+
+def _locate_list(lines: List[str], key: str
+                  ) -> Optional[Tuple[int, int, str, str, str]]:
+    """找 `key: [ ... ]` 这种列表, 方括号可以跨行。
+
+    返回 (起始行, 结束行, head, body, tail):
+      head = `key: [` 及其之前的内容, body = 方括号里的全部文本(换行换成空格),
+      tail = `]` 之后那一行剩下的内容(通常是行内注释)。
+    """
+    opener = re.compile(r"^(?P<head>" + re.escape(key) + r"[ \t]*:[ \t]*\[)(?P<rest>.*)$")
+    for idx, line in enumerate(lines):
+        match = opener.match(line)
+        if not match:
+            continue
+        head = match.group("head")
+        chunk = match.group("rest")
+        pieces: List[str] = []
+        for end in range(idx, len(lines)):
+            if end > idx:
+                chunk = lines[end]
+            close = chunk.find("]")
+            if close >= 0:
+                pieces.append(chunk[:close])
+                return idx, end, head, " ".join(pieces), chunk[close + 1:]
+            pieces.append(chunk)
+        return None  # 开了方括号但没闭合 —— 文件本身坏了, 不猜
+    return None
+
+
+def _parse_list(spec: Dict[str, Any], body: str) -> Optional[List[float]]:
+    """把方括号里的内容切成数字。个数不对/有非数字就返回 None(= 读不出当前值)。"""
+    if _SUBSTITUTION_RE.search(body):
+        return None
+    items = [t.strip() for t in body.split(",")]
+    items = [t for t in items if t != ""]
+    if len(items) != _LIST_LEN[spec["type"]]:
+        return None
+    try:
+        return [float(t) for t in items]
+    except ValueError:
+        return None
+
+
+def _format_list(spec: Dict[str, Any], values: List[float], head: str) -> List[str]:
+    """渲染成一行或多行。mat3 铺成三行、续行缩进对齐到 `[` 后面, 跟原文一致。"""
+    nums = [_format_scalar({"type": "float"}, v) for v in values]
+    if spec["type"] == "vec3":
+        return [head + ", ".join(nums) + "]"]
+    pad = " " * len(head)
+    rows = [", ".join(nums[i:i + 3]) for i in (0, 3, 6)]
+    return [head + rows[0] + ",", pad + rows[1] + ",", pad + rows[2] + "]"]
+
+
+def _validate_list(spec: Dict[str, Any], value: Any) -> List[float]:
+    key, kind = spec["key"], spec["type"]
+    want = _LIST_LEN[kind]
+    if not isinstance(value, (list, tuple)) or len(value) != want:
+        raise ValueError(f"{key} 要的是 {want} 个数字, 收到 {value!r}")
+    numbers: List[float] = []
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError(f"{key} 里不能有 true/false")
+        try:
+            numbers.append(float(item))
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} 里有解不成数字的项: {item!r}")
+    lo, hi = spec.get("min"), spec.get("max")
+    for number in numbers:
+        if lo is not None and number < lo:
+            raise ValueError(f"{key} 的每一项都不能小于 {lo}, 收到 {number}")
+        if hi is not None and number > hi:
+            raise ValueError(f"{key} 的每一项都不能大于 {hi}, 收到 {number}")
+
+    # mat3 在这两个配置里都是**旋转矩阵**(yaml 里写着"行优先 3x3 旋转矩阵"),
+    # hand-lio 直接拿它做坐标变换。随手填 9 个数很容易填出一个不正交的矩阵,
+    # 那样算出来的位姿是歪的、而且不会有任何报错 —— 这里挡一道。
+    if spec.get("rotation"):
+        import numpy as np
+        matrix = np.asarray(numbers, dtype=float).reshape(3, 3)
+        err = float(np.abs(matrix @ matrix.T - np.eye(3)).max())
+        det = float(np.linalg.det(matrix))
+        if err > _ROTATION_TOL or abs(det - 1.0) > _ROTATION_TOL:
+            raise ValueError(
+                f"{key} 必须是旋转矩阵(各行两两正交且模长为 1): "
+                f"R·Rᵀ 偏离单位阵 {err:.4f}, 行列式 {det:.4f}(应为 1)"
+            )
+    return numbers
+
+
 def _schema(service_id: str) -> Dict[str, Any]:
     schema = config.SERVICE_PARAM_SCHEMAS.get(service_id)
     if schema is None:
@@ -192,6 +296,8 @@ def _format_scalar(spec: Dict[str, Any], value: Any) -> str:
 
 def _validate(spec: Dict[str, Any], value: Any) -> Any:
     key, kind = spec["key"], spec["type"]
+    if kind in LIST_TYPES:
+        return _validate_list(spec, value)
     if kind == "bool":
         if not isinstance(value, bool):
             raise ValueError(f"{key} 要的是 true/false, 收到 {value!r}")
@@ -245,6 +351,11 @@ def get_params(service_id: str) -> Dict[str, Any]:
 
     locate = _locator(schema)
     for spec in specs:
+        if spec["type"] in LIST_TYPES:
+            found_list = _locate_list(lines, spec["key"])
+            if found_list is not None:
+                values[spec["key"]] = _parse_list(spec, found_list[3])
+            continue
         found = locate(lines, spec["key"])
         if found is not None:
             values[spec["key"]] = _parse_scalar(spec, found[2])
@@ -281,24 +392,42 @@ def write_params(service_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
     except OSError as e:
         raise RuntimeError(f"读不到配置文件 {path}: {e}") from e
 
-    # 先全文找一遍行号, 确认每个要改的键都在, 再统一改 —— 边找边改的话, 中途
-    # 发现某个键不存在时前面几个已经改过了。
+    # 先全文找一遍行号、把每个键的替换内容都算好, 再统一改 —— 边找边改的话,
+    # 中途发现某个键不存在时前面几个已经改过了。
+    #
+    # 一个键可能占**多行**(跨行的 3x3 矩阵), 所以这里记的是 [start, end] 闭区间
+    # 和整段替换文本; 替换行数可能跟原来不一样, 所以下面从后往前应用, 免得改完
+    # 前面的把后面的行号顶偏。
     stripped = [line.rstrip("\n") for line in lines]
     locate = _locator(schema)
-    hits: Dict[str, Tuple[int, str, str, str]] = {}
+    plan: Dict[str, Tuple[int, int, List[str], str]] = {}
     for key in checked:
+        spec = by_key[key]
+        if spec["type"] in LIST_TYPES:
+            found_list = _locate_list(stripped, key)
+            if found_list is None:
+                continue
+            start, end, head, body, tail = found_list
+            rendered = _format_list(spec, checked[key], head)
+            rendered[-1] = rendered[-1] + tail
+            plan[key] = (start, end, rendered, body)
+            continue
         found = locate(stripped, key)
-        if found is not None:
-            hits[key] = found
-    missing = [k for k in checked if k not in hits]
+        if found is None:
+            continue
+        idx, head, old_value, tail = found
+        plan[key] = (idx, idx,
+                     [head + _format_scalar(spec, checked[key]) + tail], old_value)
+
+    missing = [k for k in checked if k not in plan]
     if missing:
         raise RuntimeError(
-            f"配置文件 {path} 里找不到这些键的标量值: {', '.join(sorted(missing))}"
+            f"配置文件 {path} 里找不到这些键: {', '.join(sorted(missing))}"
         )
 
     # 原来存的是 $(arg ...) 这类引用, 拿字面量盖掉会把 launch 里原本的联动关系
     # 悄悄拆掉(比如 closed_loop_controller/max_vx 跟着 max_vel 走)。宁可报错。
-    referenced = [k for k, (_i, _h, old_value, _t) in hits.items()
+    referenced = [k for k, (_s, _e, _r, old_value) in plan.items()
                   if _SUBSTITUTION_RE.search(old_value)]
     if referenced:
         raise RuntimeError(
@@ -306,9 +435,12 @@ def write_params(service_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
             f"(会拆掉 launch 文件里的联动): {', '.join(sorted(referenced))}"
         )
 
-    for key, (idx, head, _old, tail) in hits.items():
-        newline = "\n" if lines[idx].endswith("\n") else ""
-        lines[idx] = head + _format_scalar(by_key[key], checked[key]) + tail + newline
+    for key, (start, end, rendered, _old) in sorted(
+            plan.items(), key=lambda kv: kv[1][0], reverse=True):
+        newline = "\n" if lines[end].endswith("\n") else ""
+        block = [text + "\n" for text in rendered]
+        block[-1] = rendered[-1] + newline
+        lines[start:end + 1] = block
         logger.info("参数写回 %s: %s = %s", path, key, checked[key])
 
     directory = os.path.dirname(path) or "."

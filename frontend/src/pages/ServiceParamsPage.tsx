@@ -23,19 +23,56 @@ import { cn } from "@/lib/utils";
 // 是有意重复: 用户很可能改完就走, 不重启的话配置看着保存成功了但完全没生效。
 const RESTART_HINT = "参数在服务启动时一次性加载, 改完必须重启服务才会生效。";
 
+/** 一个参数在表单里的形态: 数字/枚举存成字符串(受控输入框), bool 存 boolean,
+ *  vec3/mat3 存成字符串数组(每个分量一个输入框)。 */
+type FormValue = string | boolean | string[] | null;
+
+const LIST_TYPES = ["vec3", "mat3"] as const;
+function isListType(type: ServiceParamSpec["type"]): boolean {
+  return (LIST_TYPES as readonly string[]).includes(type);
+}
+
 /** 把后端读出来的值收敛成受控组件用得了的形态。后端读不出来的键是 null
  *  (yaml 里那行被注释掉了/格式不认识), 这时候控件留空、保存时也不提交这个键。 */
-function toFormValue(spec: ServiceParamSpec, raw: unknown): string | boolean | null {
+function toFormValue(spec: ServiceParamSpec, raw: unknown): FormValue {
   if (raw === null || raw === undefined) return null;
   if (spec.type === "bool") return Boolean(raw);
+  if (isListType(spec.type)) {
+    return Array.isArray(raw) ? raw.map((n) => String(n)) : null;
+  }
   return String(raw);
+}
+
+/** 两个表单值是不是一样 —— 数组要逐项比, 不能靠 !==。 */
+function sameValue(a: FormValue, b: FormValue): boolean {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((item, i) => item === b[i]);
+  }
+  return a === b;
+}
+
+/** 行优先 3x3 旋转矩阵 -> roll/pitch/yaw(度, ZYX 顺序)。纯展示用, 让用户能一眼
+ *  核对"这个矩阵到底是转了多少度"——9 个数字直接看是看不出来的。数值不成立
+ *  (还没填完/不是旋转矩阵)时返回 null, 不显示。 */
+function matrixToRpyDegrees(cells: string[]): [number, number, number] | null {
+  const m = cells.map(Number);
+  if (m.length !== 9 || m.some((v) => !Number.isFinite(v))) return null;
+  const sinPitch = -m[6];
+  if (Math.abs(sinPitch) > 1) return null;
+  const deg = (rad: number) => (rad * 180) / Math.PI;
+  return [
+    deg(Math.atan2(m[7], m[8])),
+    deg(Math.asin(sinPitch)),
+    deg(Math.atan2(m[3], m[0])),
+  ];
 }
 
 export default function ServiceParamsPage() {
   const [services, setServices] = useState<ServiceInfo[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [params, setParams] = useState<ServiceParams | null>(null);
-  const [form, setForm] = useState<Record<string, string | boolean | null>>({});
+  const [form, setForm] = useState<Record<string, FormValue>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -93,7 +130,7 @@ export default function ServiceParamsPage() {
       .filter((spec) => {
         const now = form[spec.key];
         if (now === null || now === undefined) return false;
-        return now !== toFormValue(spec, params.values[spec.key]);
+        return !sameValue(now, toFormValue(spec, params.values[spec.key]));
       })
       .map((spec) => spec.key);
   }
@@ -115,7 +152,9 @@ export default function ServiceParamsPage() {
       for (const key of dirty) {
         const spec = params.params.find((p) => p.key === key)!;
         const value = form[key];
-        payload[key] = spec.type === "bool" ? Boolean(value) : Number(value);
+        if (spec.type === "bool") payload[key] = Boolean(value);
+        else if (isListType(spec.type)) payload[key] = (value as string[]).map(Number);
+        else payload[key] = Number(value);
       }
       const updated = await updateServiceParams(params.service_id, payload);
       setParams(updated);
@@ -241,7 +280,14 @@ export default function ServiceParamsPage() {
               ) : (
                 <div className="divide-y">
                   {params.params.map((spec) => (
-                    <div key={spec.key} className="grid gap-2 py-4 sm:grid-cols-[minmax(0,1fr)_200px] sm:gap-6">
+                    <div
+                      key={spec.key}
+                      className={cn(
+                        "grid gap-2 py-4 sm:gap-6",
+                        // vec3/mat3 的输入框铺不进右侧那条 200px 的窄栏, 整行占满。
+                        isListType(spec.type) ? "" : "sm:grid-cols-[minmax(0,1fr)_200px]",
+                      )}
+                    >
                       <div className="min-w-0">
                         <Label className="text-sm font-medium">{spec.label}</Label>
                         <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
@@ -255,7 +301,11 @@ export default function ServiceParamsPage() {
                           </p>
                         )}
                       </div>
-                      <div className="flex items-start sm:justify-end">
+                      <div className={cn(
+                        "flex items-start",
+                        isListType(spec.type) ? "" : "sm:justify-end",
+                      )}
+                      >
                         {spec.type === "bool" && (
                           <Switch
                             checked={form[spec.key] === true}
@@ -302,6 +352,52 @@ export default function ServiceParamsPage() {
                             )}
                           </div>
                         )}
+                        {isListType(spec.type) && (() => {
+                          const cells = (form[spec.key] as string[] | null)
+                            ?? Array(spec.type === "mat3" ? 9 : 3).fill("");
+                          const cols = spec.type === "mat3" ? 3 : 3;
+                          const rpy = spec.rotation ? matrixToRpyDegrees(cells) : null;
+                          return (
+                            <div className="w-full">
+                              <div
+                                className="grid max-w-[420px] gap-1.5"
+                                style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
+                              >
+                                {cells.map((cell, i) => (
+                                  <Input
+                                    key={i}
+                                    type="number"
+                                    inputMode="decimal"
+                                    step={spec.step ?? 0.001}
+                                    disabled={Boolean(params.file_error)}
+                                    aria-label={`${spec.label} [${i}]`}
+                                    className="font-mono text-xs"
+                                    value={cell}
+                                    onChange={(e) => setForm((f) => {
+                                      const next = [...cells];
+                                      next[i] = e.target.value;
+                                      return { ...f, [spec.key]: next };
+                                    })}
+                                  />
+                                ))}
+                              </div>
+                              {/* 9 个数字看不出转了多少度, 换算成 roll/pitch/yaw 显示
+                                  出来方便核对(只读, 不参与提交)。 */}
+                              {spec.rotation && (
+                                <div className="mt-1.5 font-mono text-[10px] text-muted-foreground">
+                                  {rpy
+                                    ? `≈ roll ${rpy[0].toFixed(1)}° · pitch ${rpy[1].toFixed(1)}° · yaw ${rpy[2].toFixed(1)}°`
+                                    : "填完 9 个数才能换算出 roll/pitch/yaw"}
+                                </div>
+                              )}
+                              {spec.type === "vec3" && (
+                                <div className="mt-1.5 font-mono text-[10px] text-muted-foreground">
+                                  x · y · z{spec.unit ? ` [${spec.unit}]` : ""}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
                   ))}
