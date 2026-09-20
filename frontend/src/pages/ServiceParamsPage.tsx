@@ -48,8 +48,8 @@ export default function ServiceParamsPage() {
     try {
       const list = await listServices();
       setServices(list);
-      // 默认选中第一个能配的服务(目前只有 deep_bridge)。已经选了就不动——
-      // 3s 轮询刷新状态时不能把用户当前选的那个挤掉。
+      // 默认选中第一个能配的服务。已经选了就不动 —— 3s 轮询刷新状态时不能把
+      // 用户当前选的那个挤掉。
       setSelectedId((prev) => prev ?? list.find((s) => s.configurable)?.id ?? null);
     } catch (e) {
       setError(String(e));
@@ -224,11 +224,14 @@ export default function ServiceParamsPage() {
                   <div>
                     <div className="font-medium">读不到配置文件</div>
                     <div className="mt-1">{params.file_error}</div>
-                    <div className="mt-1 text-destructive/80">
-                      各台板子的工作空间路径不一样, 用环境变量
-                      <span className="font-mono"> NAVIBOT_DEEP_BRIDGE_CONFIG </span>
-                      指到这台板子上的实际路径。
-                    </div>
+                    {/* 环境变量名从后端拿, 不能写死 —— 每个服务各有各的。 */}
+                    {params.env_var && (
+                      <div className="mt-1 text-destructive/80">
+                        各台板子的工作空间路径不一样, 用环境变量
+                        <span className="font-mono"> {params.env_var} </span>
+                        指到这台板子上的实际路径。
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

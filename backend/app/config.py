@@ -504,6 +504,7 @@ SYSTEMD_SERVICES = [
 # round-trip 会全部冲掉。见 service_params.write_params。
 SERVICE_PARAM_SCHEMAS = {
     "deep_bridge": {
+        "env_var": "NAVIBOT_DEEP_BRIDGE_CONFIG",
         "file": os.environ.get(
             "NAVIBOT_DEEP_BRIDGE_CONFIG",
             "/home/lisi/Documents/work/ros1/src/deep_bridge/config/deep_bridge.yaml",
@@ -555,6 +556,30 @@ SERVICE_PARAM_SCHEMAS = {
                         "满量程是按步态给的, 而 full_scale_* 不在这个页面里, 要手工改"
                         "配置文件。只在使用模式=常规时才用得到满量程; 导航模式不受影响。",
                 "warn_on_change": True,
+            },
+        ],
+    },
+    "hand_lio": {
+        "env_var": "NAVIBOT_HAND_LIO_CONFIG",
+        "file": os.environ.get(
+            "NAVIBOT_HAND_LIO_CONFIG",
+            "/home/lisi/Documents/work/ros1/src/hand-lio/config/hand_lio.yaml",
+        ),
+        "params": [
+            {
+                "key": "blind", "label": "盲区半径", "type": "float",
+                "unit": "m", "min": 0.0, "max": 2.0, "step": 0.05,
+                "help": "靠近雷达中心这个距离以内的点直接丢弃。Mid-360 硬件本身的"
+                        "盲区只有 0.1~0.2m, 多出来的部分是自身支架/外壳造成的自遮挡 ——"
+                        "同款硬件的 Elevator-LIO 实测用的是 0.8。调大会连真实的近处"
+                        "障碍一起丢掉, 调小会把支架反射当成障碍。",
+            },
+            {
+                "key": "enable_virtual_obstacles", "label": "注入虚拟障碍", "type": "bool",
+                "help": "把 navibot 发过来的人工禁行区采样点云混进输出点云, 让"
+                        "SCAN-Planner 的局部避障也看得见(见 backend/app/"
+                        "virtual_obstacles.py)。关掉之后地图上圈的禁行区只在全局规划"
+                        "里生效, 局部规划器不知道它们的存在。",
             },
         ],
     },

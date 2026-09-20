@@ -226,8 +226,10 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 
 ## 参数配置页
 
-侧边栏「参数配置」(`/params`)，按服务分别改它的 ROS 参数 yaml。目前只接了
-`deep_bridge`，schema 在 `backend/app/config.py` 的 `SERVICE_PARAM_SCHEMAS`：
+侧边栏「参数配置」(`/params`)，按服务分别改它的 ROS 参数 yaml。schema 在
+`backend/app/config.py` 的 `SERVICE_PARAM_SCHEMAS`，目前接了两个服务。
+
+### `deep_bridge`
 
 | 键 | 类型 | 说明 |
 |---|---|---|
@@ -240,6 +242,17 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 
 float 的上下界取自厂商《各个步态的有效速度范围》表的区间上界。
 
+### `hand_lio`
+
+| 键 | 类型 | 说明 |
+|---|---|---|
+| `blind` | float | 盲区半径 [m]，0 ~ 2.0。靠近雷达中心这个距离以内的点直接丢弃 |
+| `enable_virtual_obstacles` | bool | 是否把 navibot 发的人工禁行区采样点云混进输出点云 |
+
+`blind` 的硬件本身只有 0.1~0.2m，多出来的是支架/外壳自遮挡；同款硬件的
+Elevator-LIO 实测用的是 0.8。关掉 `enable_virtual_obstacles` 之后，地图上圈的禁行区
+只在全局规划里生效，局部规划器不知道它们的存在。
+
 接口：`GET /api/services/{id}/params`（schema + 当前值）、
 `PUT /api/services/{id}/params`（只传要改的键）、
 `POST /api/services/{id}/restart`。`GET /api/services` 的每条多了个
@@ -249,20 +262,39 @@ float 的上下界取自厂商《各个步态的有效速度范围》表的区�
 
 `deep_bridge.yaml` 里那些注释（协议出处、厂商的步态速度范围表、"实测这台本体加密
 是关掉的"这类坑）信息量比配置本身还大，用 PyYAML 读出来再 dump 回去会**全部冲掉**。
-所以 `service_params.py` 只认"顶格 `key: value`"这一种形态，精确替换 value 那一段，
-行内注释/缩进/空行/其它所有内容原样不动。实测：90 行的文件改 6 个键，diff 只有 6 行。
+所以 `service_params.py` 只做**精确替换 value 那一段**，行内注释/缩进/空行/其它
+所有内容原样不动。支持两种写法，因为实际的 yaml 两种都有：
 
-代价是这个解析器**很窄**——只处理顶层不缩进的标量键。schema 里声明的键在文件里
-找不到时直接报错而不是追加一行（追加多半是缩进/命名空间写错了，静默追加只会得到
-一个永远不生效的配置）。写的时候先全文找齐所有行号、全部校验通过才动文件，然后
-写临时文件 + `os.replace` 原子替换，不会留下改了一半的配置。
+```yaml
+# (a) 一行式
+enable_virtual_obstacles: true   # 行内注释
+
+# (b) 跨行式 —— hand_lio.yaml 的 blind / virtual_obstacle_* 都是这种
+blind:
+  0.35 # 盲区半径 [m]，靠近雷达中心的点直接丢弃
+  # 后面还能接着写好几行纯注释
+```
+
+(b) 只认第一个"缩进且有实际内容"的行当值；中间的空行和纯注释行跳过；一旦遇到
+不缩进的行就判定这个键没有标量值（说明它是个 map/list 或者空值），不乱猜。
+
+实测：`deep_bridge.yaml` 90 行改 6 个键 diff 只有 6 行、`hand_lio.yaml` 84 行改
+2 个键 diff 只有 2 行，改完 `yaml.safe_load` 都仍能正常解析。
+
+代价是这个解析器**很窄**——只处理顶层键的标量值，不处理嵌套结构。schema 里声明的
+键在文件里找不到时直接报错而不是追加一行（追加多半是缩进/命名空间写错了，静默追加
+只会得到一个永远不生效的配置）。写的时候先全文找齐所有行号、全部校验通过才动文件，
+然后写临时文件 + `os.replace` 原子替换（并保留原文件权限位），不会留下改了一半的配置。
 
 ### 配置文件路径必须按环境覆盖
 
-**这套要在多台板子上跑，每台的工作空间路径都可能不一样**，所以路径是环境变量：
+**这套要在多台板子上跑，每台的工作空间路径都可能不一样**，所以路径是环境变量，
+每个服务各有各的（schema 里的 `env_var` 字段，接口会一起返回，页面据此提示用户该设
+哪个，不写死）：
 
 ```
 NAVIBOT_DEEP_BRIDGE_CONFIG=/home/cat/ros1_ws/src/deep_bridge/config/deep_bridge.yaml
+NAVIBOT_HAND_LIO_CONFIG=/home/cat/ros1_ws/src/hand-lio/config/hand_lio.yaml
 ```
 
 默认值是开发机上的路径。**路径没配对不算接口失败**——`GET` 照样返回 200，schema
@@ -973,9 +1005,8 @@ log_odds = count_hit >= count_hit_and_miss - count_hit ? prob_hit_log_ : prob_mi
   要求的行为（每个服务单独管理），但**实机上这些组合都没试过**——见「服务之间
   没有关系，每个服务单独管理」一节。
 - **参数配置页没有在真实机器上验证过。** 读/写/校验/重启端点都是在开发机上对着
-  `deep_bridge.yaml` 的副本跑通的（90 行文件改 6 个键、diff 只有 6 行、改完
-  `yaml.safe_load` 仍能正常解析），但**没有在板子上验证过后端用户对那个 yaml 有没有
-  写权限** —— 写不动的话是 500 + "权限?" 的提示，不是静默失败。重启走的 stop + start
+  `deep_bridge.yaml` / `hand_lio.yaml` 的副本跑通的，但**没有在板子上验证过后端用户
+  对那些 yaml 有没有写权限** —— 写不动的话是 500 + "权限?" 的提示，不是静默失败。重启走的 stop + start
   也没在真机上试过。
 - **`deep_bridge` / `unitree_bridge` 两个新服务只核对过 unit 文件，没跑过。**
   unit 名和 `ExecStart` 取自 `navi-planner-bringup/systemd/`，但这两条对应的

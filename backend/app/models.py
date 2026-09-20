@@ -232,6 +232,9 @@ class ServiceParams(BaseModel):
     service_id: str
     file: str
     """参数所在的 yaml 路径。多台板子路径不一样, 显示出来便于排查。"""
+    env_var: Optional[str] = None
+    """覆盖上面这个路径用的环境变量名。路径没配对时页面要告诉用户该设哪个变量,
+    不能写死成某一个服务的(每个服务各有各的)。"""
     file_error: Optional[str] = None
     """读不到配置文件时的原因; 非 None 时 values 里全是 null。不算接口失败——
     路径没配对在多板子环境里是常态, 页面要能把这个原因显示出来。"""

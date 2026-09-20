@@ -7,32 +7,86 @@
 
 **写回是按行原地替换值, 不是 yaml 重新序列化。** deep_bridge.yaml 里那些注释
 (协议出处、厂商的步态速度范围表、"实测这台本体加密是关掉的"这类坑)信息量比配置
-本身还大, 用 PyYAML 读出来再 dump 回去会把它们全部冲掉。所以这里只认"顶格
-`key: value`"这一种形态, 精确替换 value 那一段, 行内注释、缩进、空行、文件里其它
-所有内容原样不动。
+本身还大, 用 PyYAML 读出来再 dump 回去会把它们全部冲掉。所以这里只做**精确替换
+value 那一段**, 行内注释、缩进、空行、文件里其它所有内容原样不动。
 
-代价是这个解析器**很窄**: 只处理顶层(不缩进)的标量键。schema 里声明的键如果在
-文件里找不到, 直接报错而不是追加一行——追加的键很可能是缩进/命名空间写错了,
-静默追加只会得到一个永远不生效的配置。
+支持两种写法, 因为实际的 yaml 两种都有:
+
+    (a) 一行式     enable_virtual_obstacles: true   # 行内注释
+    (b) 跨行式     blind:
+                     0.35 # 盲区半径 [m]
+                     # 下面还能接着写好几行纯注释
+
+(b) 是 hand_lio.yaml 里 blind / virtual_obstacle_* 那几个键的写法(值单独一行、
+缩进, 后面跟一串解释性注释)。只认第一个"缩进且有实际内容"的行当值; 中间的空行和
+纯注释行跳过; 一旦遇到不缩进的行就判定这个键没有标量值(说明它是个 map/list 或者
+空值), 不乱猜。
+
+代价是这个解析器**很窄**: 只处理顶层键的标量值, 不处理嵌套结构。schema 里声明的
+键如果在文件里找不到, 直接报错而不是追加一行——追加的键很可能是缩进/命名空间
+写错了, 静默追加只会得到一个永远不生效的配置。
 """
 import logging
 import os
 import re
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
 
 logger = logging.getLogger("navibot.service_params")
 
-# 顶格的标量键: `key: value   # 可选行内注释`
+# 一行式: `key: value   # 可选行内注释`
 # value 捕获到第一个 ` #` 之前(yaml 要求行内注释前有空白), 前后空白不计入。
-def _line_re(key: str) -> "re.Pattern":
+def _same_line_re(key: str) -> "re.Pattern":
     return re.compile(
         r"^(?P<head>" + re.escape(key) + r"[ \t]*:[ \t]*)"
-        r"(?P<value>.*?)"
+        r"(?P<value>[^#\s][^#]*?)"
         r"(?P<tail>(?:[ \t]+#.*)?[ \t]*)$"
     )
+
+
+# 跨行式的第一行: `key:` 后面只剩空白或注释, 值在后面某一行。
+def _key_only_re(key: str) -> "re.Pattern":
+    return re.compile(r"^" + re.escape(key) + r"[ \t]*:[ \t]*(?:#.*)?$")
+
+
+# 跨行式的值那一行: 缩进 + 实际内容 + 可选行内注释。
+_BLOCK_VALUE_RE = re.compile(
+    r"^(?P<head>[ \t]+)"
+    r"(?P<value>[^#\s][^#]*?)"
+    r"(?P<tail>(?:[ \t]+#.*)?[ \t]*)$"
+)
+
+
+def _locate(lines: List[str], key: str) -> Optional[Tuple[int, str, str, str]]:
+    """在 lines(不带换行符)里找 key 的标量值所在的行。
+
+    返回 (行号, head, value, tail) —— head + value + tail 拼回来就是原行, 所以
+    改值的时候只换中间那段, 缩进和行内注释原样不动。找不到返回 None。
+    """
+    same = _same_line_re(key)
+    key_only = _key_only_re(key)
+    for idx, line in enumerate(lines):
+        match = same.match(line)
+        if match:
+            return idx, match.group("head"), match.group("value"), match.group("tail")
+        if not key_only.match(line):
+            continue
+        # 跨行式: 往后找第一个"缩进且有实际内容"的行。空行和纯注释行跳过;
+        # 碰到不缩进的行就说明这个键底下没有标量值(是 map/list 或者空), 放弃。
+        for j in range(idx + 1, len(lines)):
+            nxt = lines[j]
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if not nxt[:1].isspace():
+                return None
+            block = _BLOCK_VALUE_RE.match(nxt)
+            if block:
+                return j, block.group("head"), block.group("value"), block.group("tail")
+            return None
+        return None
+    return None
 
 
 def _schema(service_id: str) -> Dict[str, Any]:
@@ -140,15 +194,12 @@ def get_params(service_id: str) -> Dict[str, Any]:
         lines = []
 
     for spec in specs:
-        pattern = _line_re(spec["key"])
-        for line in lines:
-            match = pattern.match(line)
-            if match:
-                values[spec["key"]] = _parse_scalar(spec, match.group("value"))
-                break
+        found = _locate(lines, spec["key"])
+        if found is not None:
+            values[spec["key"]] = _parse_scalar(spec, found[2])
 
-    return {"service_id": service_id, "file": path, "file_error": file_error,
-            "params": specs, "values": values}
+    return {"service_id": service_id, "file": path, "env_var": schema.get("env_var"),
+            "file_error": file_error, "params": specs, "values": values}
 
 
 def write_params(service_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -181,28 +232,22 @@ def write_params(service_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
 
     # 先全文找一遍行号, 确认每个要改的键都在, 再统一改 —— 边找边改的话, 中途
     # 发现某个键不存在时前面几个已经改过了。
-    hits: Dict[str, int] = {}
+    stripped = [line.rstrip("\n") for line in lines]
+    hits: Dict[str, Tuple[int, str, str, str]] = {}
     for key in checked:
-        pattern = _line_re(key)
-        for idx, line in enumerate(lines):
-            if pattern.match(line.rstrip("\n")):
-                hits[key] = idx
-                break
+        found = _locate(stripped, key)
+        if found is not None:
+            hits[key] = found
     missing = [k for k in checked if k not in hits]
     if missing:
         raise RuntimeError(
-            f"配置文件 {path} 里找不到这些键(只支持顶格的 `key: value`): "
+            f"配置文件 {path} 里找不到这些键的标量值(只支持顶层键, 一行式或跨行式): "
             f"{', '.join(sorted(missing))}"
         )
 
-    for key, idx in hits.items():
-        raw = lines[idx]
-        newline = "\n" if raw.endswith("\n") else ""
-        match = _line_re(key).match(raw.rstrip("\n"))
-        # 上面刚匹配过, 这里必中; assert 只是给静态检查/未来改动留个断言。
-        assert match is not None
-        lines[idx] = (match.group("head") + _format_scalar(by_key[key], checked[key])
-                      + match.group("tail") + newline)
+    for key, (idx, head, _old, tail) in hits.items():
+        newline = "\n" if lines[idx].endswith("\n") else ""
+        lines[idx] = head + _format_scalar(by_key[key], checked[key]) + tail + newline
         logger.info("参数写回 %s: %s = %s", path, key, checked[key])
 
     directory = os.path.dirname(path) or "."
