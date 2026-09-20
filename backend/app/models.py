@@ -1,6 +1,6 @@
 import time
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -197,6 +197,52 @@ class ServiceInfo(BaseModel):
     running/exited)。"""
     enabled: str
     """systemctl 的 UnitFileState: enabled/disabled/static/..., 开机是否自启。"""
+    configurable: bool = False
+    """这个服务有没有可配置参数(config.SERVICE_PARAM_SCHEMAS 里有没有它)。
+    「参数配置」页据此决定哪些服务能点进去。"""
+
+
+class ServiceParamOption(BaseModel):
+    """enum 型参数的一个可选值。value 恒为 int(目前 usage_mode / gait_on_start
+    都是整数码), label 是给人看的说明。"""
+    value: int
+    label: str
+
+
+class ServiceParamSpec(BaseModel):
+    """一个可配置参数的声明, 直接来自 config.SERVICE_PARAM_SCHEMAS。前端照着
+    渲染控件: bool -> Switch, enum -> Select, float -> 数字输入框。"""
+    key: str
+    label: str
+    type: str
+    """bool / enum / float"""
+    help: Optional[str] = None
+    unit: Optional[str] = None
+    options: Optional[List[ServiceParamOption]] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    step: Optional[float] = None
+    warn_on_change: bool = False
+    """改这个值有连带影响、需要额外提醒用户(目前只有 gait_on_start —— 换步态就
+    必须同步改 yaml 里的 full_scale_v*, 而那三个不在这个页面里)。"""
+
+
+class ServiceParams(BaseModel):
+    """某个服务的参数 schema + 当前值。"""
+    service_id: str
+    file: str
+    """参数所在的 yaml 路径。多台板子路径不一样, 显示出来便于排查。"""
+    file_error: Optional[str] = None
+    """读不到配置文件时的原因; 非 None 时 values 里全是 null。不算接口失败——
+    路径没配对在多板子环境里是常态, 页面要能把这个原因显示出来。"""
+    params: List[ServiceParamSpec]
+    values: Dict[str, Any]
+    """key -> 当前值; 解析不出来的键是 null。"""
+
+
+class UpdateServiceParamsRequest(BaseModel):
+    values: Dict[str, Any]
+    """只传要改的键即可; 传了 schema 里没有的键会 400。"""
 
 
 class MappingModeInfo(BaseModel):

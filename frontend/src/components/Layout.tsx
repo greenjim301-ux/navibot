@@ -13,6 +13,7 @@ const SECTION_LABELS: [prefix: string, label: string][] = [
   ["/routes", "巡检路线"],
   ["/results", "巡检结果"],
   ["/system", "系统管理"],
+  ["/params", "参数配置"],
   ["/playback", "数据回放"],
 ];
 

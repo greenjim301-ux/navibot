@@ -224,6 +224,69 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 
 ---
 
+## 参数配置页
+
+侧边栏「参数配置」(`/params`)，按服务分别改它的 ROS 参数 yaml。目前只接了
+`deep_bridge`，schema 在 `backend/app/config.py` 的 `SERVICE_PARAM_SCHEMAS`：
+
+| 键 | 类型 | 说明 |
+|---|---|---|
+| `use_dtls` | bool | 是否启用 DTLS 加密。指南说本体默认开，但实测这台是关的，开了反而握不上手 |
+| `usage_mode` | enum | `0` 常规模式（归一化轴指令）/ `1` 导航模式（真实轴指令） |
+| `max_vx` | float | 最大前后速度 [m/s]，0 ~ 2.0 |
+| `max_vy` | float | 最大左右速度 [m/s]，0 ~ 1.0 |
+| `max_vyaw` | float | 最大偏航角速度 [rad/s]，0 ~ 2.0 |
+| `gait_on_start` | enum | `4097` 标准-基础 / `4099` 标准-楼梯 / `12290` 敏捷-平地 / `12291` 敏捷-楼梯 |
+
+float 的上下界取自厂商《各个步态的有效速度范围》表的区间上界。
+
+接口：`GET /api/services/{id}/params`（schema + 当前值）、
+`PUT /api/services/{id}/params`（只传要改的键）、
+`POST /api/services/{id}/restart`。`GET /api/services` 的每条多了个
+`configurable` 字段，前端据此决定哪些服务能点进去。
+
+### 写回是按行原地替换，不是 yaml 重新序列化
+
+`deep_bridge.yaml` 里那些注释（协议出处、厂商的步态速度范围表、"实测这台本体加密
+是关掉的"这类坑）信息量比配置本身还大，用 PyYAML 读出来再 dump 回去会**全部冲掉**。
+所以 `service_params.py` 只认"顶格 `key: value`"这一种形态，精确替换 value 那一段，
+行内注释/缩进/空行/其它所有内容原样不动。实测：90 行的文件改 6 个键，diff 只有 6 行。
+
+代价是这个解析器**很窄**——只处理顶层不缩进的标量键。schema 里声明的键在文件里
+找不到时直接报错而不是追加一行（追加多半是缩进/命名空间写错了，静默追加只会得到
+一个永远不生效的配置）。写的时候先全文找齐所有行号、全部校验通过才动文件，然后
+写临时文件 + `os.replace` 原子替换，不会留下改了一半的配置。
+
+### 配置文件路径必须按环境覆盖
+
+**这套要在多台板子上跑，每台的工作空间路径都可能不一样**，所以路径是环境变量：
+
+```
+NAVIBOT_DEEP_BRIDGE_CONFIG=/home/cat/ros1_ws/src/deep_bridge/config/deep_bridge.yaml
+```
+
+默认值是开发机上的路径。**路径没配对不算接口失败**——`GET` 照样返回 200，schema
+照给，`file_error` 里带上原因，页面把"文件在哪、为什么读不到"显示出来。这个错在
+多板子环境里是常态不是意外，返回 500 只会让人不知道该去改什么。
+
+### 改完必须重启服务
+
+参数 yaml 是 roslaunch **启动时一次性加载**的，服务跑着的时候改文件不会生效。所以
+保存成功后会弹窗问"现在重启服务吗"，页面上也常驻一条提示。
+
+重启在后端做成 **stop + start 两步**，不是 `systemctl restart`——部署时给的 sudoers
+规则只放行了 `start`/`stop`（见「服务状态管理」），用 `restart` 会因为不在允许列表
+里被 `sudo` 拒掉，还得让每台板子都去改 sudoers。
+
+### 一个没覆盖的耦合
+
+`gait_on_start` 带 `warn_on_change` 标记，改它时页面会额外弹一条警示：
+**换步态就必须同步改 yaml 里的 `full_scale_vx/vy/vyaw`**（满量程是按步态给的），
+而那三个键不在这个页面里，要手工改配置文件。只在 `usage_mode=0`（常规模式）时
+才用得到满量程，导航模式不受影响。
+
+---
+
 ## 建图（新建地图）
 
 地图管理页的"新建地图"是一次性的建图会话：选模式 → 填地图名 → 后端启动对应
@@ -909,6 +972,11 @@ log_odds = count_hit >= count_hit_and_miss - count_hit ? prob_hit_log_ : prob_mi
   `!have_odom_` 会把收到的途经点直接丢掉（只打一条 ROS_WARN）。这是用户明确
   要求的行为（每个服务单独管理），但**实机上这些组合都没试过**——见「服务之间
   没有关系，每个服务单独管理」一节。
+- **参数配置页没有在真实机器上验证过。** 读/写/校验/重启端点都是在开发机上对着
+  `deep_bridge.yaml` 的副本跑通的（90 行文件改 6 个键、diff 只有 6 行、改完
+  `yaml.safe_load` 仍能正常解析），但**没有在板子上验证过后端用户对那个 yaml 有没有
+  写权限** —— 写不动的话是 500 + "权限?" 的提示，不是静默失败。重启走的 stop + start
+  也没在真机上试过。
 - **`deep_bridge` / `unitree_bridge` 两个新服务只核对过 unit 文件，没跑过。**
   unit 名和 `ExecStart` 取自 `navi-planner-bringup/systemd/`，但这两条对应的
   机器（云深处 Lynx M20 / 宇树 Go2）都没有实际启停验证过，sudoers 规则也还

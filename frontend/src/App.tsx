@@ -8,6 +8,7 @@ import RouteListPage from "./pages/RouteListPage";
 import RouteEditorPage from "./pages/RouteEditorPage";
 import ResultsPage from "./pages/ResultsPage";
 import SystemPage from "./pages/SystemPage";
+import ServiceParamsPage from "./pages/ServiceParamsPage";
 import PlaybackLibraryPage from "./pages/PlaybackLibraryPage";
 import PlaybackWorkspacePage from "./pages/PlaybackWorkspacePage";
 
@@ -28,6 +29,7 @@ export default function App() {
           <Route path="/routes/:id" element={<RouteEditorPage />} />
           <Route path="/results" element={<ResultsPage />} />
           <Route path="/system" element={<SystemPage />} />
+          <Route path="/params" element={<ServiceParamsPage />} />
           <Route path="/playback" element={<PlaybackLibraryPage />} />
         </Route>
       </Routes>

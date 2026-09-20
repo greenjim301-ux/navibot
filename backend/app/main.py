@@ -28,7 +28,7 @@ from .models import (
     PlanPathRequest, PlanPathResponse, PlanPathPoint,
     RouteRecord, RouteRequest,
     SelfInflationRequest,
-    ServiceInfo,
+    ServiceInfo, ServiceParams, UpdateServiceParamsRequest,
     StartMappingRequest,
     SurfCloudRequest,
     UpdateMapEditRequest, UpdateRouteRequest,
@@ -40,6 +40,7 @@ from .ros_bridge import RosBridge
 from .route_manager import RouteManager
 from .route_store import RouteStore, validate_route_id
 from .service_manager import ServiceManager
+from . import service_params
 from .ws_manager import WebSocketManager
 
 # 不能用 logging.basicConfig: uvicorn 在导入本模块之前就调过 logging.config.dictConfig,
@@ -627,6 +628,55 @@ async def stop_service(service_id: str):
         return await run_in_threadpool(service_manager.stop, service_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/services/{service_id}/restart", response_model=ServiceInfo)
+async def restart_service(service_id: str):
+    """重启一个服务, 给「参数配置」页保存完之后用 —— 参数 yaml 是 roslaunch 启动时
+    一次性加载的, 服务跑着的时候改文件不会生效, 必须重启。
+
+    后端做成 stop + start 两步而不是 systemctl restart, 理由见
+    service_manager.ServiceManager.restart(sudoers 只放行了 start/stop)。"""
+    try:
+        return await run_in_threadpool(service_manager.restart, service_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/services/{service_id}/params", response_model=ServiceParams)
+async def get_service_params(service_id: str):
+    """某个服务的参数 schema + 当前值。只有 config.SERVICE_PARAM_SCHEMAS 里
+    声明过的服务有, 其余 404。
+
+    配置文件读不到**不算失败**(返回 200, file_error 里带原因)——各台板子的工作
+    空间路径不一样, 路径没配对是常态, 页面要能把"文件在哪、为什么读不到"显示
+    出来, 比一个 500 有用。"""
+    try:
+        return await run_in_threadpool(service_params.get_params, service_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.put("/api/services/{service_id}/params", response_model=ServiceParams)
+async def update_service_params(service_id: str, req: UpdateServiceParamsRequest):
+    """写回参数, 返回写完之后重新读出来的值。
+
+    只改 values 里给到的键, 按行原地替换、保留 yaml 里所有注释(见
+    service_params.write_params)。校验不过/键不认识是 400, 文件读写失败是 500。
+
+    **写回不会自动重启服务** —— 要不要重启由用户在页面上决定(保存成功后弹窗
+    询问), 调 POST /api/services/{id}/restart。"""
+    try:
+        return await run_in_threadpool(service_params.write_params, service_id, req.values)
+    except ValueError as e:
+        # 既包含"没有这个服务"也包含"值不合法", 前者其实该 404 —— 但 write_params
+        # 的入口第一件事就是查服务存不存在, 前端能点到保存说明服务是存在的, 这里
+        # 统一按 400 给用户看错误文本更实用。
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
 

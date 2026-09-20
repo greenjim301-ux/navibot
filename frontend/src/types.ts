@@ -193,6 +193,46 @@ export interface ServiceInfo {
   sub_state: string;
   /** systemctl 的 UnitFileState: enabled/disabled/static/..., 开机是否自启。 */
   enabled: string;
+  /** 这个服务有没有可配置参数(后端 config.SERVICE_PARAM_SCHEMAS 里有没有它)。
+   *  「参数配置」页据此决定哪些服务能点进去。 */
+  configurable: boolean;
+}
+
+/** 一个可配置参数的类型, 决定前端渲染什么控件。 */
+export type ServiceParamType = "bool" | "enum" | "float";
+
+export interface ServiceParamOption {
+  value: number;
+  label: string;
+}
+
+/** 一个可配置参数的声明, 来自后端 config.SERVICE_PARAM_SCHEMAS。 */
+export interface ServiceParamSpec {
+  key: string;
+  label: string;
+  type: ServiceParamType;
+  help?: string | null;
+  /** 单位(m/s 这种), 显示在输入框右侧。 */
+  unit?: string | null;
+  /** type === "enum" 时才有。 */
+  options?: ServiceParamOption[] | null;
+  min?: number | null;
+  max?: number | null;
+  step?: number | null;
+  /** 改这个值有连带影响, 要额外提醒用户(目前只有 gait_on_start)。 */
+  warn_on_change: boolean;
+}
+
+export interface ServiceParams {
+  service_id: string;
+  /** 参数所在的 yaml 路径。多台板子路径不一样, 显示出来便于排查。 */
+  file: string;
+  /** 读不到配置文件时的原因; 非 null 时 values 里全是 null。这不是接口失败——
+   *  路径没配对在多板子环境里是常态。 */
+  file_error?: string | null;
+  params: ServiceParamSpec[];
+  /** key -> 当前值; 解析不出来的键是 null。 */
+  values: Record<string, unknown>;
 }
 
 /** 「新建地图」建图页可选的一种建图模式, 见 backend/app/config.py 的

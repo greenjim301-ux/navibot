@@ -1,5 +1,5 @@
 import { Link, useLocation } from "react-router-dom";
-import { House, Map, Route, ListChecks, Settings, PlayCircle, Bot, SquareTerminal } from "lucide-react";
+import { House, Map, Route, ListChecks, Settings, SlidersHorizontal, PlayCircle, Bot, SquareTerminal } from "lucide-react";
 import {
   Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent,
   SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem,
@@ -17,6 +17,7 @@ export function AppSidebar() {
   const isRoutes = location.pathname.startsWith("/routes");
   const isResults = location.pathname.startsWith("/results");
   const isSystem = location.pathname.startsWith("/system");
+  const isParams = location.pathname.startsWith("/params");
   const isPlayback = location.pathname.startsWith("/playback");
   // 连接状态卡片用的数据源就是 /ws/nav 本身(跟 MapPreviewPage 用的是同一套,
   // 各页各开一条连接, 后端 WebSocketManager 本来就是广播给所有连接的)。
@@ -99,6 +100,14 @@ export function AppSidebar() {
                   <Link to="/system">
                     <Settings />
                     <span>系统管理</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={isParams} className={MENU_ITEM_CLASS}>
+                  <Link to="/params">
+                    <SlidersHorizontal />
+                    <span>参数配置</span>
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

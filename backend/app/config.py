@@ -489,6 +489,77 @@ SYSTEMD_SERVICES = [
     {"id": "unitree_bridge", "label": "运动控制 · 宇树", "unit": "unitree_bridge.service"},
 ]
 
+# 「参数配置」页能改的服务参数。key 是 SYSTEMD_SERVICES 里的服务 id —— 只有列在
+# 这里的服务才有参数页, 其余服务前端显示"暂无可配置参数"。
+#
+# **配置文件路径必须能按环境覆盖**: 这套东西要在多台板子上跑, 每台的工作空间路径
+# 都可能不一样, 不能写死。默认值是开发机上的路径, 部署时用对应的环境变量覆盖。
+#
+# 为什么不做成"任意 key 都能改": 跟 SYSTEMD_SERVICES 同一个理由——只放行这张固定
+# 表里的键, 挡掉"随便传个 key 就能改 yaml"的口子。每个键的类型/范围/可选值也在这里
+# 声明, service_params.py 照着校验。
+#
+# 写回的时候是**按行原地替换值**, 不是 yaml 重新序列化 —— deep_bridge.yaml 里那些
+# 注释(协议出处、步态速度范围表、各种实测坑)信息量比配置本身还大, 用 PyYAML
+# round-trip 会全部冲掉。见 service_params.write_params。
+SERVICE_PARAM_SCHEMAS = {
+    "deep_bridge": {
+        "file": os.environ.get(
+            "NAVIBOT_DEEP_BRIDGE_CONFIG",
+            "/home/lisi/Documents/work/ros1/src/deep_bridge/config/deep_bridge.yaml",
+        ),
+        "params": [
+            {
+                "key": "use_dtls", "label": "DTLS 加密", "type": "bool",
+                "help": "指南说本体默认启用加密(DTLS 服务端 10.21.33.103:30004), 但"
+                        "实测这台本体的加密是关掉的——同一个地址端口直接走明文 UDP 即可,"
+                        "打开反而握不上手。",
+            },
+            {
+                "key": "usage_mode", "label": "使用模式", "type": "enum",
+                "options": [
+                    {"value": 0, "label": "0 · 常规模式(归一化轴指令)"},
+                    {"value": 1, "label": "1 · 导航模式(真实轴指令)"},
+                ],
+                "help": "决定下发哪种轴指令。常规模式下发 [-1,1] 的比例值, 要靠"
+                        "full_scale_v* 换算; 导航模式直接下发 m/s 与 rad/s。安全闸门会"
+                        "要求本体回报的使用模式严格等于这个值, 不一致就一律下发全零速度。",
+            },
+            {
+                "key": "max_vx", "label": "最大前后速度", "type": "float",
+                "unit": "m/s", "min": 0.0, "max": 2.0, "step": 0.05,
+                "help": "两种模式都生效的安全限速。导航模式下这就是最终下发值——指南明确"
+                        "本体不会再额外限速, 所以这三个值是唯一的限速。",
+            },
+            {
+                "key": "max_vy", "label": "最大左右速度", "type": "float",
+                "unit": "m/s", "min": 0.0, "max": 1.0, "step": 0.05,
+                "help": "同上。上限 1.0 取自厂商《各个步态的有效速度范围》表的 Y 轴上界"
+                        "(四个步态都是 1.0)。",
+            },
+            {
+                "key": "max_vyaw", "label": "最大偏航角速度", "type": "float",
+                "unit": "rad/s", "min": 0.0, "max": 2.0, "step": 0.05,
+                "help": "同上。上限 2.0 取自步态表的 Yaw 上界; 注意敏捷-平地(0x3002)"
+                        "那个步态的 Yaw 上界只有 1.5, 选它的话别配到 1.5 以上。",
+            },
+            {
+                "key": "gait_on_start", "label": "开机步态", "type": "enum",
+                "options": [
+                    {"value": 4097, "label": "0x1001 · 标准-基础"},
+                    {"value": 4099, "label": "0x1003 · 标准-楼梯"},
+                    {"value": 12290, "label": "0x3002 · 敏捷-平地"},
+                    {"value": 12291, "label": "0x3003 · 敏捷-楼梯"},
+                ],
+                "help": "★ 改这个就必须同步改 yaml 里的 full_scale_vx/vy/vyaw ——"
+                        "满量程是按步态给的, 而 full_scale_* 不在这个页面里, 要手工改"
+                        "配置文件。只在使用模式=常规时才用得到满量程; 导航模式不受影响。",
+                "warn_on_change": True,
+            },
+        ],
+    },
+}
+
 # 启动/停止服务需要特权, 用 sudo -n(非交互——没配免密的话直接报错, 不会卡在等
 # 密码输入上)包一层调用; 查状态(systemctl show)不需要特权, 不走这个前缀。
 # 部署时要给跑后端的用户配一条对应的 sudoers NOPASSWD 规则, 只放行 SYSTEMD_SERVICES

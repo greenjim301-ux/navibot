@@ -2,6 +2,7 @@ import type {
   MapEditKind, MapEditRegion, MapEdits,
   MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint,
   RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, TrailPoint, Waypoint, XY,
+  ServiceParams,
 } from "./types";
 
 // 默认**同源**: 部署时前端是后端自己 host 的(见 backend/app/main.py 末尾那个
@@ -322,4 +323,34 @@ export async function cancelMapping(): Promise<MappingStatus> {
 /** 立即返回 saving, 真正的保存在后端跑, 结果通过 /ws/mapping 推送。 */
 export async function saveMapping(): Promise<MappingStatus> {
   return asJson(await fetch(`${BACKEND_HTTP}/api/mapping/save`, { method: "POST" }));
+}
+
+/** 某个服务的参数 schema + 当前值。只有 `ServiceInfo.configurable` 为 true 的
+ *  服务有, 其余 404。配置文件读不到不算失败——返回 200, 原因在 `file_error`
+ *  里(多台板子路径不一样, 路径没配对是常态)。 */
+export async function getServiceParams(id: string): Promise<ServiceParams> {
+  return asJson(await fetch(`${BACKEND_HTTP}/api/services/${encodeURIComponent(id)}/params`));
+}
+
+/** 写回参数, 返回写完之后重新读出来的值。只传要改的键即可。
+ *
+ *  **不会自动重启服务** —— 参数 yaml 是 roslaunch 启动时一次性加载的, 改完要
+ *  生效必须重启, 但要不要现在重启由用户决定(见 restartService)。 */
+export async function updateServiceParams(
+  id: string, values: Record<string, unknown>,
+): Promise<ServiceParams> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/services/${encodeURIComponent(id)}/params`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values }),
+    }),
+  );
+}
+
+/** 重启一个服务(后端做成 stop + start 两步, 见 service_manager.restart)。 */
+export async function restartService(id: string): Promise<ServiceInfo> {
+  return asJson(
+    await fetch(`${BACKEND_HTTP}/api/services/${encodeURIComponent(id)}/restart`, { method: "POST" }),
+  );
 }

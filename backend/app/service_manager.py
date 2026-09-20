@@ -91,6 +91,8 @@ class ServiceManager:
             "id": svc["id"], "label": svc["label"], "unit": svc["unit"],
             "active_state": status["active_state"], "sub_state": status["sub_state"],
             "enabled": status["enabled"],
+            # 「参数配置」页据此决定哪些服务能点进去, 不用再单独请求一次。
+            "configurable": svc["id"] in config.SERVICE_PARAM_SCHEMAS,
         }
 
     def start(self, service_id: str) -> dict:
@@ -110,4 +112,18 @@ class ServiceManager:
         svc = _find(service_id)
         logger.info("停止服务: %s", svc["unit"])
         systemctl_action(svc["unit"], "stop")
+        return self._status(svc)
+
+    def restart(self, service_id: str) -> dict:
+        """重启这一个服务。改完参数之后要让新配置生效就得重启(yaml 是 roslaunch
+        启动时一次性加载的, 跑起来之后改文件不会生效)。
+
+        **故意做成 stop + start 两步, 而不是 systemctl restart** —— 部署时给的
+        sudoers 规则只放行了 start/stop(见 README「服务状态管理」), 用 restart
+        会因为不在允许列表里被 sudo 拒掉, 还得让每台板子都去改 sudoers。
+        """
+        svc = _find(service_id)
+        logger.info("重启服务: %s (stop + start)", svc["unit"])
+        systemctl_action(svc["unit"], "stop")
+        systemctl_action(svc["unit"], "start")
         return self._status(svc)
