@@ -167,8 +167,8 @@ class ElevationResult:
 # (>=0.99 表示定位失败, 这里独立定义一份而不是 import backend——map_pipeline
 # 是离线脚本, 不依赖 backend 包)。实测每张图的第一个关键帧(frame_id=1,
 # tx=ty=tz=0, 建图刚开始、SLAM 还没收敛那一帧)pose_cov 都是 0.99, 其余关键帧
-# 都是 0.01——这一个坏点如果混进轨迹, detect_structure/clear_trajectory/
-# mark_known_region 会把地图原点当成狗确实站过的地方, 在那里凭空清出一小片
+# 都是 0.01——这一个坏点如果混进轨迹, detect_structure/clear_trajectory
+# clear_trajectory 会把地图原点当成狗确实站过的地方, 在那里凭空清出一小片
 # "已知可走"区域。
 POSE_COV_BAD = 0.99
 _POSE_COV_COL = 9
@@ -767,38 +767,4 @@ def clear_trajectory(
     # global_planner._dilate_bool 按行拆圆盘(列半宽 floor(sqrt(R²-dr²)))覆盖的
     # 格子集合完全相同。一次算完, 不用按轨迹点循环。
     grid[distance_transform_edt(~seed) <= radius_px] = 254
-    return grid
-
-
-def mark_known_region(
-    grid: np.ndarray,
-    trajectory: np.ndarray,
-    bounds: tuple[float, float, float, float],
-    resolution: float,
-    radius: float,
-) -> np.ndarray:
-    """把 free 格子里离轨迹超过 radius 的部分标成 205(map_server"未知"灰度)。
-
-    不是"不可通行"——occupied 格子完全不受影响, 全局规划器(backend/app/
-    global_planner.py)只有明确占据(occupied_thresh)才会挡, 这条中间灰度只是
-    给它一个"这块没实地验证过"的信号, 规划时走这类格子的代价更高
-    (GLOBAL_PLANNER_UNKNOWN_COST_MULTIPLIER), 优先绕开走验证过的地方, 但绕不
-    开的时候还是能穿过去, 不会因为"没验证过"就规划不出路。这跟 clear_trajectory
-    的半径(默认 0.25m, 对齐机身膨胀半径, 目的是压掉贴着轨迹的误判障碍)是两个
-    不同的半径、两件不同的事, 不要混用同一个数——这里的 3m 是"信得过多远",
-    那边的 0.25m 是"身位多宽"。
-
-    直接原地改 grid 并返回。
-    """
-    x_min, x_max, y_min, y_max = bounds
-    height, width = grid.shape
-    traj = resample_polyline(trajectory, resolution / 2)
-    col = np.clip(((traj[:, 0] - x_min) / resolution).astype(np.int32), 0, width - 1)
-    row = np.clip(((y_max - traj[:, 1]) / resolution).astype(np.int32), 0, height - 1)
-    traj_mask = np.zeros((height, width), dtype=bool)
-    traj_mask[row, col] = True
-    dist_px = distance_transform_edt(~traj_mask)
-    radius_px = radius / resolution
-    unknown = (grid == 254) & (dist_px > radius_px)
-    grid[unknown] = 205
     return grid

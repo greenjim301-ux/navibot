@@ -303,7 +303,7 @@ def raw_map2d_unknown_mask(
 
     重採样用最近邻(每个输出格子左上角点的世界坐标, 换算成 map_2d_raw 自己的
     像素坐标去取值), 用左上角而不是格子中心是为了跟 clear_trajectory/
-    mark_known_region/detect_structure 等其它步骤统一的"floor((坐标-原点)/
+    detect_structure 等其它步骤统一的"floor((坐标-原点)/
     分辨率)"取整方式保持一致。两张图分辨率不一定相同(这条流水线的输出分辨率
     按地图跨度自动选, 见 _auto_map2d_resolution; raw 图固定是 SLAM 自己存图
     时用的分辨率), 所以要按世界坐标对齐, 不能假设两边网格一一对应。
@@ -411,7 +411,7 @@ def export_topview_png(pgm_path: Path, yaml_path: Path, out_path: Path) -> dict:
 def write_map_server_grid(grid: np.ndarray, out_pgm: Path, out_yaml: Path,
                            resolution: float, origin_x: float, origin_y: float) -> None:
     """按 ROS map_server 的 pgm+yaml 约定写占据栅格图 (grid 是 elevation.
-    classify_occupancy 产出、再经 mark_known_region 加工过的 254/0/205 灰度
+    classify_occupancy 产出的 254/0/205 灰度
     数组), 跟 backend/app/global_planner.py
     的 _read_pgm/_parse_yaml、以及本文件 export_topview_png 的 _parse_map2d_yaml
     读法完全对应。origin 是图像左下角像素(数组最后一行)对应的世界坐标, 跟
@@ -618,17 +618,14 @@ def main():
                           "抬高了'地面'; 在 large 上错用 0.55 会让召回掉 4 个点")
     ap.add_argument("--map2d-trajectory-clear-radius", type=float, default=0.25,
                      help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
-                          "误判——默认 0.25 跟 backend/app/config.py 的"
-                          "GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致。传 0 能真正关掉,"
+                          "误判。**0.25 已经是 0.1m/px 的图上的最小可用值**: 清的格数是"
+                          "ceil(r/res)+1, 必须 >= 规划器膨胀半径 R + 1(见 clear_trajectory"
+                          "的说明), 0.1m/px 上 R=3px, 所以 0.21~0.30 产出完全一样(都是 4px),"
+                          "而 0.20 只有 3px —— 实测 save_map_small_1 上会让 2795 个轨迹格"
+                          "规划器够不着、12 对起终点只成功 4 对。传 0 能真正关掉,"
                           "但**实测关掉之后规划基本不可用**(save_map_small_1 上 47% 的轨迹格"
                           "被膨胀吃掉, 轨迹上随机取 12 对起终点 0 对能规划出来), 见 README"
                           "「为什么沟沿的安全余量不能靠关掉这两个开关拿回来」")
-    ap.add_argument("--map2d-known-radius", type=float, default=0.25,
-                     help="离轨迹这个距离(m)以内的 free 格子算'已知'区域, 以外的降级成"
-                          "map_server 的'未知'灰度(205)——不是不可通行, 全局规划器"
-                          "(global_planner.py)只有明确占据才会挡, 未知区域只是规划代价更高,"
-                          "见 mark_known_region 说明。跟 --map2d-trajectory-clear-radius"
-                          "不是同一件事, 不要混用")
     ap.add_argument("--block-unscanned", action=_BooleanOptionalAction, default=True,
                      help="把 map_2d_raw.pgm(handbot slam 自己建图时跑 ray casting 算出"
                           "的原图)里标'未知'的格子, 在新图里也标 occupied(0), 不让全局"
@@ -777,14 +774,6 @@ def main():
             else:
                 print("      轨迹强制清空: 已关闭(--map2d-trajectory-clear-radius=0), "
                       "轨迹旁边的障碍照点云判定保留")
-            # 离轨迹超过 map2d_known_radius 的 free 格子降级成"未知"(205)——
-            # 不影响能不能走, 只是让全局规划器(靠 occupied_thresh 判占据、靠
-            # unknown_multiplier 给未知区域加规划代价, 见 backend/app/
-            # global_planner.py)优先走验证过的地方。occupied 格子不受影响。
-            grid = elevation.mark_known_region(
-                grid, trajectory, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max),
-                map2d_resolution, radius=args.map2d_known_radius,
-            )
             write_map_server_grid(grid, pgm_path, yaml_path, map2d_resolution, map2d_x_min, map2d_y_min)
             n_free, n_occ, n_unk = int((grid == 254).sum()), int((grid == 0).sum()), int((grid == 205).sum())
             print(f"      生成 {pgm_path}: {grid.shape[1]}x{grid.shape[0]}px, {map2d_resolution}m/px, "
