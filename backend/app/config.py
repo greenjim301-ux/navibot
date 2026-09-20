@@ -465,17 +465,34 @@ LOCALIZATION_SERVICE_UNIT = "localization.service"
 # /api/services/{id}/start|stop 时用的稳定标识符, 不直接把 unit 名暴露给请求参数——
 # 只放行这个固定列表里的几个单元, 挡掉"随便传个 unit 名"的口子(subprocess 传参
 # 不走 shell, 没有命令注入风险, 但"能控制任意 systemd 单元"本身就是个过大的权限面)。
+# **每个服务各管各的, 服务之间不存在任何关系** —— 启动不自动带依赖, 停止也不
+# 拦"还有别的服务在用它"。这是有意为之(用户要求), 也跟部署侧一致:
+# navi-planner-bringup/systemd/ 下那几个 unit 文件彼此没有任何 Requires=/After=,
+# navi_planner.service 的 Description 里直接写着 "hand-lio, unitree_bridge
+# started separately"。以前那套 SERVICE_DEPENDENCIES / SERVICE_COSTART /
+# MAPPING_MODE_DEPENDENCIES 已经整套删掉, 别再加回来。
+#
+# unit 名以 /home/lisi/Documents/work/navi-planner-bringup/systemd/ 里的实际
+# 文件为准(deep_bridge / hand_lio / navi_planner / unitree_bridge 四个);
+# mid360.service / camera.service 不在那个仓库里, 沿用原来的名字。
+#
+# deep_bridge 和 unitree_bridge 是两种底盘各自的 cmd_vel 桥接(云深处 Lynx M20
+# 的 UDP/JSON vs 宇树 Go2 SDK), 实际用哪个取决于装在哪台狗上。**这里不做互斥**
+# —— 同上, 服务之间不设关系, 要不要同时开着由用户自己判断。
 SYSTEMD_SERVICES = [
     {"id": "lidar", "label": "激光雷达", "unit": "mid360.service"},
     {"id": "camera", "label": "相机", "unit": "camera.service"},
     {"id": "localization", "label": "导航定位", "unit": LOCALIZATION_SERVICE_UNIT},
+    {"id": "hand_lio", "label": "实时里程计", "unit": "hand_lio.service"},
     {"id": "planner", "label": "路线规划", "unit": "navi_planner.service"},
+    {"id": "deep_bridge", "label": "运动控制 · 云深处", "unit": "deep_bridge.service"},
+    {"id": "unitree_bridge", "label": "运动控制 · 宇树", "unit": "unitree_bridge.service"},
 ]
 
 # 启动/停止服务需要特权, 用 sudo -n(非交互——没配免密的话直接报错, 不会卡在等
 # 密码输入上)包一层调用; 查状态(systemctl show)不需要特权, 不走这个前缀。
-# 部署时要给跑后端的用户配一条对应的 sudoers NOPASSWD 规则, 只放行这四个单元的
-# start/stop, 具体写法见 README「服务状态管理」一节。
+# 部署时要给跑后端的用户配一条对应的 sudoers NOPASSWD 规则, 只放行 SYSTEMD_SERVICES
+# 和 MAPPING_MODES 里列出的那些单元的 start/stop, 具体写法见 README「服务状态管理」一节。
 SYSTEMCTL_SUDO_CMD = os.environ.get("NAVIBOT_SYSTEMCTL_SUDO_CMD", "sudo -n systemctl").split()
 
 # 「新建地图」建图页管理的 4 个互斥的建图模式, 分别对应板子上一个 systemd 单元。
@@ -499,44 +516,6 @@ MAPPING_MODES = [
         "unit": "color_mapping_large.service", "area_desc": "面积 ≥ 5000 ㎡",
     },
 ]
-
-# 服务依赖关系(单元名 -> 它直接依赖的单元名列表): 启动一个服务前必须先保证
-# 它依赖的服务都在跑, 没在跑就自动启动(见 service_manager.start_with_dependencies);
-# 停止一个服务前必须先确认没有(直接或间接)依赖它、且仍在运行的服务(见
-# service_manager.find_blocking_dependents), 有就拒绝, 报错列出是哪些服务,
-# 提示用户先停那些。只列直接依赖就够——间接依赖(比如 navi_planner.service 通过
-# localization.service 间接依赖 mid360.service)靠 service_manager 里的传递
-# 闭包算法推出来, 这里不用重复写。
-SERVICE_DEPENDENCIES = {
-    "mid360.service": [],
-    "camera.service": [],
-    "localization.service": ["mid360.service"],
-    "navi_planner.service": ["localization.service"],
-}
-
-# localization.service 和 hand_lio.service(实时里程计, 导航定位用它输出的位姿)
-# 必须一起跑, 顺序固定: 先启动 localization.service, 再启动 hand_lio.service
-# (用户口述的顺序要求, 没有拿到 hand_lio 的实际配置核对过反过来会怎样)。这跟
-# SERVICE_DEPENDENCIES 是不同方向的关系, 不能塞进那张表: SERVICE_DEPENDENCIES
-# 表达的是"启动 A 前确保 A 依赖的 B 已经在跑"(单向, 由启动 A 触发), 这里要的是
-# "启动 A 之后紧接着也启动 B"(由启动 A 触发, 但 B 在 A 之后而不是之前)——两者
-# 触发方向相同、但 B 相对 A 的先后顺序相反, 用同一张表会自相矛盾。hand_lio.service
-# 没有单独的 SYSTEMD_SERVICES 条目(不在系统管理页单独展示/开关), 只跟着
-# localization.service 一起启动/停止, 见 service_manager.ServiceManager.start/stop。
-SERVICE_COSTART = {
-    "localization.service": ["hand_lio.service"],
-}
-
-# 建图模式服务的依赖, 跟上面 SERVICE_DEPENDENCIES 是两张分开的表(对应两个独立
-# 的允许列表, 见 SYSTEMD_SERVICES/MAPPING_MODES 各自的说明), 但共用同一套
-# service_manager 里的依赖解析逻辑——建图服务依赖的是系统服务(mid360/camera),
-# 反过来系统服务不依赖建图服务, 两张表不会互相指向对方缺失的 key。
-MAPPING_MODE_DEPENDENCIES = {
-    "cloud_mapping_small.service": ["mid360.service"],
-    "cloud_mapping_large.service": ["mid360.service"],
-    "color_mapping_small.service": ["mid360.service", "camera.service"],
-    "color_mapping_large.service": ["mid360.service", "camera.service"],
-}
 
 SURROUND_MAP_CLOUD_TOPIC = os.environ.get("NAVIBOT_SURROUND_MAP_CLOUD_TOPIC", "/surround_map_cloud")
 # 建图页当前帧扫描高亮用的话题——直接复用 SURF_CLOUD_TOPIC(建图页/地图预览页

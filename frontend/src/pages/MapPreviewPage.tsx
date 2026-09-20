@@ -6,8 +6,8 @@ import {
   MapPin, CircleCheck, Trash2, Play, Flag, OctagonX, Squircle, Ban, Check,
 } from "lucide-react";
 import {
-  addMapEdit, deleteMapEdit, estop, getMapTrajectory, listMapEdits, listServices, planPath,
-  setInflationMap, setSelfInflation, setSurfCloud, startService, stopService, submitRoute,
+  addMapEdit, deleteMapEdit, estop, getMapTrajectory, listMapEdits, planPath,
+  setInflationMap, setSelfInflation, setSurfCloud, submitRoute,
   updateMapEdit,
 } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
@@ -16,7 +16,7 @@ import { PointCloudView, type PointCloudViewHandle } from "../components/PointCl
 import { TopView, type TopViewHandle } from "../components/TopView";
 import type {
   MapEditKind, MapEditRegion,
-  PlannedRoutePoint, ServiceActiveState, ServiceInfo, TrailPoint, Waypoint, XY,
+  PlannedRoutePoint, TrailPoint, Waypoint, XY,
 } from "../types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
@@ -50,18 +50,6 @@ const POSE_COV_BAD = 0.99;
 const PANEL_SWITCH_CLASS =
   "data-unchecked:bg-white/15 data-checked:bg-cyan-500 " +
   "[&_[data-slot=switch-thumb]]:bg-white [&_[data-slot=switch-thumb]]:shadow-[0_0_0_1px_rgba(0,0,0,0.35)]";
-
-// 「路线规划」服务(navi_planner.service)状态展示用, 颜色配这个面板自己的暗色
-// 主题(跟 SystemPage.tsx 浅色主题下那份同名映射不一样, 两边各自独立, 没必要
-// 抽公共组件——就四五行, 抽出来跨两个视觉风格完全不同的页面复用反而绕远)。
-const PLANNER_SERVICE_STATE_DISPLAY: Record<ServiceActiveState, { text: string; className: string }> = {
-  active: { text: "● 运行中", className: "text-emerald-400" },
-  inactive: { text: "● 已停止", className: "text-white/50" },
-  failed: { text: "● 异常", className: "text-red-400" },
-  activating: { text: "● 启动中…", className: "text-amber-400" },
-  deactivating: { text: "● 停止中…", className: "text-amber-400" },
-  unknown: { text: "● 未知", className: "text-white/50" },
-};
 
 type ViewMode = "3d" | "2d";
 
@@ -170,52 +158,6 @@ export default function MapPreviewPage() {
       setNavError(String(e));
     } finally {
       setSurfCloudBusy(false);
-    }
-  }
-
-  // 「路线规划」服务(navi_planner.service)状态: 跟具体是哪张地图无关(机器狗
-  // 层面的服务), 但只有激活地图时"导航控制"面板才有意义, 顺带在同一个地方
-  // 管这个服务的启停, 省得用户还要跳去系统管理页——只在激活地图时轮询, 见下面
-  // 那个 effect 的 isActive 门槛。
-  const [plannerService, setPlannerService] = useState<ServiceInfo | null>(null);
-  const [plannerBusy, setPlannerBusy] = useState(false);
-  const refreshPlannerService = useCallback(async () => {
-    try {
-      const list = await listServices();
-      setPlannerService(list.find((s) => s.id === "planner") ?? null);
-    } catch {
-      // 服务状态查询失败不该打断这个页面的核心功能(点云/位姿), 静默忽略,
-      // 下一次轮询再试就够了。
-    }
-  }, []);
-  useEffect(() => {
-    if (!isActive) return;
-    refreshPlannerService();
-    const timer = window.setInterval(refreshPlannerService, 3000);
-    return () => window.clearInterval(timer);
-  }, [isActive, refreshPlannerService]);
-
-  async function handleStartPlanner() {
-    setPlannerBusy(true);
-    try {
-      await startService("planner");
-      await refreshPlannerService();
-    } catch (e) {
-      setNavError(String(e));
-    } finally {
-      setPlannerBusy(false);
-    }
-  }
-
-  async function handleStopPlanner() {
-    setPlannerBusy(true);
-    try {
-      await stopService("planner");
-      await refreshPlannerService();
-    } catch (e) {
-      setNavError(String(e));
-    } finally {
-      setPlannerBusy(false);
     }
   }
 
@@ -871,41 +813,6 @@ export default function MapPreviewPage() {
                     />
                   </div>
                 </PanelSection>
-
-                {/* 只在激活地图上显示(理由同下面"导航控制"): 路线规划服务是
-                    "开始导航"能不能真的下发成功的前提, 放在导航控制上面, 引导
-                    用户先确认/启动这个服务。跟具体是哪张地图无关(机器狗层面的
-                    服务), 顺带在这里管起停, 不用跳去系统管理页。 */}
-                {isActive && (
-                  <PanelSection
-                    title="路线规划服务"
-                    right={plannerService && (
-                      <span className={cn(
-                        "font-medium",
-                        PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].className,
-                      )}
-                      >
-                        {PLANNER_SERVICE_STATE_DISPLAY[plannerService.active_state].text}
-                      </span>
-                    )}
-                  >
-                    {plannerService?.active_state === "active" ? (
-                      <PanelButton
-                        icon={OctagonX}
-                        label={plannerBusy ? "停止中…" : "停止服务"}
-                        disabled={plannerBusy}
-                        onClick={handleStopPlanner}
-                      />
-                    ) : (
-                      <PanelButton
-                        icon={Play}
-                        label={plannerBusy ? "启动中…" : "启动服务"}
-                        disabled={plannerBusy || plannerService == null}
-                        onClick={handleStartPlanner}
-                      />
-                    )}
-                  </PanelSection>
-                )}
 
                 {/* 只在激活地图上显示, 见 isActive 声明处的注释——"开始导航"
                     下发的是机器狗当前位姿, 不激活的地图上这份位姿要么对不上

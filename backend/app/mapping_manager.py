@@ -29,7 +29,7 @@ from .map_registry import MapRegistry, clear_localization_link, validate_map_nam
 from .models import MappingState, MappingStatus
 from .ros_bridge import RosBridge
 from .route_manager import point_array_to_json_list
-from .service_manager import start_with_dependencies, systemctl_action
+from .service_manager import systemctl_action, systemctl_status
 from .ws_manager import WebSocketManager
 
 logger = logging.getLogger("navibot.mapping_manager")
@@ -131,10 +131,12 @@ class MappingManager:
         self._map_registry.clear_active()
 
         try:
-            # 建图服务依赖 mid360.service(彩色建图模式还依赖 camera.service, 见
-            # config.MAPPING_MODE_DEPENDENCIES), 启动前自动确认/启动这些依赖,
-            # 不要求用户自己先去系统管理页手动打开。
-            start_with_dependencies(mode["unit"])
+            # 只启动建图服务本身。**不再自动带起 mid360.service / camera.service**
+            # —— 服务之间不设关系, 每个服务各管各的(见 service_manager 模块
+            # docstring)。雷达/相机要用户自己先在系统管理页打开; 没打开的话建图
+            # 服务照样能起来, 只是收不到数据, 建图页上看不到点云。
+            if systemctl_status(mode["unit"])["active_state"] not in ("active", "activating"):
+                systemctl_action(mode["unit"], "start")
             self._ros_bridge.set_mapping_enabled(True)
         except RuntimeError:
             # 服务没能真的起来(典型是 sudoers 没配好), 这次建图会话根本没

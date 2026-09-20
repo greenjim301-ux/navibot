@@ -146,23 +146,31 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 
 ## 服务状态管理
 
-系统管理页有一张"服务状态"卡片，管 4 个固定的 systemd 单元（id/显示名/unit 名见
+系统管理页有一张"服务状态"卡片，管 7 个固定的 systemd 单元（id/显示名/unit 名见
 `backend/app/config.py` 的 `SYSTEMD_SERVICES`，不接受任意 unit 名）：
 
-| id | 显示名 | systemd 单元 |
-|---|---|---|
-| `lidar` | 激光雷达 | `mid360.service` |
-| `camera` | 相机 | `camera.service` |
-| `localization` | 导航定位 | `localization.service` |
-| `planner` | 路线规划 | `navi_planner.service` |
+| id | 显示名 | systemd 单元 | 来源 |
+|---|---|---|---|
+| `lidar` | 激光雷达 | `mid360.service` | — |
+| `camera` | 相机 | `camera.service` | — |
+| `localization` | 导航定位 | `localization.service` | — |
+| `hand_lio` | 实时里程计 | `hand_lio.service` | navi-planner-bringup |
+| `planner` | 路线规划 | `navi_planner.service` | navi-planner-bringup |
+| `deep_bridge` | 运动控制 · 云深处 | `deep_bridge.service` | navi-planner-bringup |
+| `unitree_bridge` | 运动控制 · 宇树 | `unitree_bridge.service` | navi-planner-bringup |
+
+后四个 unit 名以 `navi-planner-bringup/systemd/` 下的实际文件为准。
+`deep_bridge` / `unitree_bridge` 是两种底盘各自的 `cmd_vel` 桥接（云深处 Lynx M20
+的 UDP/JSON 协议 vs 宇树 Go2 SDK），用哪个取决于装在哪台狗上——**这里不做互斥**，
+见下面「服务之间没有关系」。
 
 对应接口：`GET /api/services`（3s 轮询查状态）、`POST /api/services/{id}/start`、
 `POST /api/services/{id}/stop`（`service_manager.py`）。查状态用 `systemctl show`，
 不需要特权；启动/停止需要特权，默认用 `sudo -n systemctl ...`（`-n` 非交互，没配
 免密的话直接报错而不是卡住等密码），可用 `NAVIBOT_SYSTEMCTL_SUDO_CMD` 覆盖。
 
-**这意味着部署到机器上时要单独配一条 sudoers 规则**，只放行跑后端的用户对这
-4 个单元执行 `start`/`stop`（仓库里没有现成的 unit 文件/sudoers 配置，这步要在
+**这意味着部署到机器上时要单独配一条 sudoers 规则**，只放行跑后端的用户对上表
+这些单元（外加建图模式的 4 个）执行 `start`/`stop`（仓库里没有现成的 unit 文件/sudoers 配置，这步要在
 机器上手动做），例如：
 
 ```
@@ -173,6 +181,8 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
     /bin/systemctl start localization.service, /bin/systemctl stop localization.service, \
     /bin/systemctl start hand_lio.service, /bin/systemctl stop hand_lio.service, \
     /bin/systemctl start navi_planner.service, /bin/systemctl stop navi_planner.service, \
+    /bin/systemctl start deep_bridge.service, /bin/systemctl stop deep_bridge.service, \
+    /bin/systemctl start unitree_bridge.service, /bin/systemctl stop unitree_bridge.service, \
     /bin/systemctl start cloud_mapping_small.service, /bin/systemctl stop cloud_mapping_small.service, \
     /bin/systemctl start cloud_mapping_large.service, /bin/systemctl stop cloud_mapping_large.service, \
     /bin/systemctl start color_mapping_small.service, /bin/systemctl stop color_mapping_small.service, \
@@ -182,37 +192,35 @@ mamba run -n ros_host python backend/mock_planner.py --start <X> <Y> <Z> <YAW>
 没配这条规则时，点"启动"/"停止"会在页面上收到 500 和 `sudo` 的报错文本（比如
 `sudo: a password is required`），不是静默失败。
 
-### 服务依赖关系
+### 服务之间没有关系，每个服务单独管理
 
-`backend/app/config.py` 的 `SERVICE_DEPENDENCIES` + `MAPPING_MODE_DEPENDENCIES`
-声明了这几个 systemd 单元之间的依赖（只列直接依赖，间接依赖靠
-`service_manager.py` 里的传递闭包算法推出来）：
+**启动一个服务就只启动它自己，不自动带依赖；停止就只停它自己，不检查"还有没有
+别的服务在用它"。** 这是有意为之，也跟部署侧一致——`navi-planner-bringup/systemd/`
+下那几个 unit 文件彼此没有任何 `Requires=`/`After=`，`navi_planner.service` 的
+`Description` 里直接写着 "hand-lio, unitree_bridge started separately"。
 
-- `localization.service` 依赖 `mid360.service`
-- `navi_planner.service` 依赖 `localization.service`（因此间接依赖 `mid360.service`）
-- 建图服务（`cloud_mapping_*.service`）依赖 `mid360.service`
-- 彩色点云建图服务（`color_mapping_*.service`）额外依赖 `camera.service`
+以前这里有一整套应用层的依赖解析，现在**整套删掉了**，别再加回来：
 
-另外 `SERVICE_COSTART` 声明了一条方向相反的"伴生"关系：启动 `localization.
-service` 后紧接着也要启动 `hand_lio.service`（导航定位用它输出的实时里程计），
-顺序固定先 `localization.service` 后 `hand_lio.service`（用户口述的顺序要求，
-没有拿到 `hand_lio` 的实际配置核对过反过来会怎样）；停止 `localization.
-service` 时顺序相反，先停 `hand_lio.service` 再停 `localization.service`。
-`hand_lio.service` 没有自己的 `SYSTEMD_SERVICES` 条目（系统管理页看不到它单独
-的开关/状态），只能跟着「导航定位」这张卡片一起启/停。
+| 删掉的东西 | 原来干什么的 |
+|---|---|
+| `config.SERVICE_DEPENDENCIES` | 声明 `localization`→`mid360`、`navi_planner`→`localization` |
+| `config.SERVICE_COSTART` | 启动「导航定位」时顺带带起 `hand_lio.service` |
+| `config.MAPPING_MODE_DEPENDENCIES` | 开始建图时自动先启 `mid360` / `camera` |
+| `service_manager.start_with_dependencies` | 递归确认/启动依赖 |
+| `service_manager.find_blocking_dependents` | 停止前查有没有服务还依赖它，有就拒绝 |
+| `service_manager.ServiceDependencyError` | 上面那条拒绝对应的 400 |
 
-这些 unit 文件本身没有声明 `Requires=`/`After=`（板子上是各自独立配置的脚本，
-不假设它们互相知道对方存在），依赖关系是在应用层做的：
+随之而来的三个变化：
 
-- **启动一个服务，会自动启动它依赖的服务**（没在跑才启动，见
-  `service_manager.start_with_dependencies`）——比如在系统管理页点"启动"
-  「路线规划」，会先确认「导航定位」和「激光雷达」都已经在跑，没跑就顺带启动；
-  「新建地图」选彩色建图模式同理，会先确认「激光雷达」和「相机」。
-- **停止一个服务，如果有其它正在运行的服务（直接或间接）依赖它，会拒绝**
-  （`service_manager.find_blocking_dependents`），报错里列出是哪些服务，
-  提示用户先停那些——比如「导航定位」还在跑的时候不能停「激光雷达」。
+1. **`hand_lio.service` 现在是独立条目**（上表 `hand_lio`），自己启停。以前它没有
+   自己的条目，只能跟着「导航定位」被带起来；关系拆掉之后不给它独立入口的话就
+   完全没法管了。
+2. **开始建图不再自动启雷达/相机**，要用户自己先在系统管理页打开。没打开建图
+   服务照样能起来，只是收不到数据、建图页上看不到点云。
+3. **停止底层服务后端不再拦**。唯一的防呆是前端停止确认弹窗里那句提示（会说明
+   停的是哪个 unit、用到它的功能会不可用、而且不会自动重启）。
 
-**这一整套依赖解析没有在真实机器上验证过**，见「已知缺口」。
+**这些都没有在真实机器上验证过**，见「已知缺口」。
 
 ---
 
@@ -322,7 +330,7 @@ keyframe_info_3d.txt}` + `2d_map/{map_2d.pgm,map_2d.yaml}`）跟
 - **保存失败**（状态转 `error`）**不会**恢复——`_run_save` 的 `error` 分支故意
   不清理 `config.SAVE_MAP_DIR`（留着现场给用户重试），这时候恢复会撞上"目标
   已存在"；等用户放弃、真正调用取消时再恢复。
-- 启动服务本身失败（`start_with_dependencies` 抛错，典型是 sudoers 没配好）
+- 启动服务本身失败（`systemctl_action` 抛错，典型是 sudoers 没配好）
   也会恢复——这种情况下建图会话根本没有真正开始过。
 - 恢复动作失败（比如那张图这期间被删了、`localization.service` 这期间被手动
   启动了）只记日志，不会让取消/保存这个动作本身也跟着报错——用户可以去地图
@@ -895,12 +903,16 @@ log_odds = count_hit >= count_hit_and_miss - count_hit ? prob_hit_log_ : prob_mi
   localization 相关代码/权限配置核对过。`RM_SUDO_CMD` 对应的 sudoers 规则
   （见上面「建图」一节）也还没在机器上实际配过、验证过报错文本是否可读。见
   「激活地图 与 localization.service 共用的固定路径」一节。
-- **服务依赖关系（`SERVICE_DEPENDENCIES`/`MAPPING_MODE_DEPENDENCIES`）是按
-  用户口述的依赖列出来的，没有拿板子上的实际配置核对过。** 如果实际依赖关系
-  跟这两张表不一致（比如还有表里没列的依赖，或者某条依赖其实反了），后果分
-  两种：该自动启动的没启动（现象是"点了启动，界面显示成功，但服务其实因为
-  缺依赖起不来"）、或者该拦住的停止操作没拦住（现象是"停了一个服务，另一个
-  正在依赖它的服务跟着挂了却没有任何提示"）——见「服务依赖关系」一节。
+- **服务之间的关系整套去掉之后，起停顺序完全交给用户，没有任何防呆。** 比如
+  在「导航定位」还在跑的时候停掉「激光雷达」，后端不会拦，定位会静默失去数据
+  源；反过来只启动「路线规划」而没启动「实时里程计」，planner 因为
+  `!have_odom_` 会把收到的途经点直接丢掉（只打一条 ROS_WARN）。这是用户明确
+  要求的行为（每个服务单独管理），但**实机上这些组合都没试过**——见「服务之间
+  没有关系，每个服务单独管理」一节。
+- **`deep_bridge` / `unitree_bridge` 两个新服务只核对过 unit 文件，没跑过。**
+  unit 名和 `ExecStart` 取自 `navi-planner-bringup/systemd/`，但这两条对应的
+  机器（云深处 Lynx M20 / 宇树 Go2）都没有实际启停验证过，sudoers 规则也还
+  没在机器上配过。
 
 ---
 

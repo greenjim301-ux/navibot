@@ -39,7 +39,7 @@ from . import virtual_obstacles
 from .ros_bridge import RosBridge
 from .route_manager import RouteManager
 from .route_store import RouteStore, validate_route_id
-from .service_manager import ServiceDependencyError, ServiceManager
+from .service_manager import ServiceManager
 from .ws_manager import WebSocketManager
 
 # 不能用 logging.basicConfig: uvicorn 在导入本模块之前就调过 logging.config.dictConfig,
@@ -599,37 +599,34 @@ async def delete_route(route_id: str):
 
 @app.get("/api/services", response_model=List[ServiceInfo])
 async def list_services():
-    """系统管理页「服务状态」卡片: lidar/相机/导航定位/路线规划这几个固定的
-    systemd 单元, 列表见 config.SYSTEMD_SERVICES。"""
+    """系统管理页「服务状态」卡片管理的那几个固定 systemd 单元, 列表见
+    config.SYSTEMD_SERVICES。彼此之间没有任何关系, 各起各的。"""
     return await run_in_threadpool(service_manager.list_status)
 
 
 @app.post("/api/services/{service_id}/start", response_model=ServiceInfo)
 async def start_service(service_id: str):
-    """启动前会先自动启动它依赖的服务(没在跑才启动, 见
-    service_manager.start_with_dependencies), 比如启动"路线规划"会顺带确认
-    "导航定位"和"激光雷达"都在跑。"""
+    """只启动这一个服务, 不连带启动别的 —— 服务之间没有关系(见
+    service_manager 模块 docstring)。已经在跑就什么都不做。"""
     try:
         return await run_in_threadpool(service_manager.start, service_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
     except RuntimeError as e:
         # 最典型的是 sudoers 没配好(sudo -n 直接失败)——原样透给前端, 别只显示
-        # "启动失败"看不出是权限问题还是服务本身起不来(可能是这个服务自己, 也
-        # 可能是它依赖的某个服务)。
+        # "启动失败", 看不出到底是权限问题还是服务本身起不来。
         raise HTTPException(500, str(e))
 
 
 @app.post("/api/services/{service_id}/stop", response_model=ServiceInfo)
 async def stop_service(service_id: str):
-    """有其它正在运行的服务(直接或间接)依赖这个服务时拒绝停止(见
-    service_manager.find_blocking_dependents), 报错里列出需要先停哪些。"""
+    """只停这一个服务, 不检查有没有别的服务在用它, 也不连带停别的 —— 服务之间
+    没有关系(见 service_manager 模块 docstring)。"停掉之后哪些功能会不可用"
+    由前端的确认弹窗提醒, 后端不替用户拦。"""
     try:
         return await run_in_threadpool(service_manager.stop, service_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
-    except ServiceDependencyError as e:
-        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
 

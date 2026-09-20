@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from "@/components/ui/dialog";
@@ -28,13 +29,41 @@ const SAFETY_ITEMS = [
   { key: "autoCharge", label: "任务完成后自动充电" },
 ] as const;
 
-const SERVICE_STATE_DISPLAY: Record<ServiceActiveState, { text: string; className: string }> = {
-  active: { text: "● 运行中", className: "text-success" },
-  inactive: { text: "● 已停止", className: "text-muted-foreground" },
-  failed: { text: "● 异常", className: "text-destructive" },
-  activating: { text: "● 启动中…", className: "text-amber-500" },
-  deactivating: { text: "● 停止中…", className: "text-amber-500" },
-  unknown: { text: "● 未知", className: "text-muted-foreground" },
+// 服务状态要一眼看得见: 以前是一行 text-xs 的灰色小字("● 运行中"), 混在
+// 服务名和按钮中间, 扫一眼根本分不出哪个在跑(用户反馈"状态不明显")。现在三
+// 层冗余编码, 不依赖单一线索:
+//   1. 整行左侧一条 3px 的状态色竖条(accent)—— 远距离/余光就能扫出来
+//   2. 实心底色的状态胶囊(pill)—— 不再是细小的彩色文字
+//   3. 胶囊里的圆点(dot), 过渡态(启动中/停止中)加 animate-pulse
+// 颜色之外还有文字, 不让色觉障碍的用户只能靠颜色分辨。
+const SERVICE_STATE_DISPLAY: Record<
+  ServiceActiveState,
+  { text: string; dot: string; pill: string; accent: string; pulse?: boolean }
+> = {
+  active: {
+    text: "运行中", dot: "bg-success", accent: "border-l-success",
+    pill: "bg-success/12 text-success border-success/35",
+  },
+  inactive: {
+    text: "已停止", dot: "bg-muted-foreground/50", accent: "border-l-border",
+    pill: "bg-muted text-muted-foreground border-border",
+  },
+  failed: {
+    text: "异常", dot: "bg-destructive", accent: "border-l-destructive",
+    pill: "bg-destructive/12 text-destructive border-destructive/35",
+  },
+  activating: {
+    text: "启动中", dot: "bg-amber-500", accent: "border-l-amber-500",
+    pill: "bg-amber-500/12 text-amber-600 border-amber-500/35", pulse: true,
+  },
+  deactivating: {
+    text: "停止中", dot: "bg-amber-500", accent: "border-l-amber-500",
+    pill: "bg-amber-500/12 text-amber-600 border-amber-500/35", pulse: true,
+  },
+  unknown: {
+    text: "未知", dot: "bg-muted-foreground/40", accent: "border-l-border",
+    pill: "bg-muted text-muted-foreground border-border",
+  },
 };
 
 export default function SystemPage() {
@@ -173,25 +202,72 @@ export default function SystemPage() {
         </Card>
 
         <Card className="p-5 lg:col-span-2">
-          <div className="mb-1 flex items-center justify-between">
-            <h2 className="text-[15px] font-medium">服务状态</h2>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div className="flex items-baseline gap-3">
+              <h2 className="text-[15px] font-medium">服务状态</h2>
+              {/* 顶部小结: 7 个服务一行行看过去太慢, 先给个总览, 有异常时直接
+                  用醒目色标出来。这几个服务彼此没有依赖关系, 各起各的
+                  (见后端 service_manager 模块 docstring), 所以这里只是计数,
+                  不表达任何"谁带起谁"。 */}
+              {services && (
+                <span className="text-xs text-muted-foreground">
+                  共 {services.length} 个 ·{" "}
+                  <span className="font-medium text-success">
+                    {services.filter((s) => s.active_state === "active").length} 运行中
+                  </span>
+                  {services.some((s) => s.active_state === "failed") && (
+                    <>
+                      {" · "}
+                      <span className="font-medium text-destructive">
+                        {services.filter((s) => s.active_state === "failed").length} 异常
+                      </span>
+                    </>
+                  )}
+                </span>
+              )}
+            </div>
             {servicesError && (
               <span className="text-xs text-destructive">{servicesError}</span>
             )}
           </div>
-          <div className="divide-y">
+          <div className="grid gap-2 sm:grid-cols-2">
             {services === null && !servicesError && (
-              <div className="py-6 text-center text-xs text-muted-foreground">加载中…</div>
+              <div className="py-6 text-center text-xs text-muted-foreground sm:col-span-2">加载中…</div>
             )}
             {services?.map((svc) => {
               const display = SERVICE_STATE_DISPLAY[svc.active_state] ?? SERVICE_STATE_DISPLAY.unknown;
               const pending = pendingServiceId === svc.id;
               const busy = pending || svc.active_state === "activating" || svc.active_state === "deactivating";
               return (
-                <div key={svc.id} className="flex items-center justify-between py-3">
-                  <div className="text-sm">{svc.label}</div>
-                  <div className="flex items-center gap-3">
-                    <span className={`text-xs font-medium ${display.className}`}>{display.text}</span>
+                <div
+                  key={svc.id}
+                  className={cn(
+                    "flex items-center justify-between gap-3 rounded-md border border-l-[3px] bg-card px-3 py-2.5",
+                    display.accent,
+                  )}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">{svc.label}</div>
+                    {/* unit 名对运维是有用信息, 尤其"运动控制 · 云深处/宇树"
+                        这种名字相近的两条, 光看中文标签分不出对应哪个 unit。 */}
+                    <div className="truncate font-mono text-[10px] text-muted-foreground">{svc.unit}</div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-medium",
+                        display.pill,
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "size-1.5 rounded-full",
+                          display.dot,
+                          display.pulse && "animate-pulse",
+                        )}
+                      />
+                      {display.text}
+                    </span>
                     {svc.active_state === "active" ? (
                       <AlertDialog
                         open={stopConfirmId === svc.id}
@@ -206,8 +282,12 @@ export default function SystemPage() {
                         <AlertDialogContent>
                           <AlertDialogHeader>
                             <AlertDialogTitle>停止「{svc.label}」?</AlertDialogTitle>
+                            {/* 后端不再拦"还有别的服务在用它"(服务之间没有依赖
+                                关系了, 见 service_manager), 所以这句提醒是用户
+                                唯一的防呆, 措辞要说清后果。 */}
                             <AlertDialogDescription>
-                              「{svc.label}」将被停止, 依赖它的功能(比如导航)会跟着不可用, 确定继续吗？
+                              将停止 <span className="font-mono">{svc.unit}</span>。
+                              用到它的功能会跟着不可用, 而且不会自动重启, 需要在这里手动启动。确定继续吗？
                             </AlertDialogDescription>
                           </AlertDialogHeader>
                           <AlertDialogFooter>
