@@ -744,8 +744,16 @@ def clear_trajectory(
     (不只是"每个格子单独看是可走的")。tools/check_trajectory_clearance.py 验的
     就是这个, 改动任何一边之后跑一遍。
 
+    **radius <= 0 表示整个关掉这一步**, 原样返回。注意不能靠传 0 来关 —— 下面
+    那个 `max(1, ...) + 1` 会把 0 也算成 2px, 反而清出一条 0.2m 的带子。关掉之后
+    上面那条"整条轨迹一定走得通"的保证就没了: 轨迹贴着障碍的地方会被膨胀吃掉,
+    规划可能在那里断开, 跑 tools/check_trajectory_clearance.py 能看出断在哪。
+
     直接原地改 grid 并返回。
     """
+    if radius <= 0:
+        return grid
+
     x_min, x_max, y_min, y_max = bounds
     height, width = grid.shape
     traj = resample_polyline(trajectory, resolution / 2)

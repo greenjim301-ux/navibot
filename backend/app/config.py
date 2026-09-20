@@ -120,7 +120,7 @@ GLOBAL_PLANNER_OFF_TRAJECTORY_MULTIPLIER = float(
 # detect_structure 判出的障碍里、或者落在人工圈的禁行区里, 照样不能走 —— 人工画
 # 的禁行区就是"这里现在不许走"(门关了、地塌了), 它必须压过历史上走过这个事实。
 GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION = os.environ.get(
-    "NAVIBOT_GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION", "1"
+    "NAVIBOT_GLOBAL_PLANNER_TRAJECTORY_BEATS_INFLATION", "0"
 ) not in ("0", "false", "False")
 
 # 相邻途经点的硬下限(m)。低于 SCAN-Planner 的 0.2m 死区就生成不出轨迹

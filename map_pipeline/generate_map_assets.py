@@ -619,7 +619,10 @@ def main():
     ap.add_argument("--map2d-trajectory-clear-radius", type=float, default=0.25,
                      help="轨迹(狗真的走过的地方)膨胀这么多米内强制标 free, 压过点云侧的"
                           "误判——默认 0.25 跟 backend/app/config.py 的"
-                          "GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致, 不要单独改")
+                          "GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致。传 0 能真正关掉,"
+                          "但**实测关掉之后规划基本不可用**(save_map_small_1 上 47% 的轨迹格"
+                          "被膨胀吃掉, 轨迹上随机取 12 对起终点 0 对能规划出来), 见 README"
+                          "「为什么沟沿的安全余量不能靠关掉这两个开关拿回来」")
     ap.add_argument("--map2d-known-radius", type=float, default=0.25,
                      help="离轨迹这个距离(m)以内的 free 格子算'已知'区域, 以外的降级成"
                           "map_server 的'未知'灰度(205)——不是不可通行, 全局规划器"
@@ -763,10 +766,17 @@ def main():
             # GLOBAL_PLANNER_INFLATION_RADIUS_M 保持一致——全局规划器规划
             # 路径时本来就假设轨迹周围这个半径内没有障碍, 2D 图跟这个假设
             # 对不上的话, 路径规划出来会贴着"障碍"走或者干脆绕不过去。
+            n_free_before_clear = int((grid == 254).sum())
             grid = elevation.clear_trajectory(
                 grid, trajectory, (map2d_x_min, map2d_x_max, map2d_y_min, map2d_y_max),
                 map2d_resolution, radius=args.map2d_trajectory_clear_radius,
             )
+            if args.map2d_trajectory_clear_radius > 0:
+                print(f"      轨迹强制清空 {args.map2d_trajectory_clear_radius}m: free 格子 "
+                      f"{n_free_before_clear} -> {int((grid == 254).sum())}")
+            else:
+                print("      轨迹强制清空: 已关闭(--map2d-trajectory-clear-radius=0), "
+                      "轨迹旁边的障碍照点云判定保留")
             # 离轨迹超过 map2d_known_radius 的 free 格子降级成"未知"(205)——
             # 不影响能不能走, 只是让全局规划器(靠 occupied_thresh 判占据、靠
             # unknown_multiplier 给未知区域加规划代价, 见 backend/app/
