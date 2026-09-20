@@ -157,6 +157,52 @@ const GROUND_FALLBACK_PLANE = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
 // sizeAttenuation 用默认的 true(世界坐标系大小, 跟随缩放跟途经点小球一致),
 // 不用 3D 点云那套"固定屏幕像素大小"——数字标记只需要跟它标注的小球保持同一个
 // 观感比例, 没有点云那种"缩太小看不见/缩太大糊成一团"的两难。
+// 途经点圆点的屏幕像素直径。路线本身的 LineMaterial linewidth 是 2.5px, 起终点
+// 是 0.1m 的球(世界系, 近看比这大得多) —— 6px 夹在中间, 正好是"比线粗一点、
+// 但不像起终点那么抢眼"(用户要求)。
+const ROUTE_DOT_PIXEL_SIZE = 6;
+
+
+/** 路线上每个点画一个圆点。整串点用**一个** THREE.Points 画完, 不是一个点一个
+ *  Mesh —— 一条 270m 的路线现在有三四百个途经点, 那样会多出几百个 draw call。 */
+function makeRouteDots(flatXYZ: number[], material: THREE.PointsMaterial): THREE.Points {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(flatXYZ, 3));
+  const dots = new THREE.Points(geometry, material);
+  // 比线(renderOrder 10)再靠前一点, 免得被线自己盖住。
+  dots.renderOrder = 11;
+  return dots;
+}
+
+
+/** 清空一个路线 group(线 + 圆点)。两者都有 geometry, 材质是共用的常驻实例,
+ *  只 dispose geometry。 */
+function disposeRouteGroup(group: THREE.Group): void {
+  group.children.forEach((c) => (c as Line2 | THREE.Points).geometry.dispose());
+  group.clear();
+}
+
+
+// 全局规划路线上每个途经点画一个小圆点, 用的贴图。THREE.PointsMaterial 默认画
+// 的是**方块**, 要圆点只能给它一张带圆形 alpha 的贴图 —— 画成纯白, 颜色交给
+// material.color 上色, 这样预览线(青)和下发线(粉)能共用同一张贴图。
+function createRoundDotTexture(): THREE.CanvasTexture {
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  // 留 2px 边距, 免得贴图边缘被线性采样切出锯齿
+  ctx.arc(size / 2, size / 2, size / 2 - 2, 0, Math.PI * 2);
+  ctx.fill();
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+
 function createWaypointLabelSprite(text: string): THREE.Sprite {
   const size = 64;
   const canvas = document.createElement("canvas");
@@ -263,6 +309,8 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   const startGoalGroupRef = useRef<THREE.Group | null>(null);
   const plannedRouteGroupRef = useRef<THREE.Group | null>(null);
   const plannedRouteMaterialRef = useRef<LineMaterial | null>(null);
+  const plannedRouteDotMaterialRef = useRef<THREE.PointsMaterial | null>(null);
+  const navRouteDotMaterialRef = useRef<THREE.PointsMaterial | null>(null);
   const navRouteGroupRef = useRef<THREE.Group | null>(null);
   const navRouteMaterialRef = useRef<LineMaterial | null>(null);
   const robotMeshRef = useRef<THREE.Group | null>(null);
@@ -498,6 +546,16 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     plannedRouteMaterial.resolution.set(width, height);
     plannedRouteMaterialRef.current = plannedRouteMaterial;
 
+    // 途经点圆点: 比线粗一点(线 2.5px, 点 6px)但远不到起终点标记那么显眼,
+    // 只要能一眼数出"路线上的点落在哪儿"就够了(用户要求)。sizeAttenuation=false
+    // 让它跟线一样是屏幕像素常量, 缩放时两者的粗细比例不变。
+    const dotTexture = createRoundDotTexture();
+    const plannedRouteDotMaterial = new THREE.PointsMaterial({
+      color: 0x22d3ee, size: ROUTE_DOT_PIXEL_SIZE, sizeAttenuation: false,
+      map: dotTexture, transparent: true, alphaTest: 0.5, depthTest: false,
+    });
+    plannedRouteDotMaterialRef.current = plannedRouteDotMaterial;
+
     const plannedRouteGroup = new THREE.Group();
     scene.add(plannedRouteGroup);
     plannedRouteGroupRef.current = plannedRouteGroup;
@@ -511,6 +569,12 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     });
     navRouteMaterial.resolution.set(width, height);
     navRouteMaterialRef.current = navRouteMaterial;
+
+    const navRouteDotMaterial = new THREE.PointsMaterial({
+      color: 0xec4899, size: ROUTE_DOT_PIXEL_SIZE, sizeAttenuation: false,
+      map: dotTexture, transparent: true, alphaTest: 0.5, depthTest: false,
+    });
+    navRouteDotMaterialRef.current = navRouteDotMaterial;
 
     const navRouteGroup = new THREE.Group();
     scene.add(navRouteGroup);
@@ -1014,8 +1078,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       mappingTrailMaterial.dispose();
       optimalGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       optimalMaterial.dispose();
-      plannedRouteGroup.children.forEach((c) => (c as Line2).geometry.dispose());
+      disposeRouteGroup(plannedRouteGroup);
       plannedRouteMaterial.dispose();
+      plannedRouteDotMaterial.dispose();
+      navRouteDotMaterial.dispose();
+      dotTexture.dispose();
       navRouteGroup.children.forEach((c) => (c as Line2).geometry.dispose());
       navRouteMaterial.dispose();
       origin.children.forEach((c) => (c as Line2).geometry.dispose());
@@ -1147,11 +1214,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   useEffect(() => {
     const group = plannedRouteGroupRef.current;
     const material = plannedRouteMaterialRef.current;
-    if (!group || !material) return;
+    const dotMaterial = plannedRouteDotMaterialRef.current;
+    if (!group || !material || !dotMaterial) return;
     needsRenderRef.current = true;
 
-    group.children.forEach((c) => (c as Line2).geometry.dispose());
-    group.clear();
+    disposeRouteGroup(group);
 
     if (!plannedRoute || plannedRoute.length < 2) return;
 
@@ -1163,6 +1230,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     line.computeLineDistances();
     line.renderOrder = 10;
     group.add(line);
+    group.add(makeRouteDots(flat, dotMaterial));
   }, [plannedRoute]);
 
   // 真的下发下去的导航路线, 画法跟上面的 plannedRoute 完全一样(单段直连,
@@ -1171,11 +1239,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   useEffect(() => {
     const group = navRouteGroupRef.current;
     const material = navRouteMaterialRef.current;
-    if (!group || !material) return;
+    const dotMaterial = navRouteDotMaterialRef.current;
+    if (!group || !material || !dotMaterial) return;
     needsRenderRef.current = true;
 
-    group.children.forEach((c) => (c as Line2).geometry.dispose());
-    group.clear();
+    disposeRouteGroup(group);
 
     if (!navRoute || navRoute.length < 2) return;
 
@@ -1187,6 +1255,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     line.computeLineDistances();
     line.renderOrder = 10;
     group.add(line);
+    group.add(makeRouteDots(flat, dotMaterial));
   }, [navRoute]);
 
   // 机器狗实时位姿标记

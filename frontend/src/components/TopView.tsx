@@ -114,6 +114,9 @@ const PLANNED_ROUTE_COLOR = "#22d3ee";
 // 同时显示(见 Props.navRoute 的说明), 颜色跟 PointCloudView 的 navRouteMaterial
 // 保持一致。
 const NAV_ROUTE_COLOR = "#ec4899";
+// 路线上每个途经点画一个小圆点。起终点是 7px, 线宽 2px —— 2.5px 夹在中间,
+// 正好是"比线粗一点、但不像起终点那么抢眼"(用户要求)。
+const ROUTE_DOT_RADIUS_PX = 2.5;
 const ROBOT_RADIUS_PX = 10;
 const ROBOT_STROKE_PX = 1.5;
 const HOVER_RADIUS_PX = 4;
@@ -539,30 +542,60 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               );
             })}
 
-            {/* 路线预览算出来的参考路线, 只读展示, 不接收点击 */}
+            {/* 路线预览算出来的参考路线, 只读展示, 不接收点击。线之后再逐点画一个
+                小圆点(ROUTE_DOT_RADIUS_PX), 让人能看出途经点具体落在哪儿 ——
+                航点间距是 navi_mode=2 的有效前瞻, 光看一条线看不出疏密。 */}
             {plannedRoute && plannedRoute.length >= 2 && (
-              <Line
-                points={plannedRoute.flatMap((p) => {
+              <>
+                <Line
+                  points={plannedRoute.flatMap((p) => {
+                    const rp = worldToPixel(centeredMeta, p.x, p.y);
+                    return [rp.col * baseScale, rp.row * baseScale];
+                  })}
+                  stroke={PLANNED_ROUTE_COLOR}
+                  strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
+                  listening={false}
+                />
+                {plannedRoute.map((p, i) => {
                   const rp = worldToPixel(centeredMeta, p.x, p.y);
-                  return [rp.col * baseScale, rp.row * baseScale];
+                  return (
+                    <Circle
+                      key={`pr-${i}`}
+                      x={rp.col * baseScale} y={rp.row * baseScale}
+                      radius={ROUTE_DOT_RADIUS_PX / zoom}
+                      fill={PLANNED_ROUTE_COLOR}
+                      listening={false}
+                    />
+                  );
                 })}
-                stroke={PLANNED_ROUTE_COLOR}
-                strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
-                listening={false}
-              />
+              </>
             )}
 
             {/* 真的下发下去的导航路线, 跟上面的路线预览可能同时显示, 颜色区分开 */}
             {navRoute && navRoute.length >= 2 && (
-              <Line
-                points={navRoute.flatMap((p) => {
+              <>
+                <Line
+                  points={navRoute.flatMap((p) => {
+                    const rp = worldToPixel(centeredMeta, p.x, p.y);
+                    return [rp.col * baseScale, rp.row * baseScale];
+                  })}
+                  stroke={NAV_ROUTE_COLOR}
+                  strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
+                  listening={false}
+                />
+                {navRoute.map((p, i) => {
                   const rp = worldToPixel(centeredMeta, p.x, p.y);
-                  return [rp.col * baseScale, rp.row * baseScale];
+                  return (
+                    <Circle
+                      key={`nr-${i}`}
+                      x={rp.col * baseScale} y={rp.row * baseScale}
+                      radius={ROUTE_DOT_RADIUS_PX / zoom}
+                      fill={NAV_ROUTE_COLOR}
+                      listening={false}
+                    />
+                  );
                 })}
-                stroke={NAV_ROUTE_COLOR}
-                strokeWidth={ROUTE_LINE_STROKE_PX / zoom}
-                listening={false}
-              />
+              </>
             )}
 
             {/* 起点/终点标记, 跟途经点标记同一套画法, 右键撤销靠 handleContextMenu
