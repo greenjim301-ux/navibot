@@ -340,7 +340,17 @@ async def plan_path(name: str, req: PlanPathRequest):
 
     publish_error: Optional[str] = None
     if not req.publish:
-        logger.info("plan_path: publish=False, 跳过下发 /initial_path (只返回规划结果)")
+        # 措辞要当心: 这条**每次规划都会打** —— 前端两处 planPath 调用都传
+        # publish=False(见 api.ts 的说明, published 恒为 false), navi_mode=3 的
+        # /initial_path 早就没有调用方了。以前写的是"跳过下发 /initial_path",
+        # 读起来像"这次路线没发下去", 实际跟下发成不成功一点关系都没有 ——
+        # 真正的下发是调用方紧接着的 submit_route(navi_mode=2), 在另一个请求里,
+        # 日志是 "route submitted: ..."。
+        logger.info(
+            "plan_path: 规划结果已返回(publish=False, 正常)。navi_mode=3 的 "
+            "/initial_path 没有调用方, 这里什么都不发; 真正的下发看调用方随后的 "
+            "submit_route, 日志是 'route submitted'"
+        )
     else:
         try:
             await run_in_threadpool(ros_bridge.publish_initial_path, points)
