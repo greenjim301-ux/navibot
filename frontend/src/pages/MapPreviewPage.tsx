@@ -416,7 +416,7 @@ export default function MapPreviewPage() {
     setPlanning(true);
     setNavError(null);
     try {
-      const result = await planPath(name, startGoal.start, startGoal.goal, false);
+      const result = await planPath(name, startGoal.start, startGoal.goal, false, "preview");
       setPlannedRoute(result.points);
       setStartGoalPicking(false);
     } catch (e) {
@@ -460,7 +460,11 @@ export default function MapPreviewPage() {
     setSubmitting(true);
     setNavError(null);
     try {
-      const planned = await planPath(name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, false);
+      // purpose=navigate: 途经点明细由随后的 submitRoute 在后端打(那边还能带上
+      // 机器狗当前位姿/z 的来历), 这里让后端少刷一份重复的。
+      const planned = await planPath(
+        name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, false, "navigate",
+      );
       const corners = planned.points.slice(1);
       const toDispatch = corners.length > 0 ? corners : planned.points.slice(-1);
       const dispatchWaypoints: Waypoint[] = toDispatch.map((p, i) => {

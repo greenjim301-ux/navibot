@@ -1,7 +1,7 @@
 import type {
   MapEditKind, MapEditRegion, MapEdits,
   MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint,
-  RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, TrailPoint, Waypoint, XY,
+  PlanPurpose, RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, TrailPoint, Waypoint, XY,
   ServiceParams,
 } from "./types";
 
@@ -160,11 +160,14 @@ export async function planPath(
   start: XY,
   goal: XY,
   publish: boolean = true,
+  /** 这次规划是"路线预览"还是"真实导航"。只影响后端日志详略, 不影响规划结果:
+   *  navigate 的途经点明细由随后的 submitRoute 打, 避免同一串点刷两遍。 */
+  purpose: PlanPurpose = "preview",
 ): Promise<PlanPathResult> {
   const res = await fetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(mapName)}/plan_path`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ start, goal, publish }),
+    body: JSON.stringify({ start, goal, publish, purpose }),
   });
   const data = await asJson<{ points: PlannedRoutePoint[]; published: boolean; publish_error: string | null }>(res);
   return { points: data.points, published: data.published, publishError: data.publish_error };

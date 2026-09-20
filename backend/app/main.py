@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 from typing import List, Optional
 
@@ -28,7 +29,7 @@ from .models import (
     PlanPathRequest, PlanPathResponse, PlanPathPoint,
     RouteRecord, RouteRequest,
     SelfInflationRequest,
-    ServiceInfo, ServiceParams, UpdateServiceParamsRequest,
+    PlanPurpose, ServiceInfo, ServiceParams, UpdateServiceParamsRequest,
     StartMappingRequest,
     SurfCloudRequest,
     UpdateMapEditRequest, UpdateRouteRequest,
@@ -276,8 +277,8 @@ async def plan_path(name: str, req: PlanPathRequest):
     # 进来就把地图名和起终点原样打出来, 跟下面失败那条日志配成一对, 照着 log 就
     # 能用同样的参数在本地重跑一遍。
     logger.info(
-        "plan_path: map=%s, 起点=(%.3f, %.3f), 终点=(%.3f, %.3f), publish=%s",
-        name, req.start.x, req.start.y, req.goal.x, req.goal.y, req.publish,
+        "plan_path: map=%s, 起点=(%.3f, %.3f), 终点=(%.3f, %.3f), purpose=%s",
+        name, req.start.x, req.start.y, req.goal.x, req.goal.y, req.purpose.value,
     )
 
     def compute() -> List[dict]:
@@ -298,18 +299,28 @@ async def plan_path(name: str, req: PlanPathRequest):
             trajectory=path_planner.mapping_trajectory(name),
         )
         delta = route_manager.get_altitude_calibration(name)
+        # 这两条警告原来是**逐点**打的 —— 一条 300 多个点的路线就刷 300 多行,
+        # 而它们讲的是整条路线共同的前提(这张图没有轨迹数据 / 现在算不出 Δ),
+        # 每个点重复一遍没有任何新信息。整条路线各打一次就够。
+        warned_no_ground = False
+        warned_no_delta = False
         out = []
         for x, y in raw_points:
             ground = path_planner.ground_elevation(name, x, y)
             if ground is None:
-                logger.warning(
-                    "plan_path: (%.2f, %.2f) 这张图没有建图轨迹数据, 查不到地面高程, z 按 0 兜底", x, y,
-                )
+                if not warned_no_ground:
+                    logger.warning(
+                        "plan_path: map=%s 没有建图轨迹数据, 查不到地面高程, 整条路线 z 按 0 兜底", name,
+                    )
+                    warned_no_ground = True
                 z = 0.0
             elif delta is None:
-                logger.warning(
-                    "plan_path: (%.2f, %.2f) 算不出位姿标定 Δ, z 直接用未标定的地面高程 %.3f", x, y, ground,
-                )
+                if not warned_no_delta:
+                    logger.warning(
+                        "plan_path: map=%s 算不出位姿标定 Δ(没连机器狗, 或它不在这张图上), "
+                        "整条路线的 z 直接用未标定的轨迹高度", name,
+                    )
+                    warned_no_delta = True
                 z = ground
             else:
                 z = ground + delta
@@ -337,7 +348,33 @@ async def plan_path(name: str, req: PlanPathRequest):
         )
         raise
 
-    logger.info("plan_path: 规划成功, map=%s, %d 个途经点", name, len(points))
+    # 段长按 3D 算(跟 route_manager._log_dispatch 里那个"段长"同一个口径, 两边
+    # 能直接对着看)。平地上跟水平距离一样, 坡上会略大。
+    segs = [
+        math.dist((a["x"], a["y"], a["z"]), (b["x"], b["y"], b["z"]))
+        for a, b in zip(points[:-1], points[1:])
+    ]
+    summary = ""
+    if segs:
+        ordered = sorted(segs)
+        summary = ("全长 %.1fm, 段长 最小 %.2f 中位 %.2f 最大 %.2fm"
+                   % (sum(segs), ordered[0], ordered[len(ordered) // 2], ordered[-1]))
+    if req.purpose is PlanPurpose.NAVIGATE:
+        # 紧接着就会调 submit_route, 明细由那边的 _log_dispatch 打(还能带上机器狗
+        # 当前位姿/z 的来历/planner 会不会跳过某个点), 这里不重复刷一遍。
+        logger.info(
+            "plan_path: 规划成功, map=%s, %d 个途经点%s"
+            " —— purpose=navigate, 途经点明细见随后的 \"=== 下发 preset_waypoints\"",
+            name, len(points), (", " + summary) if summary else "",
+        )
+    else:
+        logger.info("plan_path: 规划成功(预览), map=%s, %d 个途经点%s",
+                    name, len(points), (", " + summary) if summary else "")
+        # 预览没有后续的下发那一步, 明细只能在这里打 —— 否则"预览出来的到底是哪
+        # 几个点、间距多少"在任何地方都查不到。
+        for i, pt in enumerate(points, 1):
+            seg = "" if i == 1 else "  段长 %.2fm" % segs[i - 2]
+            logger.info("  #%d  x=%.3f y=%.3f z=%.3f%s", i, pt["x"], pt["y"], pt["z"], seg)
 
     publish_error: Optional[str] = None
     if not req.publish:

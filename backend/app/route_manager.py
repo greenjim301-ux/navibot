@@ -229,6 +229,7 @@ class RouteManager:
                 f"{ground:.3f}" if ground is not None else "未知(这张图没有建图轨迹数据)",
                 pose.cov, "  【定位失败!】" if pose.cov >= config.POSE_COV_BAD else "",
             )
+        segments: List[float] = []
         for i, (wp, a) in enumerate(zip(waypoints, alts), 1):
             if a.ground is not None and a.delta is not None:
                 how = f"轨迹{a.ground:+.3f} + Δ{a.delta:+.3f}" + (f" + 微调{wp.z_offset:+.3f}" if wp.z_offset else "")
@@ -240,8 +241,23 @@ class RouteManager:
             # planNextWaypoint() 的重合点判据(不是到达判据): 只有跟机器狗当前位置
             # 几乎重合(<5cm)才会被跳过, 标出来
             skip = "  ← planner 会跳过(重合 <%.2fm)" % config.DEGENERATE_DIST_M if dist < config.DEGENERATE_DIST_M else ""
-            logger.info("  #%d  x=%.3f y=%.3f z=%.3f  (%s)  距狗 %.2fm%s",
-                        i, wp.x, wp.y, a.z, how, dist, skip)
+            # 段长 = 离上一个途经点多远(第一个点算离机器狗多远), 跟 main.py 的
+            # plan_path 预览日志同一个口径(3D), 两边能直接对着看。**航点间距就是
+            # mode 2 的有效前瞻**, 也是"平地一冲一冲/楼梯左右摆"的直接成因, 所以
+            # 这个数比"距狗多远"更值得逐点打出来。
+            if i == 1:
+                seg = dist
+            else:
+                prev_wp, prev_a = waypoints[i - 2], alts[i - 2]
+                seg = math.dist((prev_wp.x, prev_wp.y, prev_a.z), (wp.x, wp.y, a.z))
+            segments.append(seg)
+            logger.info("  #%d  x=%.3f y=%.3f z=%.3f  (%s)  段长 %.2fm  距狗 %.2fm%s",
+                        i, wp.x, wp.y, a.z, how, seg, dist, skip)
+        if segments:
+            ordered = sorted(s for s in segments if s == s)  # 滤掉没位姿时的 nan
+            if ordered:
+                logger.info("  全长 %.1fm, 段长 最小 %.2f 中位 %.2f 最大 %.2fm",
+                            sum(ordered), ordered[0], ordered[len(ordered) // 2], ordered[-1])
 
     def _resolve_altitudes(self, waypoints: List[Waypoint], map_name: Optional[str],
                             pose: Optional[Pose]) -> List["_Altitude"]:

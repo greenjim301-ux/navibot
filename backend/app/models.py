@@ -33,9 +33,26 @@ class XY(BaseModel):
     y: float
 
 
+class PlanPurpose(str, Enum):
+    """这次规划是干嘛用的 —— 只影响**日志详略**, 不影响规划结果。
+
+    两个调用方拿到的是同一份规划结果, 区别只在后面做什么:
+      PREVIEW  地图预览页的"路线预览", 拿到就画在图上, 到此为止
+      NAVIGATE 地图预览页的"开始导航", 拿到之后紧接着调 submit_route 下发
+
+    NAVIGATE 的途经点明细由 submit_route 的 _log_dispatch 打(那边还能同时打出
+    机器狗当前位姿、z 是怎么算出来的、planner 会不会跳过某个点), 所以这里不再
+    重复打一遍; PREVIEW 没有后续那一步, 明细就得在这里打, 否则没有任何地方能
+    看到预览出来的到底是哪些点。"""
+    PREVIEW = "preview"
+    NAVIGATE = "navigate"
+
+
 class PlanPathRequest(BaseModel):
     start: XY
     goal: XY
+    purpose: PlanPurpose = PlanPurpose.PREVIEW
+    """见 PlanPurpose。默认 preview —— 老调用方不传也不会丢日志, 最多是多打一份。"""
     publish: bool = True
     """是否把规划结果下发给 /initial_path (navi_mode=3)。
 

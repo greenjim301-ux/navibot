@@ -174,6 +174,10 @@ export function pixelToWorld(meta: Topview2D, col: number, row: number) {
   };
 }
 
+/** plan_path 这次是干嘛用的 —— 只影响后端**日志详略**, 不影响规划结果。
+ *  "navigate" 的途经点明细由随后的 submit_route 打, 这里就不重复打了。 */
+export type PlanPurpose = "preview" | "navigate";
+
 export type ServiceActiveState =
   | "active"
   | "inactive"
