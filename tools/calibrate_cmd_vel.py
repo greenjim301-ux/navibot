@@ -25,8 +25,15 @@ x / y / yaw 三个轴分别标, 每轴给出**比例、死区、正反不对称�
     python3 tools/calibrate_cmd_vel.py --axis yaw            # 先只跑 yaw 最稳妥
     python3 tools/calibrate_cmd_vel.py --axis x --axis y --axis yaw --out cal.json
 
-yaw 轴顺带能估出 **lidar_t_body 杆臂** —— 原地旋转时如果雷达不在机体中心, odom 的
-位置会画一个圆, 半径就是杆臂长度。那个外参现在还是占位零向量, 白捡的。
+yaw 轴顺带能把 hand_lio 的两个外参也标了(它们现在还是占位的单位阵 + 零向量):
+
+  * **lidar_t_body 杆臂** —— 原地旋转时雷达不在机体中心的话, odom 的位置画一个圆,
+    半径就是杆臂长度。
+  * **lidar_R_body 安装旋转** —— 转圈时雷达 z 轴在世界系里画的那个圆给出安装倾角,
+    x/y 直线段的行进方向偏差给出绕 z 的偏转 γ, 两者拼成完整的 3x3。**倾角里含狗
+    自己的站姿, odom 原理上分不开**, 见 estimate_mount_tilt 的说明。
+
+所以即使只想标外参, 也得带上 --spin-turns(默认 2 圈)。
 """
 import argparse
 import json
@@ -87,7 +94,7 @@ class OdomBuffer:
 
     def __init__(self, topic: str, keep_sec: float = 60.0):
         self.keep_sec = keep_sec
-        self._samples: List[Tuple[float, float, float, float, float]] = []
+        self._samples: List[Tuple[float, ...]] = []
         self._twist_seen = False
         self._sub = rospy.Subscriber(topic, Odometry, self._cb,
                                      queue_size=200, tcp_nodelay=True)
@@ -95,10 +102,16 @@ class OdomBuffer:
     def _cb(self, msg: Odometry) -> None:
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
-        yaw = tft.euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        quat = [q.x, q.y, q.z, q.w]
+        yaw = tft.euler_from_quaternion(quat)[2]
+        # **雷达 z 轴在世界系里的指向**(只留水平两个分量)。安装倾角要靠它估,
+        # 不能用 roll/pitch 欧拉角 —— 欧拉角里地面坡度和安装倾角搅在一起分不开,
+        # 换成世界系 z 轴之后: 坡度是个固定偏移(不随 yaw 转), 安装倾角是个随 yaw
+        # 转的向量, 一次圆拟合就分开了。见 estimate_mount_tilt。
+        m = tft.quaternion_matrix(quat)
         t = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
         cov = msg.pose.covariance[0]
-        self._samples.append((t, p.x, p.y, yaw, cov))
+        self._samples.append((t, p.x, p.y, yaw, cov, m[0][2], m[1][2]))
         tw = msg.twist.twist
         if abs(tw.linear.x) + abs(tw.linear.y) + abs(tw.angular.z) > 1e-9:
             self._twist_seen = True
@@ -112,11 +125,13 @@ class OdomBuffer:
         return self._twist_seen
 
     def window(self, t0: float, t1: float) -> np.ndarray:
-        """取 [t0, t1] 区间的样本, 返回 (N, 5) 的 t/x/y/yaw/cov。"""
-        rows = [s for s in self._samples if t0 <= s[0] <= t1]
-        return np.array(rows, dtype=float).reshape(-1, 5)
+        """取 [t0, t1] 区间的样本, 返回 (N, 7): t/x/y/yaw/cov/zx/zy。
 
-    def latest(self) -> Optional[Tuple[float, float, float, float, float]]:
+        前 5 列的含义不能动 —— measure_window 按下标取。"""
+        rows = [s for s in self._samples if t0 <= s[0] <= t1]
+        return np.array(rows, dtype=float).reshape(-1, 7)
+
+    def latest(self) -> Optional[Tuple[float, ...]]:
         return self._samples[-1] if self._samples else None
 
 
@@ -170,6 +185,8 @@ class Calibrator:
         self.pub = rospy.Publisher(args.cmd_topic, Twist, queue_size=10)
         self.odom = OdomBuffer(args.odom_topic)
         self.runs: List[Dict] = []
+        # 原地转圈那几段的时间区间, 给 estimate_mount_tilt / estimate_lever_arm 用
+        self.spin_windows: List[Tuple[float, float]] = []
         self.started_at = time.time()
 
     # ---- 安全 ----
@@ -259,6 +276,43 @@ class Calibrator:
                     return round(t + w / 2, 3)
             t += step
         return float("nan")
+
+    # ---- 原地转圈: 给"安装倾角"和"杆臂"两个圆拟合提供全朝向覆盖 ----
+    def run_spin(self, turns: float, rate_cmd: float) -> Optional[Dict]:
+        """原地匀速转 turns 圈, 单独记一段窗口。
+
+        为什么不复用 yaw 的阶跃数据: 一次阶跃只转 0.5rad/s x 3.5s ≈ 100°, 而且正负
+        交替会转回原处 —— 朝向覆盖不到一整圈, 圆拟合的条件数极差, 半径和相位都不
+        可信。转两整圈的一段连续数据, 两个圆拟合都稳。
+        """
+        self.check_budget()
+        if not self.wait_stationary():
+            return None
+        rate = rospy.Rate(self.args.rate)
+        cmd = make_twist("yaw", rate_cmd)
+        t0 = time.time()
+        # 超时兜底: 万一命令值落在死区里狗根本不转, 不能死等
+        timeout = turns * 2 * math.pi / max(abs(rate_cmd), 1e-3) * 2.5 + 10.0
+        while not rospy.is_shutdown():
+            self.pub.publish(cmd)
+            rate.sleep()
+            win = self.odom.window(t0, time.time() + 1.0)
+            if len(win) > 10 and abs(np.unwrap(win[:, 3])[-1] - win[0, 3]) >= turns * 2 * math.pi:
+                break
+            if time.time() - t0 > timeout:
+                rospy.logwarn("转圈超时(命令 %.2f rad/s 可能落在死区里), 用已转到的部分",
+                              rate_cmd)
+                break
+        t_end = time.time()
+        self.publish_zero(self.args.rest)
+        win = self.odom.window(t0 + self.args.settle, t_end)
+        if len(win) < 50:
+            return None
+        turned = float(abs(np.unwrap(win[:, 3])[-1] - win[0, 3]))
+        print("    原地转圈: 命令 %.2f rad/s, 实际转过 %.0f° (%.1f 圈), %d 个样本"
+              % (rate_cmd, math.degrees(turned), turned / (2 * math.pi), len(win)))
+        self.spin_windows.append((t0 + self.args.settle, t_end))
+        return {"cmd": rate_cmd, "turned_rad": turned, "n": int(len(win))}
 
     # ---- 慢斜坡(给人看一张图, 不参与拟合) ----
     def run_ramp(self, axis: str) -> Dict:
@@ -409,7 +463,245 @@ def analyse(runs: List[Dict], args) -> Dict:
     return {"per_axis": out, "coupling": coupling}
 
 
-def estimate_lever_arm(runs: List[Dict], odom: OdomBuffer, args) -> Optional[Dict]:
+def estimate_mount_tilt(windows: List[np.ndarray]) -> Optional[Dict]:
+    """从原地转圈估**安装倾角**(lidar_R_body 的 roll/pitch 那部分)。
+
+    世界系是重力对齐的(见 lidar_tilt_impact.md 第 1 节), 于是雷达 z 轴在世界系里
+    的水平投影满足:
+
+        (zx, zy) = c + Rz(ψ) · δ
+
+      c = 地面坡度 —— **固定在世界系**, 不随 yaw 转
+      δ = 安装倾角(+ 狗的站姿倾角)在机体系里的水平分量 —— 固定在机体系, 随 yaw 转
+
+    所以对 (zx, zy, ψ) 做一次线性最小二乘就把两者分开了: 圆心是坡度, 半径 |δ| 是
+    倾角, 相位是倾斜方向。**这就是为什么不能用 roll/pitch 欧拉角** —— 欧拉角里这
+    两样是搅在一起的。
+
+    分不开的那一条: **安装倾角和狗自己的站姿倾角**。两者都固定在机体系、都随 yaw
+    转, odom 只看得见雷达, 原理上无法区分。要拆开只能靠外部参照(机体上放水平仪,
+    或者拿量角器量支架)—— 那是一次性机械测量, 不是标定能解决的。
+
+    ψ 用的是 odom 报的 yaw(即雷达的 yaw), 跟机体 yaw 差一个常数 γ。常数偏移只会
+    把 δ 整体转 γ, **不影响倾角大小**, 只影响报出来的"倾斜方向"。下面 estimate_
+    mount_yaw 估出 γ 之后, build_lidar_R_body 会把这一层补回去。
+    """
+    rows = [w for w in windows if len(w) >= 50]
+    if not rows:
+        return None
+    win = np.vstack(rows)
+    psi = np.unwrap(win[:, 3])
+    span = float(psi.max() - psi.min())
+    zx, zy = win[:, 5], win[:, 6]
+    cp, sp = np.cos(psi), np.sin(psi)
+    # [zx; zy] = [1 0 cos -sin; 0 1 sin cos] · [cx, cy, dx, dy]
+    A = np.zeros((2 * len(psi), 4))
+    A[0::2, 0] = 1.0
+    A[0::2, 2] = cp
+    A[0::2, 3] = -sp
+    A[1::2, 1] = 1.0
+    A[1::2, 2] = sp
+    A[1::2, 3] = cp
+    b = np.empty(2 * len(psi))
+    b[0::2], b[1::2] = zx, zy
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, dx, dy = (float(v) for v in sol)
+    resid = float(np.sqrt(((A @ sol - b) ** 2).mean()))
+    tilt = math.hypot(dx, dy)
+    return {
+        "tilt_rad": tilt,
+        "tilt_deg": math.degrees(math.asin(min(1.0, tilt))),
+        # 机体系里倾斜指向哪边(还没扣 γ, 见 docstring)
+        "tilt_dir_rad_in_odom_frame": math.atan2(dy, dx),
+        "delta": [dx, dy],
+        "floor_slope_deg": math.degrees(math.asin(min(1.0, math.hypot(cx, cy)))),
+        "residual": resid,
+        "yaw_span_deg": math.degrees(span),
+        "n": int(len(win)),
+        "trustworthy": bool(span >= 1.5 * math.pi and resid < 0.02),
+        "note": ("yaw 覆盖不到 270° 或者残差 > 0.02 时这个估计不可信。**倾角里含狗"
+                 "自己的站姿, odom 分不开** —— 要拆开得在机体上放水平仪/量支架。"),
+    }
+
+
+def estimate_mount_yaw(runs: List[Dict], args) -> Optional[Dict]:
+    """从 x / y 直线段估**安装偏转 γ**(lidar_R_body 绕 z 的那部分)。
+
+    雷达绕机体 z 轴装歪 γ 的话, 机体沿自己的 +x 走时, odom(报的是雷达系)看到的
+    行进方向会偏 γ。measure_window 出来的 (vx, vy) 已经在这个系里, 直接取"实际行进
+    方向"跟"名义方向"的夹角就行。
+
+    麻烦在于这个夹角里还混着**底盘自己的横向漂移**。设机体系里有一个恒定的漂移
+    速度 w(狗迈腿时往一边蹭), 命令方向单位向量 n̂、速度 v, 则
+
+        夹角 ≈ γ + (w · n̂⊥) / v            n̂⊥ = Rz(90°)·n̂
+
+    关键在第二项**随命令方向翻号**而 γ 不翻: 命令 +x 时是 +wy/v, 命令 -x 时是
+    -wy/v。所以每个轴拿正反两组做一次两参数最小二乘 [1, s/v], 截距就是 γ, 斜率
+    就是漂移 —— 两者干净分开, 不需要 x 和 y 都跑。
+    (最早那版只按轴取平均、拿组内散布当容差, 合成数据一验: 5% 的横向漂移照样被
+     判成"一致"就写进矩阵了 —— 因为漂移的信号恰恰**就在**组内那个散布里。)
+
+    x 和 y 两组分别给出 γ 之后再对一次, 是第二道关: 上面的模型假设 w 恒定, 如果
+    漂移其实随速度成比例、或者根本不是这个形状, 两组就对不上。
+    """
+    per_axis: Dict[str, Dict[str, float]] = {}
+    for axis, nominal in (("x", 0.0), ("y", math.pi / 2)):
+        ang, inv_v = [], []
+        for r in runs:
+            if r["axis"] != axis or r["r2_main"] < args.min_r2:
+                continue
+            v = abs(r["main"])
+            if v < args.min_main_speed:
+                continue
+            sgn = math.copysign(1.0, r["cmd"])
+            # 名义方向带上命令的正负, 这样反向那些 run 不用单独处理
+            nx, ny = sgn * math.cos(nominal), sgn * math.sin(nominal)
+            vx, vy = r["vx"], r["vy"]
+            ang.append(math.atan2(nx * vy - ny * vx, nx * vx + ny * vy))
+            inv_v.append(sgn / v)
+        if len(ang) < 4 or len(set(np.sign(inv_v))) < 2:
+            continue                      # 缺一个方向就分不开 γ 和漂移
+        A = np.column_stack([np.ones(len(ang)), np.array(inv_v)])
+        y = np.array(ang)
+        sol, *_ = np.linalg.lstsq(A, y, rcond=None)
+        resid = y - A.dot(sol)
+        dof = max(1, len(ang) - 2)
+        cov = (float((resid ** 2).sum()) / dof) * np.linalg.pinv(A.T.dot(A))
+        per_axis[axis] = {
+            "gamma_rad": float(sol[0]),
+            "gamma_deg": math.degrees(float(sol[0])),
+            # w·n̂⊥ [m/s]: x 组给的是 wy, y 组给的是 -wx
+            "drift_mps": float(sol[1]),
+            "stderr_deg": math.degrees(math.sqrt(max(0.0, cov[0][0]))),
+            "resid_deg": math.degrees(float(np.sqrt((resid ** 2).mean()))),
+            "n": len(ang),
+        }
+    if not per_axis:
+        return None
+    out: Dict[str, object] = {"per_axis": per_axis}
+    # 漂移向量(机体系), 两个分量各来自一个轴
+    drift = {}
+    if "x" in per_axis:
+        drift["wy"] = per_axis["x"]["drift_mps"]
+    if "y" in per_axis:
+        drift["wx"] = -per_axis["y"]["drift_mps"]
+    out["chassis_drift_mps"] = drift
+    if "x" in per_axis and "y" in per_axis:
+        gx, gy = per_axis["x"]["gamma_rad"], per_axis["y"]["gamma_rad"]
+        spread = math.degrees(abs(gx - gy))
+        tol = 3.0 * math.hypot(per_axis["x"]["stderr_deg"],
+                               per_axis["y"]["stderr_deg"]) + 0.3
+        out["gamma_rad"] = float((gx + gy) / 2)
+        out["gamma_deg"] = math.degrees(float((gx + gy) / 2))
+        out["xy_spread_deg"] = spread
+        out["consistent"] = bool(spread <= tol)
+        out["note"] = ("x 和 y 两组差 %.2f° (容差 %.2f°): %s" % (
+            spread, tol,
+            "一致" if spread <= tol else
+            "**对不上 —— 漂移不是恒定向量那个形状, γ 不可信, 别写进 lidar_R_body**"))
+    else:
+        only = list(per_axis)[0]
+        out["gamma_rad"] = per_axis[only]["gamma_rad"]
+        out["gamma_deg"] = per_axis[only]["gamma_deg"]
+        out["consistent"] = True
+        out["note"] = ("只有 %s 轴的数据。正反两个方向都跑了, γ 和漂移仍然分得开, "
+                       "但少了 x/y 互相印证这道关 —— 想更稳就把另一个轴也跑上"
+                       % only)
+    return out
+
+
+def _yaw_free_tilt(dx: float, dy: float) -> np.ndarray:
+    """由 z 轴的水平分量还原"去掉 yaw"的倾斜矩阵 L = Ry(p)·Rx(r)。
+
+    该矩阵第三列 = (sin p·cos r, -sin r, cos p·cos r), 所以 r 和 p 有闭式解。
+    measure_window 把世界位移按 odom 报的 yaw 转回来, 剩下的就是这个 L —— 倾角
+    大的时候, 它会让"水平面上看到的行进方向"偏离真正的 γ。
+    """
+    dz = math.sqrt(max(0.0, 1.0 - dx * dx - dy * dy))
+    r = math.asin(max(-1.0, min(1.0, -dy)))
+    p = math.atan2(dx, dz)
+    return tft.euler_matrix(r, p, 0.0)[:3, :3]
+
+
+def _compose_from_u_gamma(dx: float, dy: float, gamma: float) -> np.ndarray:
+    """给定倾角拟合值 δ_est 和偏转 γ, 拼出 lidar_R_body。见 build_lidar_R_body。"""
+    cg, sg = math.cos(gamma), math.sin(gamma)
+    ux, uy = cg * dx + sg * dy, -sg * dx + cg * dy     # δ_body = Rz(-γ)·δ_est
+    u = np.array([ux, uy, math.sqrt(max(0.0, 1.0 - ux * ux - uy * uy))])
+    # ⊥u 的一组正交基
+    seed = np.array([1.0, 0.0, 0.0]) if abs(u[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    a = np.cross(u, seed)
+    a /= np.linalg.norm(a)
+    b = np.cross(u, a)
+    phi = math.atan2(b[0], a[0]) - gamma
+    r1 = math.cos(phi) * a + math.sin(phi) * b
+    r2 = -math.sin(phi) * a + math.cos(phi) * b
+    R = np.vstack([r1, r2, u])
+    if np.linalg.det(R) < 0:      # 保证是旋转不是镜像
+        R[1] = -R[1]
+    return R
+
+
+def build_lidar_R_body(tilt: Optional[Dict], mount_yaw: Optional[Dict]) -> Optional[Dict]:
+    """把倾角和偏转拼成可以直接填进 hand_lio.yaml 的 lidar_R_body(行优先 3x3)。
+
+    约定跟那份 yaml 一致: p_lidar = lidar_R_body · p_body, 也就是 R 的**行**是雷达
+    各轴在机体系里的表示, **列**是机体各轴在雷达系里的表示。于是:
+
+      第 3 行 = 雷达 z 轴在机体系 = u = (δx, δy, sqrt(1-δx²-δy²))   <- 倾角给的
+      第 1 列的水平角 = 机体 x 轴在雷达系里的方向 = γ                <- 偏转给的
+
+    剩下的自由度(绕 u 转)由 γ 唯一确定: 取 ⊥u 的任意正交基 (a, b), 令
+    r1 = cosφ·a + sinφ·b、r2 = -sinφ·a + cosφ·b, 则 (r1x, r2x) 是 (ax, bx) 转了
+    -φ, 所以 φ = atan2(bx, ax) - γ 就是闭式解, 不用数值搜。
+
+    两处必须补的坐标系修正(合成数据验证出来的, 不补的话 15° 倾角下矩阵差 1.8°):
+
+    1. estimate_mount_tilt 的 δ 是拿 **odom(雷达)的 yaw** 当相位拟合出来的, 雷达
+       yaw 比机体 yaw 少 γ, 所以拟合值是 δ_est = Rz(γ)·δ_body。填进 u 之前要先
+       转回来: δ_body = Rz(-γ)·δ_est。
+    2. estimate_mount_yaw 量到的不是 γ 本身。它量的是"水平面上看到的行进方向",
+       而 measure_window 的参考系是**去掉 yaw 的雷达系** L, 于是实际观测量是
+       atan2(horiz(L·R[:,0]))。倾角大的时候这跟 γ 差零点几度。这里不去反解析,
+       直接拿构造出来的 R 正向预测一遍观测量, 按差值迭代几次修 γ —— 三四轮就
+       收敛到 1e-9, 比推闭式解省事也不容易推错。
+    """
+    if tilt is None:
+        return None
+    dx, dy = tilt["delta"]
+    if dx * dx + dy * dy >= 1.0:
+        return None
+    gamma_meas = 0.0
+    gamma_known = False
+    if mount_yaw and mount_yaw.get("consistent") and "gamma_rad" in mount_yaw:
+        gamma_meas = float(mount_yaw["gamma_rad"])
+        gamma_known = True
+
+    L = _yaw_free_tilt(dx, dy)
+    gamma = gamma_meas
+    R = _compose_from_u_gamma(dx, dy, gamma)
+    if gamma_known:
+        for _ in range(8):        # 见 docstring 第 2 条
+            v = L.dot(R[:, 0])
+            gamma += gamma_meas - math.atan2(v[1], v[0])
+            R = _compose_from_u_gamma(dx, dy, gamma)
+    orth = float(np.abs(R.dot(R.T) - np.eye(3)).max())
+    rpy = tft.euler_from_matrix(np.vstack([np.hstack([R, [[0], [0], [0]]]),
+                                           [0, 0, 0, 1]]))
+    return {
+        "matrix": [[round(float(v), 6) for v in row] for row in R],
+        "rpy_deg": [round(math.degrees(v), 3) for v in rpy],
+        "gamma_used_deg": math.degrees(gamma),
+        "gamma_known": gamma_known,
+        "orthonormality_error": orth,
+        "note": ("gamma_known=false 表示绕 z 的那一维没测出来(x/y 两组对不上, 或者"
+                 "没跑 x/y), 矩阵里那一维按 0 填, 只有 roll/pitch 可信。"
+                 "另外 roll/pitch 里含狗的站姿倾角, 见 estimate_mount_tilt。"),
+    }
+
+
+def estimate_lever_arm(windows: List[np.ndarray]) -> Optional[Dict]:
     """从 yaw 原地旋转的 odom 轨迹估 lidar 相对机体中心的杆臂。
 
     原地纯 yaw 旋转时, 如果雷达不在机体中心, odom 的 xy 会画一个圆, **半径就是
@@ -419,13 +711,10 @@ def estimate_lever_arm(runs: List[Dict], odom: OdomBuffer, args) -> Optional[Dic
     注意反过来也成立: **yaw 标定时 x/y 方向的"耦合"有一部分是杆臂造成的假象**,
     不是真的平移耦合 —— 分析耦合矩阵时要记得这一条。
     """
-    yaw_runs = [r for r in runs if r["axis"] == "yaw" and r["r2_main"] >= args.min_r2]
-    if not yaw_runs:
-        return None
-    # 用记录下来的整段 odom 拟合圆: (x-cx)² + (y-cy)² = R² 线性化成
-    # 2x·cx + 2y·cy + (R²-cx²-cy²) = x²+y², 直接最小二乘。
-    chunks = [odom.window(r["t_start"], r["t_end"]) for r in yaw_runs]
-    chunks = [c for c in chunks if len(c) >= 10]
+    # 拟合圆: (x-cx)² + (y-cy)² = R² 线性化成 2x·cx + 2y·cy + (R²-cx²-cy²) = x²+y²,
+    # 直接最小二乘。用**原地转圈**那几段而不是逐次 yaw 阶跃 —— 阶跃只转 100° 左右
+    # 而且正负交替转回原处, 朝向覆盖不足, 圆拟合条件数极差。
+    chunks = [w for w in windows if len(w) >= 50]
     if not chunks:
         return None
     win = np.vstack(chunks)
@@ -485,6 +774,42 @@ def print_report(report: Dict) -> None:
     if la:
         print("\n顺带估的杆臂(lidar 相对机体中心, 来自 yaw 原地旋转):")
         print("  半径 %.3f m   圆拟合残差 %.3f m" % (la["radius_m"], la["fit_residual_m"]))
+    tilt = report.get("mount_tilt")
+    if tilt:
+        ok = "" if tilt["trustworthy"] else "   ← 不可信(yaw 覆盖 %.0f°/残差 %.4f)" % (
+            tilt["yaw_span_deg"], tilt["residual"])
+        print("\n雷达安装倾角(来自原地转圈的姿态圆拟合):")
+        print("  倾角 %.2f°   倾斜方向 %.1f°(odom 系)   地面坡度 %.2f°%s"
+              % (tilt["tilt_deg"], math.degrees(tilt["tilt_dir_rad_in_odom_frame"]),
+                 tilt["floor_slope_deg"], ok))
+        print("  注意: 这个倾角里**含狗自己的站姿倾角**, odom 原理上分不开 ——")
+        print("        要拆开得在机体上放水平仪, 或者拿量角器量支架。")
+    my = report.get("mount_yaw")
+    if my:
+        print("\n雷达安装偏转 γ(绕 z, 来自 x/y 直线段的行进方向):")
+        for axis in ("x", "y"):
+            pa = my["per_axis"].get(axis)
+            if pa:
+                print("  由 %s 轴估: %+.2f°  (标准误 %.2f°, 拟合残差 %.2f°, %d 点)"
+                      % (axis, pa["gamma_deg"], pa["stderr_deg"], pa["resid_deg"],
+                         pa["n"]))
+        d = my.get("chassis_drift_mps") or {}
+        if d:
+            print("  同时分离出的底盘横向漂移: %s"
+                  % ", ".join("%s=%+.4f m/s" % kv for kv in sorted(d.items())))
+        print("  " + str(my["note"]))
+    sug = report.get("lidar_R_body_suggestion")
+    if sug:
+        print("\nhand_lio.yaml 的 lidar_R_body 建议值(行优先):")
+        for row in sug["matrix"]:
+            print("    [%9.6f, %9.6f, %9.6f]" % tuple(row))
+        print("  等价 rpy: %.2f°, %.2f°, %.2f°   正交性误差 %.2e"
+              % (sug["rpy_deg"][0], sug["rpy_deg"][1], sug["rpy_deg"][2],
+                 sug["orthonormality_error"]))
+        if not sug["gamma_known"]:
+            print("  ← γ 没测出来, 绕 z 那一维按 0 填, 只有 roll/pitch 可信")
+        print("  写进配置前先确认上面两条前提: 站姿倾角、底盘漂移。")
+
     v = report.get("verification")
     if v:
         print("\n验证集(不参与拟合的幅值, 看预测准不准):")
@@ -534,6 +859,9 @@ def main() -> int:
     ap.add_argument("--still-yaw", type=float, default=0.02, help="判静止的朝向抖动上限 [rad]")
     ap.add_argument("--max-runtime", type=float, default=3600.0,
                     help="总时长硬上限 [s], 超了自动停并保存已有数据")
+    ap.add_argument("--spin-turns", type=float, default=2.0,
+                    help="标 yaw 轴时额外原地转几圈, 给'安装倾角'和'杆臂'两个圆拟合"
+                         "提供全朝向覆盖。**少于 1 圈这两个估计都不可信**; 设 0 跳过")
     ap.add_argument("--ramp", action="store_true",
                     help="每轴额外跑一次很慢的斜坡, 原始曲线存进报告 —— 阶跃给精确"
                          "数值, 斜坡给一张能一眼看出死区形状的图")
@@ -563,6 +891,7 @@ def main() -> int:
 
     cal = Calibrator(args)
     ramps: List[Dict] = []
+    spins: List[Optional[Dict]] = []
     interrupted = False
     try:
         for axis in args.axis:
@@ -576,6 +905,13 @@ def main() -> int:
                     # 正负交替: 让狗来回走, 把位移抵消掉, 省场地
                     for sign in (1, -1):
                         cal.run_step(axis, sign * amp)
+            if axis == "yaw" and args.spin_turns > 0:
+                # 放在 yaw 阶跃**之后**: 那时已经知道哪个幅值能真的转起来了, 但简单
+                # 起见直接取最大幅值的 0.7 倍, 稳稳在死区之上。
+                print("  [yaw] 原地转 %.1f 圈(给安装倾角/杆臂两个圆拟合用) ..."
+                      % args.spin_turns)
+                spins.append(cal.run_spin(args.spin_turns,
+                                          0.7 * max(AXES["yaw"]["amps"])))
             if args.ramp:
                 print("  [%s] 慢斜坡 %.0fs ..." % (axis, args.ramp_duration))
                 ramps.append(cal.run_ramp(axis))
@@ -606,6 +942,10 @@ def main() -> int:
             "error": err, "error_frac": err / r["main"] if abs(r["main"]) > 1e-6 else float("nan"),
         })
 
+    spin_windows = [cal.odom.window(a, b) for a, b in cal.spin_windows]
+    tilt = estimate_mount_tilt(spin_windows)
+    mount_yaw = estimate_mount_yaw(fit_runs, args)
+
     report = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "interrupted": interrupted,
@@ -615,7 +955,11 @@ def main() -> int:
         "runs": cal.runs,
         "analysis": analysis,
         "verification": verification,
-        "lever_arm": estimate_lever_arm(cal.runs, cal.odom, args),
+        "lever_arm": estimate_lever_arm(spin_windows),
+        "mount_tilt": tilt,
+        "mount_yaw": mount_yaw,
+        "lidar_R_body_suggestion": build_lidar_R_body(tilt, mount_yaw),
+        "spins": [sp for sp in spins if sp],
         "ramps": ramps,
         # 这几项脚本自己读不到(它们在 deep_bridge / launch 的参数服务器里, 而且
         # 标定时那些节点未必都在跑), 所以只放提示, 让人手工核对填进报告。
