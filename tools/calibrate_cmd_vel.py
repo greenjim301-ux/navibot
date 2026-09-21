@@ -131,7 +131,11 @@ class OdomBuffer:
             # 此写了防护(:119, "timestamp went backwards, clearing pose buffer",
             # 播包重播那类情况)。这里照抄它的做法: 清空重新累积, 并计数, 结尾报出来
             # —— 被清掉那一段的窗口会取不到样本, 表现为该次阶跃被跳过, 有据可查。
-            if self._samples and t <= self._samples[-1][0]:
+            # 判据是**严格**回退, 不是 <=。并列的时间戳对 bisect 无害(非递减序列
+            # 二分照样正确, 闭区间两端也都取得到), 拿 <= 判的话一次无害的并列就会
+            # 清空整个缓冲, 白跳一次阶跃。hand_lio 那边用 <= 是对的 —— 它那个缓冲
+            # 是做位姿插值的, 零长度区间确实有问题; 这里的需求不一样。
+            if self._samples and t < self._samples[-1][0]:
                 self._backwards += 1
                 rospy.logwarn_throttle(
                     1.0, "odom 时间戳回退(%.3f -> %.3f), 清空缓冲重新累积",
@@ -908,9 +912,11 @@ def estimate_lever_arm(windows: List[np.ndarray],
         cg, sg = math.cos(gamma), math.sin(gamma)
         return cg * lx + sg * ly, -sg * lx + cg * ly
 
-    out = {"segments": segs, "n_spins": len(segs)}
     rates = [sg["spin_rate_rad_s"] for sg in segs]
     spread = (max(map(abs, rates)) / max(min(map(abs, rates)), 1e-6)) if len(segs) > 1 else 1.0
+    # spread 无论走哪条分支都要记: 退回去的时候, "两段转速差多少"正是诊断
+    # "为什么没走联立"最需要的那个数。
+    out = {"segments": segs, "n_spins": len(segs), "rate_spread": spread}
 
     if len(segs) > 1 and spread >= 1.3:
         # 联立: 每段两个方程, 未知 (ℓx, ℓy, wx, wy)。按样本数加权。
@@ -922,6 +928,10 @@ def estimate_lever_arm(windows: List[np.ndarray],
             wgt = math.sqrt(sg["n"])
             A.append([wgt, 0.0, 0.0, wgt / om]); b.append(wgt * sg["vec"][0])
             A.append([0.0, wgt, -wgt / om, 0.0]); b.append(wgt * sg["vec"][1])
+        if len(A) < 4:      # 两段都几乎没转起来, 方程凑不齐 -> 别往 lstsq 里塞空矩阵
+            out["method"] = "raw"
+            out["note"] = "两段转圈的角速度都接近 0, 联立解不出来, 这个杆臂没扣漂移。"
+            return out
         sol, *_ = np.linalg.lstsq(np.array(A), np.array(b), rcond=None)
         lx, ly = to_body(float(sol[0]), float(sol[1]))
         out.update({
@@ -929,7 +939,6 @@ def estimate_lever_arm(windows: List[np.ndarray],
             "lidar_t_body_xy": [lx, ly],
             "radius_corrected_m": float(math.hypot(lx, ly)),
             "spin_drift_mps": [float(sol[2]), float(sol[3])],
-            "rate_spread": spread,
             "note": ("两段不同转速联立解出的, **不依赖任何关于步态的假设**。"
                      "spin_drift_mps 是转圈时的横向漂移, 跟 x/y 直线段量到的"
                      "chassis_drift_mps 对比就知道两种步态蹭得一不一样。"),
@@ -950,9 +959,11 @@ def estimate_lever_arm(windows: List[np.ndarray],
             "lidar_t_body_xy": [lx, ly],
             "radius_corrected_m": float(math.hypot(lx, ly)),
             "drift_term_m": float(math.hypot(wx, wy) / abs(om)),
-            "note": ("只有一段转速, 只能拿 x/y 直线段量到的漂移去扣。**前提是转圈和"
-                     "平移两种步态蹭得一样多, 四足狗上没理由成立** —— 上面那组数里"
-                     "这个前提不成立时还差 4.3cm。跑两段不同转速就能免掉这个前提。"),
+            "note": (("只有一段转速" if len(segs) == 1 else
+                      "两段转速只差 %.2f 倍(要 >= 1.3 才联立得动)" % spread) +
+                     ", 只能拿 x/y 直线段量到的漂移去扣。**前提是转圈和平移两种步态"
+                     "蹭得一样多, 四足狗上没理由成立** —— 假狗实测这个前提不成立时"
+                     "差 7~14cm。跑两段拉得开的转速就能免掉这个前提。"),
         })
     else:
         out["method"] = "raw"
@@ -1029,11 +1040,18 @@ def print_report(report: Dict) -> None:
             print("  扣掉漂移那一项(%.3f m)之后: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
                   % (la["drift_term_m"], la["lidar_t_body_xy"][0],
                      la["lidar_t_body_xy"][1], la["radius_corrected_m"]))
-            print("  ← 只有一段转速, 拿直线段的漂移去扣。**前提是转圈和平移蹭得一样")
-            print("    多, 四足狗上没理由成立** —— 不成立时还会差几厘米。")
+            why = ("只有一段转速" if la["n_spins"] == 1 else
+                   "两段转速只差 %.2f 倍(要 >= 1.3)" % la["rate_spread"])
+            print("  ← %s, 只能拿直线段的漂移去扣。**前提是转圈和平移蹭得一样多," % why)
+            print("    四足狗上没理由成立** —— 假狗实测不成立时差 7~14cm。")
         else:
             print("  ← 没扣漂移, 这个半径可能明显偏大(假狗实测: 0.222m 量成 0.307m),")
             print("    而且完全不影响圆拟合残差, 光看残差发现不了。")
+    errs = report.get("errors") or {}
+    if errs:
+        print("\n!! 有 %d 个分析环节失败了(原始数据已经存下来了, 没丢):" % len(errs))
+        for k, v in sorted(errs.items()):
+            print("   %s -> %s" % (k, v))
     bw = report.get("odom_backwards")
     if bw:
         print("\n!! odom 时间戳回退了 %d 次, 每次都清空了缓冲重新累积。" % bw)
@@ -1217,7 +1235,11 @@ def main() -> int:
                     slow = min(usable, key=lambda r: r["main"])
                     fast = max(usable, key=lambda r: r["main"])
                     picks = [(slow["cmd"], slow["main"])]
-                    if fast["main"] / slow["main"] >= 1.3:
+                    # 门槛 1.5 而不是 estimate_lever_arm 那边的 1.3: 这里判的是
+                    # **阶跃实测**的转速比, 那边判的是**转圈段拟合**出来的 ω 比,
+                    # 两个量不一样。卡在同一个数上的话, 这边算出 1.31、那边拟合成
+                    # 1.29, 就会白转一段 40 秒然后照样退回非联立。留一截余量。
+                    if fast["main"] / slow["main"] >= 1.5:
                         picks.append((fast["cmd"], fast["main"]))
                 elif good:
                     pick = max(good, key=lambda r: r["main"])
@@ -1246,11 +1268,57 @@ def main() -> int:
         print("\n发零刹停 ...")
         cal.publish_zero(max(1.5, 3.0 / max(args.rate, 1.0) + 1.5))
 
+    report = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "interrupted": interrupted,
+        "args": {k: v for k, v in vars(args).items()},
+        "preflight": info,
+        "odom_twist_filled": cal.odom.twist_seen,
+        "odom_backwards": cal.odom.backwards_count,
+        "skipped": dict(cal.skipped, attempted=cal.attempted),
+        "runs": cal.runs,
+        "spins": [sp for sp in spins if sp],
+        "ramps": ramps,
+        # 这几项脚本自己读不到(它们在 deep_bridge / launch 的参数服务器里, 而且
+        # 标定时那些节点未必都在跑), 所以只放提示, 让人手工核对填进报告。
+        "config_hint": {
+            "usage_mode": "手工填: deep_bridge 的 usage_mode",
+            "gait_on_start": "手工填: deep_bridge 的 gait_on_start(死区按步态给, 换步态必须重标)",
+            "max_v": "手工填: deep_bridge 的 max_vx/max_vy/max_vyaw",
+            "full_scale_v": "手工填: deep_bridge 的 full_scale_vx/vy/vyaw(usage_mode=0 时才用到)",
+            "bridge": "手工填: deep_bridge 还是 unitree_bridge",
+        },
+    }
+    # **先把原始数据落盘, 再做分析。** 采集要二十多分钟, 而下面每个估计器都可能
+    # 因为某组数据的形状抛异常(比如两段转圈都几乎没转起来, 联立的矩阵是空的)。
+    # 分析写在 dict 字面量里、json.dump 排在后面的话, 任何一个异常都会把那两百多
+    # 次阶跃的原始记录一起带走。先存一份, 分析再追加。
+    def _dump() -> None:
+        with open(args.out, "w") as fh:
+            json.dump(report, fh, ensure_ascii=False, indent=2)
+
+    _dump()
+    print("  原始数据已存 %s, 开始分析 ..." % args.out)
+
+    errors: Dict[str, str] = {}
+
+    def _safe(label, fn, default=None):
+        """每个估计器单独兜底: 失败就在报告里记一条, 不连累别的和原始数据。"""
+        try:
+            return fn()
+        except Exception as e:                       # noqa: BLE001
+            rospy.logerr("%s 失败: %s", label, e)
+            errors[label] = "%s: %s" % (type(e).__name__, e)
+            return default
+
     fit_runs = [r for r in cal.runs if not is_verify(r)]
-    analysis = analyse(fit_runs, args)
+    analysis = _safe("analyse", lambda: analyse(fit_runs, args),
+                     {"per_axis": {}, "coupling": {}})
+    tilt = _safe("mount_tilt", lambda: estimate_mount_tilt(cal.spin_windows))
+    mount_yaw = _safe("mount_yaw", lambda: estimate_mount_yaw(fit_runs, args))
 
     # 验证集: 用拟合结果预测, 跟实测比
-    verification = []
+    verification: List[Dict] = []
     for r in cal.runs:
         if not is_verify(r) or r["r2_main"] < args.min_r2:
             continue
@@ -1265,41 +1333,20 @@ def main() -> int:
             "error": err, "error_frac": err / r["main"] if abs(r["main"]) > 1e-6 else float("nan"),
         })
 
-    tilt = estimate_mount_tilt(cal.spin_windows)
-    mount_yaw = estimate_mount_yaw(fit_runs, args)
-
-    report = {
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "interrupted": interrupted,
-        "args": {k: v for k, v in vars(args).items()},
-        "preflight": info,
-        "odom_twist_filled": cal.odom.twist_seen,
-        "odom_backwards": cal.odom.backwards_count,
-        "skipped": dict(cal.skipped, attempted=cal.attempted),
-        "runs": cal.runs,
+    report.update({
         "analysis": analysis,
         "verification": verification,
-        "lever_arm": estimate_lever_arm(
-            cal.spin_windows, (mount_yaw or {}).get("chassis_drift_mps"),
-            (mount_yaw or {}).get("gamma_rad") if (mount_yaw or {}).get("consistent")
-            else None),
         "mount_tilt": tilt,
         "mount_yaw": mount_yaw,
-        "lidar_R_body_suggestion": build_lidar_R_body(tilt, mount_yaw),
-        "spins": [sp for sp in spins if sp],
-        "ramps": ramps,
-        # 这几项脚本自己读不到(它们在 deep_bridge / launch 的参数服务器里, 而且
-        # 标定时那些节点未必都在跑), 所以只放提示, 让人手工核对填进报告。
-        "config_hint": {
-            "usage_mode": "手工填: deep_bridge 的 usage_mode",
-            "gait_on_start": "手工填: deep_bridge 的 gait_on_start(死区按步态给, 换步态必须重标)",
-            "max_v": "手工填: deep_bridge 的 max_vx/max_vy/max_vyaw",
-            "full_scale_v": "手工填: deep_bridge 的 full_scale_vx/vy/vyaw(usage_mode=0 时才用到)",
-            "bridge": "手工填: deep_bridge 还是 unitree_bridge",
-        },
-    }
-    with open(args.out, "w") as fh:
-        json.dump(report, fh, ensure_ascii=False, indent=2)
+        "lever_arm": _safe("lever_arm", lambda: estimate_lever_arm(
+            cal.spin_windows, (mount_yaw or {}).get("chassis_drift_mps"),
+            (mount_yaw or {}).get("gamma_rad") if (mount_yaw or {}).get("consistent")
+            else None)),
+        "lidar_R_body_suggestion": _safe(
+            "lidar_R_body", lambda: build_lidar_R_body(tilt, mount_yaw)),
+        "errors": errors,
+    })
+    _dump()
     print_report(report)
     print("\n完整报告(含每次 run 的原始记录): %s" % args.out)
     return 0
