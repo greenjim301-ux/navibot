@@ -215,12 +215,12 @@ class Calibrator:
         self.runs: List[Dict] = []
         # 原地转圈那几段的时间区间, 给 estimate_mount_tilt / estimate_lever_arm 用
         # **存数组本身, 不存时间区间。** OdomBuffer 只留 60s, 而这几段要等整轮跑
-        # 完(可能 30 分钟后)才用得上 —— 存区间的话回头 window() 取出来是空的,
+        # 完(20 多分钟后)才用得上 —— 存区间的话回头 window() 取出来是空的,
         # 三个估计器一起静默返回 None, 报告里那几节直接不打印, 人还以为没这功能。
         # estimate_lever_arm 从 0651bef 起就一直踩这个坑: 只有默认轴序(yaw 恰好
         # 最后)才侥幸有数据, 而且也只剩最后 60s 那一点。
         self.spin_windows: List[np.ndarray] = []
-        # 跳过统计。一次 run 失败只打一行 logwarn, 跑满半小时才发现一条数据都没
+        # 跳过统计。一次 run 失败只打一行 logwarn, 跑满二十多分钟才发现一条数据都没
         # 采到就太晚了 —— 结尾按这个给汇总和告警。
         self.attempted = 0
         self.skipped = {"stationary": 0, "window": 0}
@@ -914,7 +914,7 @@ def print_report(report: Dict) -> None:
     n_try, n_skip = sk.get("attempted", 0), sk.get("stationary", 0) + sk.get("window", 0)
     if n_try and n_skip:
         # 单次失败只有一行 logwarn, 滚上去就看不见了。整轮的比例必须在报告顶上,
-        # 不然"跑了半小时其实大半白跑"这件事不会有人注意到。
+        # 不然"跑了二十多分钟其实大半白跑"这件事不会有人注意到。
         frac = float(n_skip) / n_try
         print("\n%s跳过 %d/%d 次阶跃 (%.0f%%): 等不到静止 %d, 窗口无效 %d"
               % ("!! " if frac > 0.3 else "", n_skip, n_try, 100 * frac,
