@@ -1048,10 +1048,10 @@ def _print_t_body_hint(la: Dict, report: Dict) -> None:
     print("     坐标, 等于 -lidar_R_body*ℓ。而 ℓ 的 z(雷达比机体中心高多少)这套")
     print("     动作测不到: 绕竖直轴原地转, 装多高圆都一样大, 只能拿尺子量。")
     if sug and abs(sug["rpy_deg"][1]) > 2.0:
-        print("     这台有 %.0f° 俯仰, -R*ℓ 会把 z 混进水平分量(每 0.1m 高度差约"
-              " %.0f mm), 所以 z 必须补上才算得出来。"
-              % (sug["rpy_deg"][1],
-                 1000 * 0.1 * abs(math.sin(math.radians(sug["rpy_deg"][1])))))
+        print("     这台有 %.0f° 俯仰, -R*ℓ 会把 z 混进水平分量(每 0.1m 高度差"
+              % sug["rpy_deg"][1])
+        print("     约 %.0f mm), 所以 z 必须补上才算得出来。"
+              % (1000 * 0.1 * abs(math.sin(math.radians(sug["rpy_deg"][1])))))
 
 
 def print_report(report: Dict) -> None:
@@ -1101,7 +1101,7 @@ def print_report(report: Dict) -> None:
                          row.get("yaw", float("nan"))))
     la = report.get("lever_arm")
     if la:
-        print("\n顺带估的杆臂 lidar_t_body(来自 yaw 原地旋转):")
+        print("\n顺带估的杆臂(雷达相对机体中心, 来自 yaw 原地旋转):")
         for sg in la["segments"]:
             print("  转速 %+.2f rad/s: 圆半径 %.3f m, 残差 %.3f m, %d 样本"
                   % (sg["spin_rate_rad_s"], sg["radius_m"], sg["fit_residual_m"],
@@ -1142,6 +1142,7 @@ def print_report(report: Dict) -> None:
                    "两段转速只差 %.2f 倍(要 >= 1.3)" % la["rate_spread"])
             print("  ← %s, 只能拿直线段的漂移去扣。**前提是转圈和平移蹭得一样多," % why)
             print("    四足狗上没理由成立** —— 假狗实测不成立时差 7~14cm。")
+            _print_t_body_hint(la, report)      # 这条路上的人更需要这段提示
         else:
             print("  ← 没扣漂移, 这个半径可能明显偏大(假狗实测: 0.222m 量成 0.307m),")
             print("    而且完全不影响圆拟合残差, 光看残差发现不了。")
