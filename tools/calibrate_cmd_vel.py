@@ -104,6 +104,7 @@ class OdomBuffer:
         self._samples = collections.deque()  # type: collections.deque
         self._lock = threading.Lock()
         self._twist_seen = False
+        self._backwards = 0
         self._sub = rospy.Subscriber(topic, Odometry, self._cb,
                                      queue_size=200, tcp_nodelay=True)
 
@@ -124,9 +125,26 @@ class OdomBuffer:
             self._twist_seen = True
         cutoff = t - self.keep_sec
         with self._lock:
+            # **时间戳必须单调**: window() 是二分定位的, 缓冲区一旦乱序, 切出来的
+            # 区间会静默错。而这条链路上回退是真会发生的 —— odom_vehicle 的 stamp
+            # 直接继承自 /latest_imu_odom(HandLioNode.cpp:532), hand_lio 自己就为
+            # 此写了防护(:119, "timestamp went backwards, clearing pose buffer",
+            # 播包重播那类情况)。这里照抄它的做法: 清空重新累积, 并计数, 结尾报出来
+            # —— 被清掉那一段的窗口会取不到样本, 表现为该次阶跃被跳过, 有据可查。
+            if self._samples and t <= self._samples[-1][0]:
+                self._backwards += 1
+                rospy.logwarn_throttle(
+                    1.0, "odom 时间戳回退(%.3f -> %.3f), 清空缓冲重新累积",
+                    self._samples[-1][0], t)
+                self._samples.clear()
             self._samples.append((t, p.x, p.y, yaw, cov, m[0][2], m[1][2]))
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.popleft()
+
+    @property
+    def backwards_count(self) -> int:
+        """时间戳回退了几次。见 _cb。"""
+        return self._backwards
 
     @property
     def twist_seen(self) -> bool:
@@ -832,23 +850,31 @@ def estimate_lever_arm(windows: List[np.ndarray],
     0.351rad/s, 量到 0.307m —— 偏了 38%, 而且圆拟合残差只有 0.001m, 光看残差
     完全发现不了。
 
-    好在这一项是可以扣掉的: 上面那式子说 (p_lidar − C)·e^{−iψ} 是个常数向量, 把
-    它按 ψ 解出来就拿到了**带方向的** ℓ − i·w/ω, 再加回 i·w/ω 就是 ℓ 本身。
-    w 来自 estimate_mount_yaw(它本来就要把漂移从 γ 里剥出来), ω 直接从这段数据
-    拟合。
+    (p_lidar − C)·e^{−iψ} 是个常向量, 等于 ℓ − i·w/ω, 按 ψ 解出来就拿到了带方向
+    的它。剩下的问题是怎么把 w 这一项剥掉, 两条路:
 
-    最后还要转一次系: 上面整套都在"雷达 yaw 系"里算(ψ 是 odom 报的 yaw), 而
-    lidar_t_body 要的是**机体系**, 两者差一个 γ, 所以结果再乘 Rz(−γ)。长度不受
-    影响, 但方向受 —— 假狗实测: 不转的话报 [0.213, 0.050], 转完 [0.216, 0.034],
-    真值 (0.220, 0.030)。
+    **首选: 跑两段不同转速, 联立解。** ℓ 是常量而 w/ω 随 ω 变, 所以
+
+        vec_x(ω) = ℓx + wy/ω
+        vec_y(ω) = ℓy − wx/ω
+
+    两个不同的 ω 就能把 (ℓx, wy) 和 (ℓy, wx) 各自解出来 —— **不需要任何假设**,
+    而且顺带给出转圈时的 w 本身。
+
+    **退路: 拿 x/y 直线段量到的 w 去扣。** 只有一段转圈时只能这么办, 但要清楚它
+    的前提: **转圈和平移是两种步态, 横向蹭的量没理由相同**。数值上(真 ℓ=(0.220,
+    0.030), 转圈 w=(0.030,−0.015), 平移量到 w=(0.030, 0), ω=0.35):
+
+        w 恰好相同   扣完 (0.2200, 0.0300)   差 0.0 cm
+        w 不同       扣完 (0.1771, 0.0300)   差 4.3 cm
+        完全不扣                              差 9.6 cm
+
+    扣比不扣好一截, 但**不是"精确"**。所以默认会跑两段转速, 走联立那条路。
     """
-    # **每段各算各的, 不能 vstack。** 两段转圈在场地上的位置不一样(圆心不同),
-    # 时间轴也不连续, 拼起来拟合出的圆和角速度都没有意义。目前每轮只有一段, 所以
-    # 这跟 vstack 的结果逐位相同 —— 写成这样是为了将来真跑多段时不出错。
     chunks = [w for w in windows if len(w) >= 50]
     if not chunks:
         return None
-    per, weights = [], []
+    segs = []
     for win in chunks:
         x, y = win[:, 1], win[:, 2]
         # 拟合圆: (x-cx)² + (y-cy)² = R² 线性化成 2x·cx + 2y·cy + (R²-cx²-cy²) = x²+y²。
@@ -861,48 +887,78 @@ def estimate_lever_arm(windows: List[np.ndarray],
         if r2 <= 0:
             continue
         radius = float(math.sqrt(r2))
-        # 带方向的 (ℓ − i·w/ω): 把 (p − C) 按 ψ 转回去, 理论上是个常向量
         psi = np.unwrap(win[:, 3])
         cp, sp = np.cos(psi), np.sin(psi)
-        per.append((radius,
-                    float(np.abs(np.hypot(x - cx, y - cy) - radius).mean()),
-                    float(np.mean(cp * (x - cx) + sp * (y - cy))),
-                    float(np.mean(-sp * (x - cx) + cp * (y - cy))),
-                    fit_line(win[:, 0] - win[0, 0], psi)[0],
-                    float(cx), float(cy)))
-        weights.append(float(len(win)))
-    if not per:
+        segs.append({
+            "radius_m": radius,
+            "center": [float(cx), float(cy)],   # 每段场地位置不同, **不能平均**
+            "fit_residual_m": float(np.abs(np.hypot(x - cx, y - cy) - radius).mean()),
+            "vec": [float(np.mean(cp * (x - cx) + sp * (y - cy))),
+                    float(np.mean(-sp * (x - cx) + cp * (y - cy)))],
+            "spin_rate_rad_s": float(fit_line(win[:, 0] - win[0, 0], psi)[0]),
+            "n": int(len(win)),
+        })
+    if not segs:
         return None
-    w_arr = np.array(weights)
-    radius, resid_mean, vx, vy, omega, cx, cy = (
-        float(np.average([p[i] for p in per], weights=w_arr)) for i in range(7))
 
-    out = {
-        "radius_m": radius,
-        "center": [cx, cy],
-        "n_spins": len(per),
-        "fit_residual_m": resid_mean,
-        "apparent_vec": [vx, vy],
-        "spin_rate_rad_s": float(omega),
-        "drift_corrected": False,
-        "note": ("圆拟合残差远大于半径时这个估计不可信(说明这段不是纯原地旋转, "
-                 "或者杆臂本来就接近 0)。**残差小不代表半径对** —— 底盘横向漂移"
-                 "会给半径加一项 w/ω 而完全不影响残差, 见 docstring。"),
-    }
-    wx = (drift or {}).get("wx")
-    wy = (drift or {}).get("wy")
-    if wx is not None and wy is not None and abs(omega) > 0.05:
-        # ℓ = vec + i·w/ω;  复数乘 i 就是转 +90°: (wx, wy) -> (-wy, wx)
-        lx, ly = vx - wy / omega, vy + wx / omega
-        if gamma is not None:      # 雷达 yaw 系 -> 机体系
-            cg, sg = math.cos(gamma), math.sin(gamma)
-            lx, ly = cg * lx + sg * ly, -sg * lx + cg * ly
+    def to_body(lx, ly):
+        """雷达 yaw 系 -> 机体系(差一个 γ)。长度不变, 方向变。"""
+        if gamma is None:
+            return lx, ly
+        cg, sg = math.cos(gamma), math.sin(gamma)
+        return cg * lx + sg * ly, -sg * lx + cg * ly
+
+    out = {"segments": segs, "n_spins": len(segs)}
+    rates = [sg["spin_rate_rad_s"] for sg in segs]
+    spread = (max(map(abs, rates)) / max(min(map(abs, rates)), 1e-6)) if len(segs) > 1 else 1.0
+
+    if len(segs) > 1 and spread >= 1.3:
+        # 联立: 每段两个方程, 未知 (ℓx, ℓy, wx, wy)。按样本数加权。
+        A, b = [], []
+        for sg in segs:
+            om = sg["spin_rate_rad_s"]
+            if abs(om) < 1e-3:
+                continue
+            wgt = math.sqrt(sg["n"])
+            A.append([wgt, 0.0, 0.0, wgt / om]); b.append(wgt * sg["vec"][0])
+            A.append([0.0, wgt, -wgt / om, 0.0]); b.append(wgt * sg["vec"][1])
+        sol, *_ = np.linalg.lstsq(np.array(A), np.array(b), rcond=None)
+        lx, ly = to_body(float(sol[0]), float(sol[1]))
         out.update({
-            "drift_corrected": True,
+            "method": "joint",
             "lidar_t_body_xy": [lx, ly],
             "radius_corrected_m": float(math.hypot(lx, ly)),
-            "drift_term_m": float(math.hypot(wx, wy) / abs(omega)),
+            "spin_drift_mps": [float(sol[2]), float(sol[3])],
+            "rate_spread": spread,
+            "note": ("两段不同转速联立解出的, **不依赖任何关于步态的假设**。"
+                     "spin_drift_mps 是转圈时的横向漂移, 跟 x/y 直线段量到的"
+                     "chassis_drift_mps 对比就知道两种步态蹭得一不一样。"),
         })
+        return out
+
+    # 只有一段(或者两段转速太接近): 退回用平移段量到的 w
+    sg = max(segs, key=lambda d: d["n"])
+    out["radius_m"] = sg["radius_m"]
+    out["fit_residual_m"] = sg["fit_residual_m"]
+    out["spin_rate_rad_s"] = sg["spin_rate_rad_s"]
+    wx, wy = (drift or {}).get("wx"), (drift or {}).get("wy")
+    if wx is not None and wy is not None and abs(sg["spin_rate_rad_s"]) > 0.05:
+        om = sg["spin_rate_rad_s"]
+        lx, ly = to_body(sg["vec"][0] - wy / om, sg["vec"][1] + wx / om)
+        out.update({
+            "method": "drift_subtracted",
+            "lidar_t_body_xy": [lx, ly],
+            "radius_corrected_m": float(math.hypot(lx, ly)),
+            "drift_term_m": float(math.hypot(wx, wy) / abs(om)),
+            "note": ("只有一段转速, 只能拿 x/y 直线段量到的漂移去扣。**前提是转圈和"
+                     "平移两种步态蹭得一样多, 四足狗上没理由成立** —— 上面那组数里"
+                     "这个前提不成立时还差 4.3cm。跑两段不同转速就能免掉这个前提。"),
+        })
+    else:
+        out["method"] = "raw"
+        out["note"] = ("既没有第二段转速、也没有 x/y 直线段的漂移, 这个半径是没扣过"
+                       "漂移的, 可能明显偏大 —— 漂移会给它硬加一项 w/ω, 而且完全"
+                       "不影响圆拟合残差。")
     return out
 
 
@@ -953,19 +1009,36 @@ def print_report(report: Dict) -> None:
                          row.get("yaw", float("nan"))))
     la = report.get("lever_arm")
     if la:
-        print("\n顺带估的杆臂(lidar 相对机体中心, 来自 yaw 原地旋转):")
-        print("  量到的圆半径 %.3f m   圆拟合残差 %.3f m   实际转速 %.2f rad/s"
-              % (la["radius_m"], la["fit_residual_m"], la["spin_rate_rad_s"]))
-        if la.get("drift_corrected"):
-            print("  扣掉底盘横向漂移那一项(%.3f m)之后: lidar_t_body 水平分量 "
-                  "[%+.3f, %+.3f], 长 %.3f m"
+        print("\n顺带估的杆臂 lidar_t_body(来自 yaw 原地旋转):")
+        for sg in la["segments"]:
+            print("  转速 %+.2f rad/s: 圆半径 %.3f m, 残差 %.3f m, %d 样本"
+                  % (sg["spin_rate_rad_s"], sg["radius_m"], sg["fit_residual_m"],
+                     sg["n"]))
+        if la["method"] == "joint":
+            print("  两段联立解: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
+                  % (la["lidar_t_body_xy"][0], la["lidar_t_body_xy"][1],
+                     la["radius_corrected_m"]))
+            print("  转圈时的横向漂移 [%+.4f, %+.4f] m/s"
+                  % (la["spin_drift_mps"][0], la["spin_drift_mps"][1]))
+            cd = (report.get("mount_yaw") or {}).get("chassis_drift_mps") or {}
+            if "wx" in cd and "wy" in cd:
+                print("  (直线段量到的是 [%+.4f, %+.4f] —— 差得多就说明转圈和平移"
+                      "是两种步态)" % (cd["wx"], cd["wy"]))
+            print("  ← **不依赖任何关于步态的假设**, 用这个值。")
+        elif la["method"] == "drift_subtracted":
+            print("  扣掉漂移那一项(%.3f m)之后: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
                   % (la["drift_term_m"], la["lidar_t_body_xy"][0],
                      la["lidar_t_body_xy"][1], la["radius_corrected_m"]))
-            print("  ← 用**扣过**的这个值。漂移会给半径硬加 w/ω 而完全不影响圆拟合")
-            print("    残差, 光看残差发现不了(假狗实测: 0.222m 量成 0.307m)。")
+            print("  ← 只有一段转速, 拿直线段的漂移去扣。**前提是转圈和平移蹭得一样")
+            print("    多, 四足狗上没理由成立** —— 不成立时还会差几厘米。")
         else:
-            print("  ← 没扣底盘横向漂移(x/y 轴没跑, 或者转速太低), 这个半径可能偏大:")
-            print("    漂移会给它硬加一项 w/ω, 而且不影响圆拟合残差。")
+            print("  ← 没扣漂移, 这个半径可能明显偏大(假狗实测: 0.222m 量成 0.307m),")
+            print("    而且完全不影响圆拟合残差, 光看残差发现不了。")
+    bw = report.get("odom_backwards")
+    if bw:
+        print("\n!! odom 时间戳回退了 %d 次, 每次都清空了缓冲重新累积。" % bw)
+        print("   跨过那些时刻的阶跃会被跳过(计在上面的跳过数里)。播包重播/设备")
+        print("   对时都会造成这个, 先把时间源理顺再重标。")
     tilt = report.get("mount_tilt")
     if not tilt:
         # 同样是"静默少一节"的毛病, 这里显式说一句为什么没有。
@@ -1131,17 +1204,37 @@ def main() -> int:
                 good = [r for r in cal.runs
                         if r["axis"] == "yaw" and r["cmd"] > 0
                         and r["r2_main"] >= args.min_r2 and r["main"] > 0.15]
-                if good:
-                    pick = min(good, key=lambda r: abs(r["main"] - 0.5))
-                    spin_cmd, spin_rate = pick["cmd"], pick["main"]
-                    print("  [yaw] 原地转 %.1f 圈: 用 %.2f rad/s (实测能转出 %.2f)"
-                          % (args.spin_turns, spin_cmd, spin_rate))
-                else:
-                    spin_cmd, spin_rate = 0.7 * max(AXES["yaw"]["amps"]), None
-                    print("  [yaw] 原地转 %.1f 圈: yaw 阶跃没一个转得动, 退回用 "
-                          "%.2f rad/s" % (args.spin_turns, spin_cmd))
-                spins.append(cal.run_spin(args.spin_turns, spin_cmd,
-                                          expected_rate=spin_rate))
+                # **两段不同转速**, 不是一段: ℓ 是常量而漂移项 w/ω 随 ω 变, 两个
+                # 转速就能把杆臂和"转圈时的横向漂移"联立解出来, 免掉"转圈和平移
+                # 蹭得一样多"那个在四足狗上没理由成立的假设。见 estimate_lever_arm。
+                # 慢的那段用来把圆画大(信噪比好), 快的那段提供第二个 ω。
+                # 两个转速离得越开, 联立的条件数越好(方程里进的是 1/ω)。所以不挑
+                # 什么"目标转速", 直接取**能用的最慢**和**最快**: 下限 0.3 rad/s 是
+                # 为了兜住时间(2 圈 @0.3 已经 42s), 上限就是狗能转到的最快。
+                usable = [r for r in good if r["main"] >= 0.3]
+                picks = []
+                if usable:
+                    slow = min(usable, key=lambda r: r["main"])
+                    fast = max(usable, key=lambda r: r["main"])
+                    picks = [(slow["cmd"], slow["main"])]
+                    if fast["main"] / slow["main"] >= 1.3:
+                        picks.append((fast["cmd"], fast["main"]))
+                elif good:
+                    pick = max(good, key=lambda r: r["main"])
+                    picks = [(pick["cmd"], pick["main"])]
+                if not picks:
+                    picks = [(0.7 * max(AXES["yaw"]["amps"]), None)]
+                    print("  [yaw] yaw 阶跃没一个转得动, 退回用 %.2f rad/s" % picks[0][0])
+                elif len(picks) == 1:
+                    print("  [yaw] 只挑得出一个转速(%.2f rad/s), 杆臂只能用直线段的"
+                          "漂移去扣, 精度打折" % picks[0][1])
+                for spin_cmd, spin_rate in picks:
+                    print("  [yaw] 原地转 %.1f 圈: 命令 %.2f rad/s%s ..."
+                          % (args.spin_turns, spin_cmd,
+                             "" if spin_rate is None else
+                             " (实测能转出 %.2f)" % spin_rate))
+                    spins.append(cal.run_spin(args.spin_turns, spin_cmd,
+                                              expected_rate=spin_rate))
             if args.ramp:
                 print("  [%s] 慢斜坡 %.0fs ..." % (axis, args.ramp_duration))
                 ramps.append(cal.run_ramp(axis))
@@ -1181,6 +1274,7 @@ def main() -> int:
         "args": {k: v for k, v in vars(args).items()},
         "preflight": info,
         "odom_twist_filled": cal.odom.twist_seen,
+        "odom_backwards": cal.odom.backwards_count,
         "skipped": dict(cal.skipped, attempted=cal.attempted),
         "runs": cal.runs,
         "analysis": analysis,
