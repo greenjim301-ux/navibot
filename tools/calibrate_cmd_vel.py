@@ -840,7 +840,8 @@ def build_lidar_R_body(tilt: Optional[Dict], mount_yaw: Optional[Dict]) -> Optio
 
 def estimate_lever_arm(windows: List[np.ndarray],
                        drift: Optional[Dict[str, float]] = None,
-                       gamma: Optional[float] = None) -> Optional[Dict]:
+                       gamma: Optional[float] = None,
+                       noise_floor_m: Optional[float] = None) -> Optional[Dict]:
     """从原地转圈估雷达相对机体中心的杆臂(hand_lio 的 lidar_t_body)。
 
     原地纯 yaw 旋转时雷达画一个圆, 半径就是杆臂长度 —— **但"纯"字是个陷阱**。
@@ -874,6 +875,29 @@ def estimate_lever_arm(windows: List[np.ndarray],
         完全不扣                              差 9.6 cm
 
     扣比不扣好一截, 但**不是"精确"**。所以默认会跑两段转速, 走联立那条路。
+
+    **怎么判这个解可不可信**: 两段时联立是恰定的(4 个方程 4 个未知量, 而且 x 和 y
+    还各自解耦成 2x2), 所以它**没有自己的残差** —— 拟合永远"完美"。唯一的质量指标
+    是每段的**圆拟合残差**, 而它约束的是"这段到底是不是绕着一个固定圆心转"。
+
+    实测(给真圆叠加一个世界系平移, 模拟"转得不够原地"):
+
+        世界系漂移   圆残差      ℓ 误差   估出的 spin_w
+        0            0.0009m     0.0cm    (+0.030, -0.015)  <- 真值
+        0.005 m/s    0.028m      0.0cm    (+0.025, -0.015)
+        0.02  m/s    0.095m      0.0cm    (+0.010, -0.015)
+        0.05  m/s    0.211m      0.0cm    (-0.020, -0.015)  <- 连号都反了
+
+    **ℓ 出奇地稳, w 则完全被污染。** 所以圆残差偏大时: 杆臂照样能用, 但
+    spin_drift_mps 不可信 —— 尤其不能拿它跟直线段的漂移比较去下"两种步态不同"的
+    结论, 因为"转得不够原地"会造成一模一样的表象。noise_floor_m 传进来的话(取
+    measure_noise_floor 的 noise_xy)就用它当门槛, 自动按这台机器的噪声标定。
+
+    这个门槛的软肋: noise_floor_m 量的是"发零命令时的抖动", **狗在零命令下蠕动的
+    话它会被抬高**, 门控跟着变松(假狗上就是这样: 它零命令时仍横移 0.03m/s, 量出来
+    0.0137m 而纯噪声只有约 0.004m)。说到底这是"机器自己都停不稳时, 分不出是转圈
+    晃还是机器晃" —— 分不出就是分不出, 不去编一个绝对常数糊上。余量通常够: 干净
+    转圈的残差是 0.001m 量级, 隔着一两个数量级。
     """
     chunks = [w for w in windows if len(w) >= 50]
     if not chunks:
@@ -912,19 +936,28 @@ def estimate_lever_arm(windows: List[np.ndarray],
         cg, sg = math.cos(gamma), math.sin(gamma)
         return cg * lx + sg * ly, -sg * lx + cg * ly
 
-    rates = [sg["spin_rate_rad_s"] for sg in segs]
-    spread = (max(map(abs, rates)) / max(min(map(abs, rates)), 1e-6)) if len(segs) > 1 else 1.0
-    # spread 无论走哪条分支都要记: 退回去的时候, "两段转速差多少"正是诊断
-    # "为什么没走联立"最需要的那个数。
-    out = {"segments": segs, "n_spins": len(segs), "rate_spread": spread}
+    # spread 只对**真正进得了联立**的那些段算 —— |ω| 太小的段后面会被跳过, 把它们
+    # 算进来的话可能出现"spread 过关但实际参与的两段 ω 几乎相同"的病态而无声。
+    usable = [sg for sg in segs if abs(sg["spin_rate_rad_s"]) >= 1e-3]
+    rates = [abs(sg["spin_rate_rad_s"]) for sg in usable]
+    spread = (max(rates) / min(rates)) if len(usable) > 1 else 1.0
+    main_seg = max(segs, key=lambda d: d["n"])
+    # 这三个顶层字段每条分支都填, 免得外部读 JSON 时字段不齐。
+    # spin_is_clean: 圆残差够小 -> 这几段确实是绕固定圆心转的。见 docstring。
+    clean = None
+    if noise_floor_m:
+        clean = all(sg["fit_residual_m"] <= max(noise_floor_m, 1e-4) for sg in segs)
+    out = {"segments": segs, "n_spins": len(segs), "rate_spread": spread,
+           "radius_m": main_seg["radius_m"],
+           "fit_residual_m": main_seg["fit_residual_m"],
+           "spin_rate_rad_s": main_seg["spin_rate_rad_s"],
+           "spin_is_clean": clean}
 
-    if len(segs) > 1 and spread >= 1.3:
+    if len(usable) > 1 and spread >= 1.3:
         # 联立: 每段两个方程, 未知 (ℓx, ℓy, wx, wy)。按样本数加权。
         A, b = [], []
-        for sg in segs:
+        for sg in usable:
             om = sg["spin_rate_rad_s"]
-            if abs(om) < 1e-3:
-                continue
             wgt = math.sqrt(sg["n"])
             A.append([wgt, 0.0, 0.0, wgt / om]); b.append(wgt * sg["vec"][0])
             A.append([0.0, wgt, -wgt / om, 0.0]); b.append(wgt * sg["vec"][1])
@@ -940,16 +973,14 @@ def estimate_lever_arm(windows: List[np.ndarray],
             "radius_corrected_m": float(math.hypot(lx, ly)),
             "spin_drift_mps": [float(sol[2]), float(sol[3])],
             "note": ("两段不同转速联立解出的, **不依赖任何关于步态的假设**。"
-                     "spin_drift_mps 是转圈时的横向漂移, 跟 x/y 直线段量到的"
-                     "chassis_drift_mps 对比就知道两种步态蹭得一不一样。"),
+                     "联立是恰定的, 没有自己的残差, 质量只能看每段的圆残差 —— "
+                     "残差正常时 spin_drift_mps 才可信, 偏大时它会被'转得不够原地'"
+                     "污染到连号都反, 但杆臂本身照样稳。见 docstring 那张表。"),
         })
         return out
 
     # 只有一段(或者两段转速太接近): 退回用平移段量到的 w
-    sg = max(segs, key=lambda d: d["n"])
-    out["radius_m"] = sg["radius_m"]
-    out["fit_residual_m"] = sg["fit_residual_m"]
-    out["spin_rate_rad_s"] = sg["spin_rate_rad_s"]
+    sg = main_seg
     wx, wy = (drift or {}).get("wx"), (drift or {}).get("wy")
     if wx is not None and wy is not None and abs(sg["spin_rate_rad_s"]) > 0.05:
         om = sg["spin_rate_rad_s"]
@@ -1029,13 +1060,25 @@ def print_report(report: Dict) -> None:
             print("  两段联立解: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
                   % (la["lidar_t_body_xy"][0], la["lidar_t_body_xy"][1],
                      la["radius_corrected_m"]))
-            print("  转圈时的横向漂移 [%+.4f, %+.4f] m/s"
-                  % (la["spin_drift_mps"][0], la["spin_drift_mps"][1]))
+            print("  ← **不依赖任何关于步态的假设**, 杆臂用这个值。")
+            # 联立是恰定的, 没有自己的残差; 能说明问题的只有每段的圆残差。而圆残差
+            # 一偏大, spin_drift 就会被"转得不够原地"污染(实测能污染到连号都反),
+            # 这时它跟直线段漂移的差别**不能**读成"两种步态不同" —— 两种成因表象
+            # 一模一样。所以这几行必须门控, 不能无条件打。
+            clean = la.get("spin_is_clean")
+            print("  转圈时的横向漂移 [%+.4f, %+.4f] m/s%s"
+                  % (la["spin_drift_mps"][0], la["spin_drift_mps"][1],
+                     "" if clean is not False else "   ← 不可信, 见下"))
             cd = (report.get("mount_yaw") or {}).get("chassis_drift_mps") or {}
-            if "wx" in cd and "wy" in cd:
-                print("  (直线段量到的是 [%+.4f, %+.4f] —— 差得多就说明转圈和平移"
-                      "是两种步态)" % (cd["wx"], cd["wy"]))
-            print("  ← **不依赖任何关于步态的假设**, 用这个值。")
+            if clean is False:
+                print("  !! 圆拟合残差偏大(%.3f m, 超过静止噪声底), 说明这几段**转得"
+                      "不够原地**" % la["fit_residual_m"])
+                print("     —— 杆臂不受影响(实测世界系漂到 0.05m/s 时 ℓ 误差仍是")
+                print("     0.0cm), 但上面那个转圈漂移不可信, 别拿它跟直线段的比。")
+            elif "wx" in cd and "wy" in cd:
+                print("  (直线段量到的是 [%+.4f, %+.4f]" % (cd["wx"], cd["wy"]), end="")
+                print("; 圆残差正常, 所以差得多确实是两种步态的区别)"
+                      if clean else "; 没量噪声底, 判不了这几段够不够原地)")
         elif la["method"] == "drift_subtracted":
             print("  扣掉漂移那一项(%.3f m)之后: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
                   % (la["drift_term_m"], la["lidar_t_body_xy"][0],
@@ -1341,7 +1384,8 @@ def main() -> int:
         "lever_arm": _safe("lever_arm", lambda: estimate_lever_arm(
             cal.spin_windows, (mount_yaw or {}).get("chassis_drift_mps"),
             (mount_yaw or {}).get("gamma_rad") if (mount_yaw or {}).get("consistent")
-            else None)),
+            else None,
+            (info.get("noise_floor") or {}).get("noise_xy"))),
         "lidar_R_body_suggestion": _safe(
             "lidar_R_body", lambda: build_lidar_R_body(tilt, mount_yaw)),
         "errors": errors,
