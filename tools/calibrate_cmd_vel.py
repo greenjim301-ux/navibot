@@ -51,13 +51,17 @@ POSE_COV_BAD = 0.99
 # 0x1001 标准-基础那一行(X [0.2,2.0] / Y [0.35,1.0] / Yaw [0.5,2.0]) ——
 # **换步态这三个数就不对了**, 用 --vendor-lower 覆盖。它只用来决定"拟合比例时从
 # 哪个幅值往上取", 不影响采样。
+#
+# 下界**以上**要留足点(每个方向至少 4~5 个): 实测死区可能比厂商下界还高一点,
+# 那些落在死区里的幅值会因为 R² 太低被剔掉, 剩下的点不够就拟合不出可信的比例
+# —— 第一版 y 轴只给了 0.45/0.60 两个点, 死区估出来就偏了 0.013。
 AXES = {
     "x":   {"unit": "m/s",   "vendor_lower": 0.20,
-            "amps": [0.05, 0.10, 0.15, 0.18, 0.20, 0.22, 0.30, 0.40, 0.55, 0.75]},
+            "amps": [0.05, 0.10, 0.15, 0.18, 0.20, 0.22, 0.26, 0.32, 0.40, 0.50, 0.62, 0.75]},
     "y":   {"unit": "m/s",   "vendor_lower": 0.35,
-            "amps": [0.10, 0.20, 0.30, 0.33, 0.35, 0.38, 0.45, 0.60]},
+            "amps": [0.10, 0.20, 0.30, 0.33, 0.35, 0.38, 0.42, 0.48, 0.55, 0.65, 0.80]},
     "yaw": {"unit": "rad/s", "vendor_lower": 0.50,
-            "amps": [0.10, 0.25, 0.40, 0.48, 0.50, 0.53, 0.70, 1.00]},
+            "amps": [0.10, 0.25, 0.40, 0.48, 0.50, 0.53, 0.60, 0.70, 0.85, 1.00, 1.20]},
 }
 
 
@@ -383,18 +387,24 @@ def analyse(runs: List[Dict], args) -> Dict:
         entry["rise_time_median"] = float(np.median(rises)) if rises else None
         out[axis] = entry
 
-    # 轴间耦合: 命令某个轴时, 另外两个轴冒出来多少(按命令幅值归一)。腿式底盘上
-    # "命令纯 x 却持续偏航"是很常见的, 而那正好是"狗自己往路边靠"的直接成因。
+    # 轴间耦合: 命令某个轴时, 另外两个轴冒出来多少。腿式底盘上"命令纯 x 却持续
+    # 偏航"很常见, 而那正好是"狗自己往路边靠"的直接成因。
+    #
+    # **按实测的主轴速度归一, 不是按命令幅值。** 按命令归一的话, 有死区时
+    # v/u = k(1 - d/u) 会随幅值变, 平均出来是个没有意义的数(第一版就是这么写的,
+    # 对角线上直接出了 0.44 而真实比例是 0.92)。除以实测主轴速度之后, 对角线
+    # 恒为 1, 非对角是"每 1 单位实际主轴运动伴随多少侧向/偏航", 可以直接读:
+    # 比如 x->yaw = 0.035 就是"每前进 1m 偏 0.035 rad"。
     coupling: Dict[str, Dict[str, float]] = {}
     for axis in AXES:
         big = [r for r in runs
                if r["axis"] == axis and r["r2_main"] >= args.min_r2
-               and abs(r["cmd"]) >= args.vendor_lower.get(axis, AXES[axis]["vendor_lower"])]
+               and abs(r["main"]) >= args.min_main_speed]
         if not big:
             continue
         coupling[axis] = {}
         for out_axis, key in (("x", "vx"), ("y", "vy"), ("yaw", "vyaw")):
-            ratios = [r[key] / r["cmd"] for r in big if abs(r["cmd"]) > 1e-6]
+            ratios = [r[key] / r["main"] for r in big]
             coupling[axis][out_axis] = float(np.mean(ratios)) if ratios else float("nan")
     return {"per_axis": out, "coupling": coupling}
 
@@ -454,15 +464,16 @@ def print_report(report: Dict) -> None:
             # 报告里显示绝对值: JSON 里存的 deadzone 是拟合直线跟 v=0 的交点,
             # 反向分支上它天然是负数(命令 -0.17 以内不动), 打成 "-0.17" 容易被
             # 误读成"负的死区"。
-            print("  %s: 比例 %.4f   死区 %.4f   拟合 R²=%.4f  (%d 点)"
-                  % (label, f["scale"], abs(f["deadzone"]), f["fit_r2"], f["n"]))
+            warn = "   ← 点数太少, 比例/死区都不可信, 把死区以上的幅值加密" if f["n"] < 4 else ""
+            print("  %s: 比例 %.4f   死区 %.4f   拟合 R²=%.4f  (%d 点)%s"
+                  % (label, f["scale"], abs(f["deadzone"]), f["fit_r2"], f["n"], warn))
         if e.get("asymmetry") is not None:
             print("  正反不对称: %+.1f%%" % (100 * e["asymmetry"]))
         if e.get("rise_time_median") is not None:
             print("  上升时间(到稳态 90%%)中位: %.2fs" % e["rise_time_median"])
     cp = report["analysis"].get("coupling") or {}
     if cp:
-        print("\n轴间耦合(命令 1 单位某轴, 实测各轴冒出多少):")
+        print("\n轴间耦合(每 1 单位**实测**主轴运动, 伴随各轴多少; 对角线恒为 1):")
         print("        ->x      ->y      ->yaw")
         for axis in ("x", "y", "yaw"):
             if axis in cp:
@@ -516,6 +527,9 @@ def main() -> int:
     ap.add_argument("--min-r2", type=float, default=0.98,
                     help="稳态窗口的直线拟合 R² 门槛, 低于它的 run 不参与分析"
                          "(说明那段不是匀速: 还在加速, 或者打滑)")
+    ap.add_argument("--min-main-speed", type=float, default=0.08,
+                    help="算轴间耦合时, 主轴实测速度低于这个值的 run 不参与 —— 耦合是"
+                         "按实测主轴速度归一的, 主轴接近 0 时比值会炸")
     ap.add_argument("--still-xy", type=float, default=0.02, help="判静止的位置抖动上限 [m]")
     ap.add_argument("--still-yaw", type=float, default=0.02, help="判静止的朝向抖动上限 [rad]")
     ap.add_argument("--max-runtime", type=float, default=3600.0,
