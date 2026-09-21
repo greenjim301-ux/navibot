@@ -171,7 +171,7 @@ def main():
     print("  轴 %s, 速度 %+.3f %s, 持续 %.1fs, 发布 %.0fHz"
           % (args.axis, args.speed, unit, args.duration, args.rate))
 
-    check_other_publishers(rospy.resolve_name(args.cmd_topic), args.force)
+    others = check_other_publishers(rospy.resolve_name(args.cmd_topic), args.force)
     pub = rospy.Publisher(args.cmd_topic, Twist, queue_size=10)
     odom = Odom(args.odom_topic)
     if odom.wait() is None:
@@ -181,8 +181,15 @@ def main():
                          "位姿不可信 —— 先把定位搞好。" % (odom.latest[4], POSE_COV_BAD))
     # 等发布者和订阅者握上手, 不然开头几帧会丢
     time.sleep(0.5)
-    print("  前置检查通过(%s 上没有别的发布者, odom cov=%.3f)"
-          % (args.cmd_topic, odom.latest[4]))
+    if others:
+        # 走到这里只能是 --force。**不能照打"没有别的发布者"** —— 那正是这行唯一
+        # 会说假话的场合, 而且这次测量的数据本来就已经被污染了。
+        print("  !! %s 上还有: %s —— --force 强行下发, 这次的变化量是两边命令的"
+              "共同结果, 别当成标定数据" % (args.cmd_topic, ", ".join(others)))
+        print("  odom cov=%.3f" % odom.latest[4])
+    else:
+        print("  前置检查通过(%s 上没有别的发布者, odom cov=%.3f)"
+              % (args.cmd_topic, odom.latest[4]))
 
     start = odom.latest
     odom.worst_cov = start[4]
