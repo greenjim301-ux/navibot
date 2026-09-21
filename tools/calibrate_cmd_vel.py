@@ -996,7 +996,7 @@ def estimate_lever_arm(windows: List[np.ndarray],
         out.update(quality(usable))        # 联立只用 usable, 判据也只看这些段
         out.update({
             "method": "joint",
-            "lidar_t_body_xy": [lx, ly],
+            "lidar_xy_in_body": [lx, ly],
             "radius_corrected_m": float(math.hypot(lx, ly)),
             "spin_drift_mps": [float(sol[2]), float(sol[3])],
             "note": ("两段不同转速联立解出的, **不依赖任何关于步态的假设**。"
@@ -1015,7 +1015,7 @@ def estimate_lever_arm(windows: List[np.ndarray],
         lx, ly = to_body(sg["vec"][0] - wy / om, sg["vec"][1] + wx / om)
         out.update({
             "method": "drift_subtracted",
-            "lidar_t_body_xy": [lx, ly],
+            "lidar_xy_in_body": [lx, ly],
             "radius_corrected_m": float(math.hypot(lx, ly)),
             "drift_term_m": float(math.hypot(wx, wy) / abs(om)),
             "note": (("只有一段转速" if len(segs) == 1 else
@@ -1030,6 +1030,28 @@ def estimate_lever_arm(windows: List[np.ndarray],
                        "漂移的, 可能明显偏大 —— 漂移会给它硬加一项 w/ω, 而且完全"
                        "不影响圆拟合残差。")
     return out
+
+
+def _print_t_body_hint(la: Dict, report: Dict) -> None:
+    """说清楚量到的这个向量跟 yaml 里的 lidar_t_body **不是同一个量**。
+
+    hand_lio.yaml 的约定是 p_lidar = lidar_R_body*p_body + lidar_t_body, 所以
+    lidar_t_body 是**机体原点在雷达系里**的坐标; 而转圈量到的是反过来那个 ——
+    **雷达原点在机体系里**的位置 ℓ。两者差一个取负加旋转: lidar_t_body = -R*ℓ。
+
+    而且 R 一旦有俯仰(这台有 15°), -R*ℓ 的水平分量会把 ℓ 的 **z** 混进来, 而 z 是
+    这套动作**测不到**的 —— 绕竖直轴原地转, 传感器装多高圆都一样大。所以这里只给
+    换算式和缺的那一项, 不吐一个能直接抄进 yaml 的 lidar_t_body。
+    """
+    sug = report.get("lidar_R_body_suggestion")
+    print("     这**不是** yaml 里的 lidar_t_body —— 那个是'机体原点在雷达系'的")
+    print("     坐标, 等于 -lidar_R_body*ℓ。而 ℓ 的 z(雷达比机体中心高多少)这套")
+    print("     动作测不到: 绕竖直轴原地转, 装多高圆都一样大, 只能拿尺子量。")
+    if sug and abs(sug["rpy_deg"][1]) > 2.0:
+        print("     这台有 %.0f° 俯仰, -R*ℓ 会把 z 混进水平分量(每 0.1m 高度差约"
+              " %.0f mm), 所以 z 必须补上才算得出来。"
+              % (sug["rpy_deg"][1],
+                 1000 * 0.1 * abs(math.sin(math.radians(sug["rpy_deg"][1])))))
 
 
 def print_report(report: Dict) -> None:
@@ -1085,11 +1107,12 @@ def print_report(report: Dict) -> None:
                   % (sg["spin_rate_rad_s"], sg["radius_m"], sg["fit_residual_m"],
                      sg["n"]))
         if la["method"] == "joint":
-            print("  两段联立解: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
-                  % (la["lidar_t_body_xy"][0], la["lidar_t_body_xy"][1],
+            print("  两段联立解: 雷达在机体系里的水平位置 [%+.3f, %+.3f], 长 %.3f m"
+                  % (la["lidar_xy_in_body"][0], la["lidar_xy_in_body"][1],
                      la["radius_corrected_m"]))
             if la.get("spin_is_clean") is not False:
-                print("  ← **不依赖任何关于步态的假设**, 杆臂用这个值。")
+                print("  ← **不依赖任何关于步态的假设**。")
+                _print_t_body_hint(la, report)
             # 联立是恰定的, 没有自己的残差; 能说明问题的只有每段的圆残差。而圆残差
             # 一偏大, spin_drift 就会被"转得不够原地"污染(实测能污染到连号都反),
             # 这时它跟直线段漂移的差别**不能**读成"两种步态不同" —— 两种成因表象
@@ -1111,9 +1134,10 @@ def print_report(report: Dict) -> None:
                 print("; 圆残差正常, 所以差得多确实是两种步态的区别)"
                       if clean else "; 没量噪声底, 判不了这几段够不够原地)")
         elif la["method"] == "drift_subtracted":
-            print("  扣掉漂移那一项(%.3f m)之后: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
-                  % (la["drift_term_m"], la["lidar_t_body_xy"][0],
-                     la["lidar_t_body_xy"][1], la["radius_corrected_m"]))
+            print("  扣掉漂移那一项(%.3f m)之后: 雷达在机体系里的水平位置 "
+                  "[%+.3f, %+.3f], 长 %.3f m"
+                  % (la["drift_term_m"], la["lidar_xy_in_body"][0],
+                     la["lidar_xy_in_body"][1], la["radius_corrected_m"]))
             why = ("只有一段转速" if la["n_spins"] == 1 else
                    "两段转速只差 %.2f 倍(要 >= 1.3)" % la["rate_spread"])
             print("  ← %s, 只能拿直线段的漂移去扣。**前提是转圈和平移蹭得一样多," % why)
