@@ -36,9 +36,12 @@ yaw 轴顺带能把 hand_lio 的两个外参也标了(它们现在还是占位�
 所以即使只想标外参, 也得带上 --spin-turns(默认 2 圈)。
 """
 import argparse
+import bisect
+import collections
 import json
 import math
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -94,7 +97,12 @@ class OdomBuffer:
 
     def __init__(self, topic: str, keep_sec: float = 60.0):
         self.keep_sec = keep_sec
-        self._samples: List[Tuple[float, ...]] = []
+        # deque + 锁, 不是 list。回调跑在 rospy 的接收线程上, 主线程在 window()
+        # 里遍历同一个容器: list.pop(0) 会让遍历中的下标错位、悄悄漏掉样本, 而且
+        # pop(0) 是 O(N) 的 memmove —— 恰好违背了本类"回调里不做计算"的初衷。
+        # deque.popleft 是 O(1), 锁只保护"取快照"这一下。
+        self._samples = collections.deque()  # type: collections.deque
+        self._lock = threading.Lock()
         self._twist_seen = False
         self._sub = rospy.Subscriber(topic, Odometry, self._cb,
                                      queue_size=200, tcp_nodelay=True)
@@ -111,13 +119,14 @@ class OdomBuffer:
         m = tft.quaternion_matrix(quat)
         t = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
         cov = msg.pose.covariance[0]
-        self._samples.append((t, p.x, p.y, yaw, cov, m[0][2], m[1][2]))
         tw = msg.twist.twist
         if abs(tw.linear.x) + abs(tw.linear.y) + abs(tw.angular.z) > 1e-9:
             self._twist_seen = True
         cutoff = t - self.keep_sec
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.pop(0)
+        with self._lock:
+            self._samples.append((t, p.x, p.y, yaw, cov, m[0][2], m[1][2]))
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
 
     @property
     def twist_seen(self) -> bool:
@@ -127,12 +136,23 @@ class OdomBuffer:
     def window(self, t0: float, t1: float) -> np.ndarray:
         """取 [t0, t1] 区间的样本, 返回 (N, 7): t/x/y/yaw/cov/zx/zy。
 
-        前 5 列的含义不能动 —— measure_window 按下标取。"""
-        rows = [s for s in self._samples if t0 <= s[0] <= t1]
-        return np.array(rows, dtype=float).reshape(-1, 7)
+        前 5 列的含义不能动 —— measure_window 按下标取。
+
+        **只保留最近 keep_sec 秒。** 想留住一段数据就当场取走存成数组, 别存时间
+        区间等到最后再来取 —— 那正是 estimate_lever_arm 之前踩的坑, 见 run_spin。
+        """
+        # hand-lio 的 odom 是 **200Hz**, keep_sec=60 就是 12000 个样本。老写法在锁
+        # 里线性扫全量, 而 estimate_rise_time 一个 run 就要调二十几次 —— 接收线程
+        # 会被压住。改成: 锁里只做一次 C 级拷贝, 二分定位和切片都在锁外做。
+        with self._lock:
+            rows = list(self._samples)
+        lo = bisect.bisect_left(rows, (t0,))
+        hi = bisect.bisect_right(rows, (t1, float("inf")))
+        return np.array(rows[lo:hi], dtype=float).reshape(-1, 7)
 
     def latest(self) -> Optional[Tuple[float, ...]]:
-        return self._samples[-1] if self._samples else None
+        with self._lock:
+            return self._samples[-1] if self._samples else None
 
 
 def fit_line(t: np.ndarray, v: np.ndarray) -> Tuple[float, float]:
@@ -147,8 +167,12 @@ def fit_line(t: np.ndarray, v: np.ndarray) -> Tuple[float, float]:
     k, b = np.polyfit(t, v, 1)
     resid = v - (k * t + b)
     ss_tot = float(((v - v.mean()) ** 2).sum())
-    r2 = 1.0 - float((resid ** 2).sum()) / ss_tot if ss_tot > 1e-12 else 1.0
-    return float(k), r2
+    if ss_tot <= 1e-12:
+        # 完全没动。R² 没定义, 但**不能当成 1.0** —— 那会把"狗根本没动"判成
+        # "完美匀速", 让一个落在死区里的大幅值点带着 v=0 混进线性拟合。实测有
+        # 噪声时走不到这个分支(R² 自然会掉到很低被剔掉), 但理想数据/回放会。
+        return float(k), 0.0
+    return float(k), 1.0 - float((resid ** 2).sum()) / ss_tot
 
 
 def measure_window(win: np.ndarray) -> Optional[Dict[str, float]]:
@@ -183,10 +207,23 @@ class Calibrator:
     def __init__(self, args):
         self.args = args
         self.pub = rospy.Publisher(args.cmd_topic, Twist, queue_size=10)
-        self.odom = OdomBuffer(args.odom_topic)
+        # keep_sec 必须盖得住最长的一次回看: run_ramp 结束后要取整段斜坡, 默认 20s,
+        # 但它是命令行可调的 —— 写死 60 的话 --ramp-duration 一调大就静默截断。
+        self.odom = OdomBuffer(args.odom_topic,
+                               keep_sec=max(60.0, args.ramp_duration + 15.0,
+                                            args.hold + 15.0))
         self.runs: List[Dict] = []
         # 原地转圈那几段的时间区间, 给 estimate_mount_tilt / estimate_lever_arm 用
-        self.spin_windows: List[Tuple[float, float]] = []
+        # **存数组本身, 不存时间区间。** OdomBuffer 只留 60s, 而这几段要等整轮跑
+        # 完(可能 30 分钟后)才用得上 —— 存区间的话回头 window() 取出来是空的,
+        # 三个估计器一起静默返回 None, 报告里那几节直接不打印, 人还以为没这功能。
+        # estimate_lever_arm 从 0651bef 起就一直踩这个坑: 只有默认轴序(yaw 恰好
+        # 最后)才侥幸有数据, 而且也只剩最后 60s 那一点。
+        self.spin_windows: List[np.ndarray] = []
+        # 跳过统计。一次 run 失败只打一行 logwarn, 跑满半小时才发现一条数据都没
+        # 采到就太晚了 —— 结尾按这个给汇总和告警。
+        self.attempted = 0
+        self.skipped = {"stationary": 0, "window": 0}
         self.started_at = time.time()
 
     # ---- 安全 ----
@@ -204,6 +241,52 @@ class Calibrator:
     def check_budget(self) -> None:
         if time.time() - self.started_at > self.args.max_runtime:
             raise RuntimeError("超过 --max-runtime %.0fs, 主动中止" % self.args.max_runtime)
+
+    def measure_noise_floor(self, seconds: float = 3.0) -> Dict[str, float]:
+        """静止测几秒, 看 odom 的抖动会不会把 --still-xy/--still-yaw 卡死。
+
+        wait_stationary 判的是"窗口内离均值的**最大**径向偏差", 极值统计对噪声
+        和样本数都敏感 —— 阈值要是压在噪声底以下, 每一步都等不到静止, 整轮下来
+        一条数据都采不到, 而且只留一堆 logwarn。所以开跑前先量一遍, 拿的就是
+        wait_stationary 那个统计量本身, 不做正态假设去推。
+        """
+        print("  静止测 %.0fs 噪声底(狗现在别动)..." % seconds)
+        self.publish_zero(seconds)
+        t1 = time.time()
+        win = self.odom.window(t1 - seconds + 0.3, t1)
+        if len(win) < 20:
+            raise SystemExit("静止段只收到 %d 个 odom 样本, 检查 odom 频率。" % len(win))
+        # 按 wait_stationary 用的窗长切片, 取各片统计量的最大值
+        span = 0.7
+        xy, yw = [], []
+        t = win[0, 0]
+        while t + span <= win[-1, 0]:
+            sub = win[(win[:, 0] >= t) & (win[:, 0] <= t + span)]
+            if len(sub) >= 5:
+                xy.append(float(np.hypot(sub[:, 1] - sub[:, 1].mean(),
+                                         sub[:, 2] - sub[:, 2].mean()).max()))
+                yw.append(float(np.ptp(np.unwrap(sub[:, 3]))))
+            t += 0.1
+        if not xy:
+            raise SystemExit("静止段切不出 0.7s 的子窗口, 检查 odom 频率。")
+        out = {"noise_xy": max(xy), "noise_yaw": max(yw),
+               "rate_hz": float(len(win)) / (win[-1, 0] - win[0, 0]),
+               "n": int(len(win))}
+        print("    odom %.0f Hz; 0.7s 窗口内抖动上界 xy %.4f m / yaw %.4f rad"
+              % (out["rate_hz"], out["noise_xy"], out["noise_yaw"]))
+        bad = []
+        if out["noise_xy"] >= self.args.still_xy:
+            bad.append("--still-xy %.3f (建议 %.3f)"
+                       % (self.args.still_xy, 1.5 * out["noise_xy"]))
+        if out["noise_yaw"] >= self.args.still_yaw:
+            bad.append("--still-yaw %.3f (建议 %.3f)"
+                       % (self.args.still_yaw, 1.5 * out["noise_yaw"]))
+        if bad:
+            raise SystemExit(
+                "odom 静止噪声已经超过判静止的阈值: %s\n"
+                "  照这个跑下去每一步都等不到静止, 整轮采不到数据。放宽阈值再跑,\n"
+                "  或者先查 odom 为什么这么抖。" % "; ".join(bad))
+        return out
 
     def wait_stationary(self, timeout: float = 8.0) -> bool:
         """等狗真的停稳。上一轮的余速没退干净就开下一轮, 测出来的稳态是偏的。"""
@@ -223,7 +306,9 @@ class Calibrator:
     def run_step(self, axis: str, value: float) -> Optional[Dict]:
         """一次阶跃: 静止确认 → 阶跃保持 → 取稳态窗口 → 回零。"""
         self.check_budget()
+        self.attempted += 1
         if not self.wait_stationary():
+            self.skipped["stationary"] += 1
             rospy.logwarn("等不到静止, 跳过 %s=%+.3f", axis, value)
             return None
 
@@ -239,6 +324,7 @@ class Calibrator:
         win = self.odom.window(t_step + self.args.settle, t_step + self.args.hold)
         meas = measure_window(win)
         if meas is None:
+            self.skipped["window"] += 1
             rospy.logwarn("%s=%+.3f 的窗口取不到有效样本(样本太少或定位失败)", axis, value)
             return None
 
@@ -278,7 +364,8 @@ class Calibrator:
         return float("nan")
 
     # ---- 原地转圈: 给"安装倾角"和"杆臂"两个圆拟合提供全朝向覆盖 ----
-    def run_spin(self, turns: float, rate_cmd: float) -> Optional[Dict]:
+    def run_spin(self, turns: float, rate_cmd: float,
+                 expected_rate: Optional[float] = None) -> Optional[Dict]:
         """原地匀速转 turns 圈, 单独记一段窗口。
 
         为什么不复用 yaw 的阶跃数据: 一次阶跃只转 0.5rad/s x 3.5s ≈ 100°, 而且正负
@@ -291,12 +378,18 @@ class Calibrator:
         rate = rospy.Rate(self.args.rate)
         cmd = make_twist("yaw", rate_cmd)
         t0 = time.time()
-        # 超时兜底: 万一命令值落在死区里狗根本不转, 不能死等
-        timeout = turns * 2 * math.pi / max(abs(rate_cmd), 1e-3) * 2.5 + 10.0
+        # 超时兜底: 万一命令值落在死区里狗根本不转, 不能死等。
+        # **按实测转速算, 不是按命令值。** yaw 有死区, 实际转速能只有命令的 40%,
+        # 按命令值再乘个 2.5 的余量恰好只剩 4% —— 死区再大一点就转不满圈, 而转不满
+        # 圈时两个圆拟合都会静默退化。expected_rate 由调用方从前面的 yaw 阶跃里取。
+        ref = abs(expected_rate) if expected_rate else abs(rate_cmd)
+        timeout = turns * 2 * math.pi / max(ref, 1e-3) * 2.5 + 10.0
         while not rospy.is_shutdown():
             self.pub.publish(cmd)
             rate.sleep()
-            win = self.odom.window(t0, time.time() + 1.0)
+            # 从 t0+settle 起算, 跟最后交给圆拟合的那段窗口对齐 —— 从 t0 起算的话
+            # 前 settle 秒的转动也被计进去, --spin-turns 2 实际只留下 1.9 圈可用。
+            win = self.odom.window(t0 + self.args.settle, time.time() + 1.0)
             if len(win) > 10 and abs(np.unwrap(win[:, 3])[-1] - win[0, 3]) >= turns * 2 * math.pi:
                 break
             if time.time() - t0 > timeout:
@@ -311,7 +404,7 @@ class Calibrator:
         turned = float(abs(np.unwrap(win[:, 3])[-1] - win[0, 3]))
         print("    原地转圈: 命令 %.2f rad/s, 实际转过 %.0f° (%.1f 圈), %d 个样本"
               % (rate_cmd, math.degrees(turned), turned / (2 * math.pi), len(win)))
-        self.spin_windows.append((t0 + self.args.settle, t_end))
+        self.spin_windows.append(win)      # 当场存下来, 见 __init__ 的注释
         return {"cmd": rate_cmd, "turned_rad": turned, "n": int(len(win))}
 
     # ---- 慢斜坡(给人看一张图, 不参与拟合) ----
@@ -343,7 +436,10 @@ class Calibrator:
 
 def preflight(args) -> Dict:
     """开跑之前必须过的几关。任何一关不过就直接退出 —— 带着错误的前提跑完整套,
-    数据全是废的, 而且要几十分钟才能发现。"""
+    数据全是废的, 而且要几十分钟才能发现。
+
+    还有一关需要 odom 缓冲区, 在这之后: Calibrator.measure_noise_floor。
+    """
     info: Dict[str, object] = {}
     cmd_topic = rospy.resolve_name(args.cmd_topic)
 
@@ -372,7 +468,7 @@ def preflight(args) -> Dict:
             % (cmd_topic, ", ".join(others))
         )
 
-    # ② odom 有没有在来, 新不新鲜, 定位好不好
+    # ② odom 有没有在来, 新不新鲜, 定位好不好(③ 时钟检查在这个循环里)
     print("  等 %s ..." % args.odom_topic)
     deadline = time.time() + 10.0
     buf_ready = False
@@ -387,6 +483,22 @@ def preflight(args) -> Dict:
             raise SystemExit(
                 "odom 的 covariance[0]=%.3f >= %.2f, 定位处于失败状态, 位姿不可信 "
                 "—— 先把定位搞好再标定。" % (cov, POSE_COV_BAD))
+        # ③ 时钟。样本时间用的是 msg.header.stamp(ROS 时间/发布端时钟), 而切窗口
+        #    用的是 time.time()(本机墙钟)。两者不可比的话所有窗口都静默取空, 表现
+        #    出来是"样本太少", 排查方向完全跑偏。这里一次性把三个钟对上。
+        ros_now, wall = rospy.Time.now().to_sec(), time.time()
+        stamp = msg.header.stamp.to_sec() or ros_now
+        info["clock_ros_minus_wall"] = float(ros_now - wall)
+        info["clock_odom_lag"] = float(ros_now - stamp)
+        if abs(ros_now - wall) > 1.0:
+            raise SystemExit(
+                "ROS 时间跟墙钟差 %.1fs —— 多半是 use_sim_time 开着。脚本用 "
+                "time.time() 切窗口、用 header.stamp 存样本, 两者不可比就什么都测"
+                "不到。" % (ros_now - wall))
+        if abs(ros_now - stamp) > 1.0:
+            raise SystemExit(
+                "odom 的 header.stamp 比现在慢 %.1fs —— 要么消息是陈的, 要么手持"
+                "设备跟板子的时钟没同步。先把时钟对上再标定。" % (ros_now - stamp))
         buf_ready = True
         break
     if not buf_ready:
@@ -638,8 +750,11 @@ def _compose_from_u_gamma(dx: float, dy: float, gamma: float) -> np.ndarray:
     r1 = math.cos(phi) * a + math.sin(phi) * b
     r2 = -math.sin(phi) * a + math.cos(phi) * b
     R = np.vstack([r1, r2, u])
-    if np.linalg.det(R) < 0:      # 保证是旋转不是镜像
-        R[1] = -R[1]
+    # (a, b, u) 是右手正交基(b = u x a, 于是 a x b = u), r1/r2 是 (a, b) 在平面内
+    # 转了 φ, 所以 r1 x r2 ≡ u, det ≡ +1 —— 不需要翻号分支。之前写了一个
+    # "det<0 就翻第二行"的兜底, 2 万组随机输入无一触发, 而且真触发反倒会破坏
+    # γ 约束(γ 是第一**列**的水平角, 依赖 r2[0])。留个断言挡住将来的改坏。
+    assert np.linalg.det(R) > 0.9, "构造出的不是旋转矩阵, 正交基的手性搞反了"
     return R
 
 
@@ -701,47 +816,113 @@ def build_lidar_R_body(tilt: Optional[Dict], mount_yaw: Optional[Dict]) -> Optio
     }
 
 
-def estimate_lever_arm(windows: List[np.ndarray]) -> Optional[Dict]:
-    """从 yaw 原地旋转的 odom 轨迹估 lidar 相对机体中心的杆臂。
+def estimate_lever_arm(windows: List[np.ndarray],
+                       drift: Optional[Dict[str, float]] = None,
+                       gamma: Optional[float] = None) -> Optional[Dict]:
+    """从原地转圈估雷达相对机体中心的杆臂(hand_lio 的 lidar_t_body)。
 
-    原地纯 yaw 旋转时, 如果雷达不在机体中心, odom 的 xy 会画一个圆, **半径就是
-    杆臂长度**。`hand_lio.yaml` 的 lidar_t_body 现在还是占位零向量(那份 yaml 自己
-    注明"装好后必须自己标定"), 这里是白捡的。
+    原地纯 yaw 旋转时雷达画一个圆, 半径就是杆臂长度 —— **但"纯"字是个陷阱**。
+    狗迈腿时往一边蹭的那点横向速度 w 也在转, 用复数写清楚(ψ = ωt):
 
-    注意反过来也成立: **yaw 标定时 x/y 方向的"耦合"有一部分是杆臂造成的假象**,
-    不是真的平移耦合 —— 分析耦合矩阵时要记得这一条。
+        ṗ_body = e^{iψ}·w          =>  p_body = C + e^{iψ}·w/(iω)
+        p_lidar = p_body + e^{iψ}·ℓ =>  p_lidar = C + e^{iψ}·(ℓ − i·w/ω)
+
+    所以**量到的半径是 |ℓ − i·w/ω|, 不是 |ℓ|**: 漂移给杆臂加了一项 w/ω, 方向还
+    转了 90°。假狗端到端跑出来的例子: 真杆臂 0.222m、漂移 0.03m/s、实际转速
+    0.351rad/s, 量到 0.307m —— 偏了 38%, 而且圆拟合残差只有 0.001m, 光看残差
+    完全发现不了。
+
+    好在这一项是可以扣掉的: 上面那式子说 (p_lidar − C)·e^{−iψ} 是个常数向量, 把
+    它按 ψ 解出来就拿到了**带方向的** ℓ − i·w/ω, 再加回 i·w/ω 就是 ℓ 本身。
+    w 来自 estimate_mount_yaw(它本来就要把漂移从 γ 里剥出来), ω 直接从这段数据
+    拟合。
+
+    最后还要转一次系: 上面整套都在"雷达 yaw 系"里算(ψ 是 odom 报的 yaw), 而
+    lidar_t_body 要的是**机体系**, 两者差一个 γ, 所以结果再乘 Rz(−γ)。长度不受
+    影响, 但方向受 —— 假狗实测: 不转的话报 [0.213, 0.050], 转完 [0.216, 0.034],
+    真值 (0.220, 0.030)。
     """
-    # 拟合圆: (x-cx)² + (y-cy)² = R² 线性化成 2x·cx + 2y·cy + (R²-cx²-cy²) = x²+y²,
-    # 直接最小二乘。用**原地转圈**那几段而不是逐次 yaw 阶跃 —— 阶跃只转 100° 左右
-    # 而且正负交替转回原处, 朝向覆盖不足, 圆拟合条件数极差。
+    # **每段各算各的, 不能 vstack。** 两段转圈在场地上的位置不一样(圆心不同),
+    # 时间轴也不连续, 拼起来拟合出的圆和角速度都没有意义。目前每轮只有一段, 所以
+    # 这跟 vstack 的结果逐位相同 —— 写成这样是为了将来真跑多段时不出错。
     chunks = [w for w in windows if len(w) >= 50]
     if not chunks:
         return None
-    win = np.vstack(chunks)
-    if len(win) < 30:
+    per, weights = [], []
+    for win in chunks:
+        x, y = win[:, 1], win[:, 2]
+        # 拟合圆: (x-cx)² + (y-cy)² = R² 线性化成 2x·cx + 2y·cy + (R²-cx²-cy²) = x²+y²。
+        # 用**原地转圈**那几段而不是逐次 yaw 阶跃 —— 阶跃只转 100° 左右而且正负
+        # 交替转回原处, 朝向覆盖不足, 圆拟合条件数极差。
+        A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+        sol, *_ = np.linalg.lstsq(A, x ** 2 + y ** 2, rcond=None)
+        cx, cy, c = sol
+        r2 = c + cx ** 2 + cy ** 2
+        if r2 <= 0:
+            continue
+        radius = float(math.sqrt(r2))
+        # 带方向的 (ℓ − i·w/ω): 把 (p − C) 按 ψ 转回去, 理论上是个常向量
+        psi = np.unwrap(win[:, 3])
+        cp, sp = np.cos(psi), np.sin(psi)
+        per.append((radius,
+                    float(np.abs(np.hypot(x - cx, y - cy) - radius).mean()),
+                    float(np.mean(cp * (x - cx) + sp * (y - cy))),
+                    float(np.mean(-sp * (x - cx) + cp * (y - cy))),
+                    fit_line(win[:, 0] - win[0, 0], psi)[0],
+                    float(cx), float(cy)))
+        weights.append(float(len(win)))
+    if not per:
         return None
-    x, y = win[:, 1], win[:, 2]
-    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
-    sol, *_ = np.linalg.lstsq(A, x ** 2 + y ** 2, rcond=None)
-    cx, cy, c = sol
-    r2 = c + cx ** 2 + cy ** 2
-    if r2 <= 0:
-        return None
-    radius = float(math.sqrt(r2))
-    resid = np.abs(np.hypot(x - cx, y - cy) - radius)
-    return {
+    w_arr = np.array(weights)
+    radius, resid_mean, vx, vy, omega, cx, cy = (
+        float(np.average([p[i] for p in per], weights=w_arr)) for i in range(7))
+
+    out = {
         "radius_m": radius,
-        "center": [float(cx), float(cy)],
-        "fit_residual_m": float(resid.mean()),
+        "center": [cx, cy],
+        "n_spins": len(per),
+        "fit_residual_m": resid_mean,
+        "apparent_vec": [vx, vy],
+        "spin_rate_rad_s": float(omega),
+        "drift_corrected": False,
         "note": ("圆拟合残差远大于半径时这个估计不可信(说明这段不是纯原地旋转, "
-                 "或者杆臂本来就接近 0)。半径 ≈ |lidar_t_body| 的水平分量。"),
+                 "或者杆臂本来就接近 0)。**残差小不代表半径对** —— 底盘横向漂移"
+                 "会给半径加一项 w/ω 而完全不影响残差, 见 docstring。"),
     }
+    wx = (drift or {}).get("wx")
+    wy = (drift or {}).get("wy")
+    if wx is not None and wy is not None and abs(omega) > 0.05:
+        # ℓ = vec + i·w/ω;  复数乘 i 就是转 +90°: (wx, wy) -> (-wy, wx)
+        lx, ly = vx - wy / omega, vy + wx / omega
+        if gamma is not None:      # 雷达 yaw 系 -> 机体系
+            cg, sg = math.cos(gamma), math.sin(gamma)
+            lx, ly = cg * lx + sg * ly, -sg * lx + cg * ly
+        out.update({
+            "drift_corrected": True,
+            "lidar_t_body_xy": [lx, ly],
+            "radius_corrected_m": float(math.hypot(lx, ly)),
+            "drift_term_m": float(math.hypot(wx, wy) / abs(omega)),
+        })
+    return out
 
 
 def print_report(report: Dict) -> None:
     print("\n" + "=" * 72)
     print("标定结果")
     print("=" * 72)
+    sk = report.get("skipped") or {}
+    n_try, n_skip = sk.get("attempted", 0), sk.get("stationary", 0) + sk.get("window", 0)
+    if n_try and n_skip:
+        # 单次失败只有一行 logwarn, 滚上去就看不见了。整轮的比例必须在报告顶上,
+        # 不然"跑了半小时其实大半白跑"这件事不会有人注意到。
+        frac = float(n_skip) / n_try
+        print("\n%s跳过 %d/%d 次阶跃 (%.0f%%): 等不到静止 %d, 窗口无效 %d"
+              % ("!! " if frac > 0.3 else "", n_skip, n_try, 100 * frac,
+                 sk.get("stationary", 0), sk.get("window", 0)))
+        if frac > 0.3:
+            print("   跳过这么多, 下面的拟合都别当真。等不到静止就放宽 --still-xy/")
+            print("   --still-yaw(开跑时打的噪声底给了建议值), 窗口无效多半是定位")
+            print("   在失败(cov >= %.2f)。" % POSE_COV_BAD)
     for axis, e in report["analysis"]["per_axis"].items():
         print("\n[%s]  单位 %s   厂商下界 %.2f   有效 run %d 次"
               % (axis, e["unit"], e["vendor_lower"], e["n_runs"]))
@@ -773,8 +954,23 @@ def print_report(report: Dict) -> None:
     la = report.get("lever_arm")
     if la:
         print("\n顺带估的杆臂(lidar 相对机体中心, 来自 yaw 原地旋转):")
-        print("  半径 %.3f m   圆拟合残差 %.3f m" % (la["radius_m"], la["fit_residual_m"]))
+        print("  量到的圆半径 %.3f m   圆拟合残差 %.3f m   实际转速 %.2f rad/s"
+              % (la["radius_m"], la["fit_residual_m"], la["spin_rate_rad_s"]))
+        if la.get("drift_corrected"):
+            print("  扣掉底盘横向漂移那一项(%.3f m)之后: lidar_t_body 水平分量 "
+                  "[%+.3f, %+.3f], 长 %.3f m"
+                  % (la["drift_term_m"], la["lidar_t_body_xy"][0],
+                     la["lidar_t_body_xy"][1], la["radius_corrected_m"]))
+            print("  ← 用**扣过**的这个值。漂移会给半径硬加 w/ω 而完全不影响圆拟合")
+            print("    残差, 光看残差发现不了(假狗实测: 0.222m 量成 0.307m)。")
+        else:
+            print("  ← 没扣底盘横向漂移(x/y 轴没跑, 或者转速太低), 这个半径可能偏大:")
+            print("    漂移会给它硬加一项 w/ω, 而且不影响圆拟合残差。")
     tilt = report.get("mount_tilt")
+    if not tilt:
+        # 同样是"静默少一节"的毛病, 这里显式说一句为什么没有。
+        print("\n没有安装倾角/杆臂的估计: 要么没跑 yaw 轴, 要么 --spin-turns 设了 0,")
+        print("  要么转圈那段样本不足(<50)。这两个外参靠原地整圈覆盖才估得出来。")
     if tilt:
         ok = "" if tilt["trustworthy"] else "   ← 不可信(yaw 覆盖 %.0f°/残差 %.4f)" % (
             tilt["yaw_span_deg"], tilt["residual"])
@@ -833,9 +1029,12 @@ def main() -> int:
     ap.add_argument("--axis", action="append", choices=list(AXES),
                     help="要标的轴, 可重复。不给就三个轴都标 —— 但**建议先只跑 "
                          "--axis yaw**: 原地转不占场地、风险最小, 先验证整条流程")
-    ap.add_argument("--amplitudes", help="覆盖默认扫描幅值, 逗号分隔(只在标单轴时有意义)")
-    ap.add_argument("--verify", help="验证集幅值, 逗号分隔。这些点照样测但**不参与拟合**, "
-                                     "用来检查拟合的预测准不准 —— 没有这一步就只是拟合、不算验证")
+    ap.add_argument("--amplitudes", help="覆盖默认扫描幅值, 逗号分隔。**只能配合单轴使用**"
+                                         "(多轴时三个轴量纲都不同), 给了多个轴会直接报错")
+    ap.add_argument("--verify", help="验证集幅值: 这些点照样测但**不参与拟合**, 用来检查"
+                                     "预测准不准 —— 没有这一步就只是拟合、不算验证。"
+                                     "写 '0.33,0.62' 是**所有轴都用这组**(三个轴量纲不同, "
+                                     "多半不是你要的); 按轴给写 'x=0.33,0.62 y=0.42'")
     ap.add_argument("--repeats", type=int, default=3,
                     help="每个幅值每个方向重复几次。至少 3 次, 否则分不清 5%% 的真实"
                          "误差和噪声")
@@ -879,7 +1078,25 @@ def main() -> int:
         (k, float(v)) for k, v in
         (kv.split("=", 1) for kv in args.vendor_lower.split(",") if kv.strip())
     )
-    verify_amps = [float(a) for a in args.verify.split(",")] if args.verify else []
+    # --verify: 'a,b' = 所有轴通用; 'x=a,b y=c' = 按轴给。两种写法都归一成 per-axis,
+    # 免得像第一版那样把 x 的验证幅值悄悄塞进 yaw 的扫描表、还从 yaw 的拟合里排除。
+    verify_amps: Dict[str, List[float]] = dict((a, []) for a in AXES)
+    for chunk in (args.verify or "").split():
+        if "=" in chunk:
+            ax, _, vals = chunk.partition("=")
+            if ax not in AXES:
+                raise SystemExit("--verify 里的轴名 %r 不认识, 只能是 %s"
+                                 % (ax, "/".join(AXES)))
+            verify_amps[ax] = [float(v) for v in vals.split(",") if v.strip()]
+        else:
+            for ax in AXES:
+                verify_amps[ax] += [float(v) for v in chunk.split(",") if v.strip()]
+    if args.amplitudes and len(args.axis) > 1:
+        raise SystemExit("--amplitudes 只能配合单个 --axis 使用(三个轴量纲不同), "
+                         "现在给了 %s。" % ", ".join(args.axis))
+
+    def is_verify(run: Dict) -> bool:
+        return abs(run["cmd"]) in set(verify_amps[run["axis"]])
 
     rospy.init_node("calibrate_cmd_vel", anonymous=True, disable_signals=True)
     print("== /cmd_vel 标定 ==")
@@ -890,14 +1107,15 @@ def main() -> int:
           % (info["cmd_topic"], info.get("odom_cov", float("nan"))))
 
     cal = Calibrator(args)
+    info["noise_floor"] = cal.measure_noise_floor()
     ramps: List[Dict] = []
     spins: List[Optional[Dict]] = []
     interrupted = False
     try:
         for axis in args.axis:
             amps = ([float(a) for a in args.amplitudes.split(",")]
-                    if args.amplitudes and len(args.axis) == 1 else AXES[axis]["amps"])
-            amps = sorted(set(amps) | set(verify_amps))
+                    if args.amplitudes else AXES[axis]["amps"])
+            amps = sorted(set(amps) | set(verify_amps[axis]))
             print("\n[%s] 扫描 %d 个幅值 x 2 方向 x %d 次 = %d 次阶跃"
                   % (axis, len(amps), args.repeats, len(amps) * 2 * args.repeats))
             for rep in range(args.repeats):
@@ -906,12 +1124,24 @@ def main() -> int:
                     for sign in (1, -1):
                         cal.run_step(axis, sign * amp)
             if axis == "yaw" and args.spin_turns > 0:
-                # 放在 yaw 阶跃**之后**: 那时已经知道哪个幅值能真的转起来了, 但简单
-                # 起见直接取最大幅值的 0.7 倍, 稳稳在死区之上。
-                print("  [yaw] 原地转 %.1f 圈(给安装倾角/杆臂两个圆拟合用) ..."
-                      % args.spin_turns)
-                spins.append(cal.run_spin(args.spin_turns,
-                                          0.7 * max(AXES["yaw"]["amps"])))
+                # 放在 yaw 阶跃**之后**, 就是为了能用实测结果挑命令值: 直接取
+                # "实测转速最接近 0.5 rad/s 的那个幅值"。不用 0.7*最大幅值那种拍脑袋
+                # 的写法 —— 死区吃掉多少完全取决于这台狗, 拍出来的值可能根本转不动,
+                # 也可能快得打滑。挑不出来(yaw 全落死区)才退回去用幅值。
+                good = [r for r in cal.runs
+                        if r["axis"] == "yaw" and r["cmd"] > 0
+                        and r["r2_main"] >= args.min_r2 and r["main"] > 0.15]
+                if good:
+                    pick = min(good, key=lambda r: abs(r["main"] - 0.5))
+                    spin_cmd, spin_rate = pick["cmd"], pick["main"]
+                    print("  [yaw] 原地转 %.1f 圈: 用 %.2f rad/s (实测能转出 %.2f)"
+                          % (args.spin_turns, spin_cmd, spin_rate))
+                else:
+                    spin_cmd, spin_rate = 0.7 * max(AXES["yaw"]["amps"]), None
+                    print("  [yaw] 原地转 %.1f 圈: yaw 阶跃没一个转得动, 退回用 "
+                          "%.2f rad/s" % (args.spin_turns, spin_cmd))
+                spins.append(cal.run_spin(args.spin_turns, spin_cmd,
+                                          expected_rate=spin_rate))
             if args.ramp:
                 print("  [%s] 慢斜坡 %.0fs ..." % (axis, args.ramp_duration))
                 ramps.append(cal.run_ramp(axis))
@@ -923,13 +1153,13 @@ def main() -> int:
         print("\n发零刹停 ...")
         cal.publish_zero(max(1.5, 3.0 / max(args.rate, 1.0) + 1.5))
 
-    fit_runs = [r for r in cal.runs if abs(r["cmd"]) not in set(verify_amps)]
+    fit_runs = [r for r in cal.runs if not is_verify(r)]
     analysis = analyse(fit_runs, args)
 
     # 验证集: 用拟合结果预测, 跟实测比
     verification = []
     for r in cal.runs:
-        if abs(r["cmd"]) not in set(verify_amps) or r["r2_main"] < args.min_r2:
+        if not is_verify(r) or r["r2_main"] < args.min_r2:
             continue
         e = analysis["per_axis"].get(r["axis"]) or {}
         f = e.get("pos" if r["cmd"] > 0 else "neg")
@@ -942,8 +1172,7 @@ def main() -> int:
             "error": err, "error_frac": err / r["main"] if abs(r["main"]) > 1e-6 else float("nan"),
         })
 
-    spin_windows = [cal.odom.window(a, b) for a, b in cal.spin_windows]
-    tilt = estimate_mount_tilt(spin_windows)
+    tilt = estimate_mount_tilt(cal.spin_windows)
     mount_yaw = estimate_mount_yaw(fit_runs, args)
 
     report = {
@@ -952,10 +1181,14 @@ def main() -> int:
         "args": {k: v for k, v in vars(args).items()},
         "preflight": info,
         "odom_twist_filled": cal.odom.twist_seen,
+        "skipped": dict(cal.skipped, attempted=cal.attempted),
         "runs": cal.runs,
         "analysis": analysis,
         "verification": verification,
-        "lever_arm": estimate_lever_arm(spin_windows),
+        "lever_arm": estimate_lever_arm(
+            cal.spin_windows, (mount_yaw or {}).get("chassis_drift_mps"),
+            (mount_yaw or {}).get("gamma_rad") if (mount_yaw or {}).get("consistent")
+            else None),
         "mount_tilt": tilt,
         "mount_yaw": mount_yaw,
         "lidar_R_body_suggestion": build_lidar_R_body(tilt, mount_yaw),
