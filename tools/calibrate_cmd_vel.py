@@ -880,18 +880,28 @@ def estimate_lever_arm(windows: List[np.ndarray],
     还各自解耦成 2x2), 所以它**没有自己的残差** —— 拟合永远"完美"。唯一的质量指标
     是每段的**圆拟合残差**, 而它约束的是"这段到底是不是绕着一个固定圆心转"。
 
-    实测(给真圆叠加一个世界系平移, 模拟"转得不够原地"):
+    实测(给真圆叠加一个世界系平移, 模拟"转得不够原地")。**两段被污染得一不一样,
+    结论完全不同**:
 
-        世界系漂移   圆残差      ℓ 误差   估出的 spin_w
-        0            0.0009m     0.0cm    (+0.030, -0.015)  <- 真值
-        0.005 m/s    0.028m      0.0cm    (+0.025, -0.015)
-        0.02  m/s    0.095m      0.0cm    (+0.010, -0.015)
-        0.05  m/s    0.211m      0.0cm    (-0.020, -0.015)  <- 连号都反了
+      两段同样地脏(共模)          圆残差    ℓ 误差   估出的 spin_w
+        0(干净)                   0.0009m   0.0cm    (+0.030, -0.015) <- 真值
+        都漂 0.02 m/s             0.095m    0.0cm    (+0.010, -0.015)
+        都漂 0.05 m/s             0.211m    0.0cm    (-0.020, -0.015) <- 号都反了
 
-    **ℓ 出奇地稳, w 则完全被污染。** 所以圆残差偏大时: 杆臂照样能用, 但
-    spin_drift_mps 不可信 —— 尤其不能拿它跟直线段的漂移比较去下"两种步态不同"的
-    结论, 因为"转得不够原地"会造成一模一样的表象。noise_floor_m 传进来的话(取
-    measure_noise_floor 的 noise_xy)就用它当门槛, 自动按这台机器的噪声标定。
+      两段脏得不一样(差模)                  ℓ 误差
+        只有快段漂 0.05                     15.2cm
+        只有慢段漂 0.05                     15.1cm
+        两段都漂 0.05 但方向不同             21.4cm
+
+    共模时 ℓ 侥幸不受影响(污染全被 w 吃了), **差模时 ℓ 一起坏, 而且坏得很厉害**。
+    两段转圈本来就在场地不同位置、不同时刻跑的, 差模才是常态。**而圆残差分不出是
+    共模还是差模** —— 所以残差一超标, 正确的处理是**重转, 别用这次的杆臂**, 不是
+    "杆臂还能用"。
+
+    残差正常时才轮得到那个次要结论: spin_drift_mps 可信, 可以拿它跟直线段的漂移
+    比较去判两种步态一不一样; 残差超标时这个比较毫无意义, 因为"转得不够原地"会
+    造出一模一样的表象。noise_floor_m 传进来的话(取 measure_noise_floor 的
+    noise_xy)就用它当门槛, 自动按这台机器的噪声标定。
 
     这个门槛的软肋: noise_floor_m 量的是"发零命令时的抖动", **狗在零命令下蠕动的
     话它会被抬高**, 门控跟着变松(假狗上就是这样: 它零命令时仍横移 0.03m/s, 量出来
@@ -942,16 +952,32 @@ def estimate_lever_arm(windows: List[np.ndarray],
     rates = [abs(sg["spin_rate_rad_s"]) for sg in usable]
     spread = (max(rates) / min(rates)) if len(usable) > 1 else 1.0
     main_seg = max(segs, key=lambda d: d["n"])
-    # 这三个顶层字段每条分支都填, 免得外部读 JSON 时字段不齐。
-    # spin_is_clean: 圆残差够小 -> 这几段确实是绕固定圆心转的。见 docstring。
-    clean = None
-    if noise_floor_m:
-        clean = all(sg["fit_residual_m"] <= max(noise_floor_m, 1e-4) for sg in segs)
+
+    def quality(used: List[Dict]) -> Dict:
+        """按**真正参与这条分支的那些段**判干净不干净, 并把最差的那段点出来。
+
+        两处讲究:
+        * 判据取所有参与段里**最差**的残差, 不是"样本最多那段"的。两者不是一回事:
+          一段干净(样本多)+一段脏(样本少)时, 前者说不干净、后者是个小数, 告警会
+          打成"残差偏大(0.001m, 超过噪声底)"而 0.001 根本没超 —— 自相矛盾。
+        * 参与集按分支算: 联立看 usable, 退回只看 main_seg。判据算在和实际使用
+          不同的集合上, 这个坑前面已经踩过两次了。
+        """
+        worst = max(used, key=lambda d: d["fit_residual_m"])
+        return {
+            "spin_is_clean": (worst["fit_residual_m"] <= max(noise_floor_m, 1e-4)
+                              if noise_floor_m else None),
+            "worst_fit_residual_m": worst["fit_residual_m"],
+            "worst_segment_rate_rad_s": worst["spin_rate_rad_s"],
+        }
+
+    # 这三个顶层字段每条分支都填, 免得外部读 JSON 时字段不齐。它们描述的是
+    # **样本最多那段**, 跟上面 quality() 报的"最差那段"不是一回事, 别混用。
     out = {"segments": segs, "n_spins": len(segs), "rate_spread": spread,
            "radius_m": main_seg["radius_m"],
            "fit_residual_m": main_seg["fit_residual_m"],
-           "spin_rate_rad_s": main_seg["spin_rate_rad_s"],
-           "spin_is_clean": clean}
+           "spin_rate_rad_s": main_seg["spin_rate_rad_s"]}
+    out.update(quality(segs))
 
     if len(usable) > 1 and spread >= 1.3:
         # 联立: 每段两个方程, 未知 (ℓx, ℓy, wx, wy)。按样本数加权。
@@ -967,6 +993,7 @@ def estimate_lever_arm(windows: List[np.ndarray],
             return out
         sol, *_ = np.linalg.lstsq(np.array(A), np.array(b), rcond=None)
         lx, ly = to_body(float(sol[0]), float(sol[1]))
+        out.update(quality(usable))        # 联立只用 usable, 判据也只看这些段
         out.update({
             "method": "joint",
             "lidar_t_body_xy": [lx, ly],
@@ -981,6 +1008,7 @@ def estimate_lever_arm(windows: List[np.ndarray],
 
     # 只有一段(或者两段转速太接近): 退回用平移段量到的 w
     sg = main_seg
+    out.update(quality([main_seg]))        # 退回时只有这一段参与
     wx, wy = (drift or {}).get("wx"), (drift or {}).get("wy")
     if wx is not None and wy is not None and abs(sg["spin_rate_rad_s"]) > 0.05:
         om = sg["spin_rate_rad_s"]
@@ -1060,7 +1088,8 @@ def print_report(report: Dict) -> None:
             print("  两段联立解: 水平分量 [%+.3f, %+.3f], 长 %.3f m"
                   % (la["lidar_t_body_xy"][0], la["lidar_t_body_xy"][1],
                      la["radius_corrected_m"]))
-            print("  ← **不依赖任何关于步态的假设**, 杆臂用这个值。")
+            if la.get("spin_is_clean") is not False:
+                print("  ← **不依赖任何关于步态的假设**, 杆臂用这个值。")
             # 联立是恰定的, 没有自己的残差; 能说明问题的只有每段的圆残差。而圆残差
             # 一偏大, spin_drift 就会被"转得不够原地"污染(实测能污染到连号都反),
             # 这时它跟直线段漂移的差别**不能**读成"两种步态不同" —— 两种成因表象
@@ -1071,10 +1100,12 @@ def print_report(report: Dict) -> None:
                      "" if clean is not False else "   ← 不可信, 见下"))
             cd = (report.get("mount_yaw") or {}).get("chassis_drift_mps") or {}
             if clean is False:
-                print("  !! 圆拟合残差偏大(%.3f m, 超过静止噪声底), 说明这几段**转得"
-                      "不够原地**" % la["fit_residual_m"])
-                print("     —— 杆臂不受影响(实测世界系漂到 0.05m/s 时 ℓ 误差仍是")
-                print("     0.0cm), 但上面那个转圈漂移不可信, 别拿它跟直线段的比。")
+                print("  !! 转速 %+.2f rad/s 那段的圆拟合残差 %.3f m 超过静止噪声底, "
+                      "说明它**转得不够原地**。"
+                      % (la["worst_segment_rate_rad_s"], la["worst_fit_residual_m"]))
+                print("     **上面这个杆臂和转圈漂移都别用, 找块平整的地方重转一遍。**")
+                print("     只有两段被同样地污染时 ℓ 才侥幸躲得过(实测 0.0cm), 两段")
+                print("     污染得不一样时 ℓ 会差 15~21cm —— 而圆残差分不出是哪一种。")
             elif "wx" in cd and "wy" in cd:
                 print("  (直线段量到的是 [%+.4f, %+.4f]" % (cd["wx"], cd["wy"]), end="")
                 print("; 圆残差正常, 所以差得多确实是两种步态的区别)"
