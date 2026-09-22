@@ -255,8 +255,9 @@ float 的上下界取自厂商《各个步态的有效速度范围》表的区�
 
 `lidar_R_body` / `lidar_t_body` 是手持设备绑在狗背上的**机械安装关系，装好后必须
 自己标定**——默认还是占位的单位阵 + 零向量，那样 `/hand_lio/odom_vehicle` 给出的是
-雷达的位姿而不是机体中心的。雷达斜着装（比如前倾 15°）时倾角就体现在 `lidar_R_body`
-里，见 `lidar_tilt_impact.md` 第 3 节。**这两个外参 `tools/calibrate_cmd_vel.py` 能
+雷达的位姿而不是机体中心的。雷达斜着装（**实际是前倾约 30°**）时倾角就体现在
+`lidar_R_body` 里——30° 下这个外参是硬门槛不是"最好标一下"，见
+`lidar_tilt_impact.md` 第 3 节。**这两个外参 `tools/calibrate_cmd_vel.py` 能
 顺带标出来**（要带 `--spin-turns`），怎么标、有什么原理上的天花板见「/cmd_vel 标定 ›
 顺带能标 hand_lio 的两个外参」。页面上矩阵是 3×3 九宫格输入框，下面实时显示
 等效的 `roll / pitch / yaw`（只读，9 个数字直接看是看不出转了多少度的）。
