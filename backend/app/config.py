@@ -222,7 +222,7 @@ VIRTUAL_OBSTACLE_MAX_POINTS = int(os.environ.get("NAVIBOT_VIRTUAL_OBSTACLE_MAX_P
 # 一个副作用: 重采样点各自查自己位置的 ground_elevation, z 剖面会更贴真实地面,
 # 于是**原来被粗采样掩盖的爬升会冒出来**。是原来在撒谎, 不是这一步把路弄陡了。
 GLOBAL_PLANNER_WAYPOINT_SPACING_M = float(
-    os.environ.get("NAVIBOT_GLOBAL_PLANNER_WAYPOINT_SPACING_M", "0.8")
+    os.environ.get("NAVIBOT_GLOBAL_PLANNER_WAYPOINT_SPACING_M", "2.0")
 )
 # 老名字 NAVIBOT_GLOBAL_PLANNER_MAX_WAYPOINT_SPACING_M 语义变了(从"上限"变成
 # "目标间距"), 所以换了名字而不是沿用。部署机上要是还留着老的那个环境变量, 它

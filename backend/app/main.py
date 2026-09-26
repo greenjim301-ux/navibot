@@ -294,7 +294,9 @@ async def plan_path(name: str, req: PlanPathRequest):
             # 建图轨迹: 让规划优先贴着狗走过的路走, 而且轨迹压过膨胀余量
             # (见 global_planner.plan_path 的说明)。没有轨迹数据时是 None,
             # 退回改动前的纯代价 + 纯膨胀行为。
-            trajectory=path_planner.mapping_trajectory(name),
+            # **暂时屏蔽**: 固定传 None, 不再优先走建图轨迹。恢复时改回
+            # trajectory=path_planner.mapping_trajectory(name)。
+            trajectory=None,
         )
         delta = route_manager.get_altitude_calibration(name)
         # 这两条警告原来是**逐点**打的 —— 一条 300 多个点的路线就刷 300 多行,
