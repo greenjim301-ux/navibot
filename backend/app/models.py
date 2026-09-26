@@ -216,8 +216,8 @@ class ServiceParamSpec(BaseModel):
     max: Optional[float] = None
     step: Optional[float] = None
     warn_on_change: bool = False
-    """改这个值有连带影响、需要额外提醒用户(目前只有 gait_on_start —— 换步态就
-    必须同步改 yaml 里的 full_scale_v*, 而那三个不在这个页面里)。"""
+    """改这个值有连带影响、需要额外提醒用户(比如 gait_on_start —— 配置文件带
+    full_scale_v* 时换步态就必须同步改它们, 而那三个不在这个页面里)。"""
 
 
 class ServiceParams(BaseModel):
@@ -232,8 +232,12 @@ class ServiceParams(BaseModel):
     """读不到配置文件时的原因; 非 None 时 values 里全是 null。不算接口失败——
     路径没配对在多板子环境里是常态, 页面要能把这个原因显示出来。"""
     params: List[ServiceParamSpec]
+    """只含配置文件里真有的键(文件读不到时全部列出)。"""
     values: Dict[str, Any]
     """key -> 当前值; 解析不出来的键是 null。"""
+    absent: List[str] = []
+    """schema 里声明了、但这份配置文件里没有的键——板子上跑的是另一个版本(比如
+    deep_bridge 的 m20pro 分支没有 use_dtls / usage_mode), 已从 params 里去掉。"""
 
 
 class UpdateServiceParamsRequest(BaseModel):

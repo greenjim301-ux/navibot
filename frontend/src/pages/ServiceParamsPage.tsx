@@ -275,6 +275,15 @@ export default function ServiceParamsPage() {
                 </div>
               )}
 
+              {/* 板子上跑的是另一个版本(比如 deep_bridge 的 m20pro 分支), 有些键这份
+                  配置文件里没有, 后端已经不列了。说一声, 免得以为页面漏了。 */}
+              {!params.file_error && params.absent && params.absent.length > 0 && (
+                <div className="mb-4 text-xs text-muted-foreground">
+                  这份配置文件里没有, 已隐藏:
+                  <span className="font-mono"> {params.absent.join(", ")}</span>
+                </div>
+              )}
+
               {loading ? (
                 <div className="py-8 text-center text-xs text-muted-foreground">加载中…</div>
               ) : (

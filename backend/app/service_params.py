@@ -350,18 +350,47 @@ def get_params(service_id: str) -> Dict[str, Any]:
         lines = []
 
     locate = _locator(schema)
+    present = set()
     for spec in specs:
         if spec["type"] in LIST_TYPES:
             found_list = _locate_list(lines, spec["key"])
             if found_list is not None:
+                present.add(spec["key"])
                 values[spec["key"]] = _parse_list(spec, found_list[3])
             continue
         found = locate(lines, spec["key"])
         if found is not None:
+            present.add(spec["key"])
             values[spec["key"]] = _parse_scalar(spec, found[2])
 
+    # 同一个服务在不同板子上可能跑不同分支, 配置文件的键不一样(比如 deep_bridge 的
+    # m20pro 分支没有 use_dtls / usage_mode / full_scale_*)。文件读到了但某个键不在
+    # 里面, 说明这个版本根本没有这个参数: 不给前端显示, 免得页面上摆一个改不了、
+    # 一改就报"找不到这些键"的空控件。文件读不到时不筛——那时什么都不知道, 照旧
+    # 全部列出来、配合 file_error 显示。
+    absent: List[str] = []
+    if file_error is None:
+        absent = [spec["key"] for spec in specs if spec["key"] not in present]
+        specs = [spec for spec in specs if spec["key"] in present]
+        values = {k: v for k, v in values.items() if k in present}
+    specs = [_resolve_conditional(spec, lambda key: locate(lines, key) is not None)
+             for spec in specs]
+
     return {"service_id": service_id, "file": path, "env_var": schema.get("env_var"),
-            "file_error": file_error, "params": specs, "values": values}
+            "file_error": file_error, "params": specs, "values": values, "absent": absent}
+
+
+def _resolve_conditional(spec: Dict[str, Any], file_has) -> Dict[str, Any]:
+    """spec 里的 if_file_has = {"key": K, 其余字段...}: 配置文件里有 K 这个键时, 用
+    其余字段覆盖 spec 的同名字段。让提示跟着配置文件的版本走——比如 gait_on_start
+    的"换步态要同步改 full_scale_v*"只对有 full_scale_* 的版本成立。"""
+    cond = spec.get("if_file_has")
+    if not cond:
+        return spec
+    out = {k: v for k, v in spec.items() if k != "if_file_has"}
+    if file_has(cond["key"]):
+        out.update({k: v for k, v in cond.items() if k != "key"})
+    return out
 
 
 def write_params(service_id: str, values: Dict[str, Any]) -> Dict[str, Any]:

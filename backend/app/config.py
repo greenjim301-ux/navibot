@@ -539,10 +539,16 @@ SERVICE_PARAM_SCHEMAS = {
                     {"value": 12290, "label": "0x3002 · 敏捷-平地"},
                     {"value": 12291, "label": "0x3003 · 敏捷-楼梯"},
                 ],
-                "help": "★ 改这个就必须同步改 yaml 里的 full_scale_vx/vy/vyaw ——"
-                        "满量程是按步态给的, 而 full_scale_* 不在这个页面里, 要手工改"
-                        "配置文件。只在使用模式=常规时才用得到满量程; 导航模式不受影响。",
-                "warn_on_change": True,
+                "help": "起立、进入 RL 控制之后切换到的步态。",
+                # 只有带 full_scale_* 的版本(main 分支)换步态才要连带改满量程;
+                # m20pro 分支直接下发 m/s, 没有这组参数, 也就不该提醒。
+                "if_file_has": {
+                    "key": "full_scale_vx",
+                    "help": "★ 改这个就必须同步改 yaml 里的 full_scale_vx/vy/vyaw ——"
+                            "满量程是按步态给的, 而 full_scale_* 不在这个页面里, 要手工改"
+                            "配置文件。只在使用模式=常规时才用得到满量程; 导航模式不受影响。",
+                    "warn_on_change": True,
+                },
             },
         ],
     },

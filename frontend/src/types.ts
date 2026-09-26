@@ -232,9 +232,12 @@ export interface ServiceParams {
   /** 读不到配置文件时的原因; 非 null 时 values 里全是 null。这不是接口失败——
    *  路径没配对在多板子环境里是常态。 */
   file_error?: string | null;
+  /** 只含配置文件里真有的键(文件读不到时全部列出)。 */
   params: ServiceParamSpec[];
   /** key -> 当前值; 解析不出来的键是 null。 */
   values: Record<string, unknown>;
+  /** 声明了但这份配置文件里没有的键: 板子上跑的是另一个版本, 已从 params 去掉。 */
+  absent?: string[];
 }
 
 /** 「新建地图」建图页可选的一种建图模式, 见 backend/app/config.py 的
