@@ -27,7 +27,7 @@ import { cn } from "@/lib/utils";
 const HEIGHT_LIMIT_STEP = 0.25;
 // 「自身膨胀」「膨胀地图」这两个图层开关先隐藏入口(订阅/渲染逻辑不动, 保留
 // 随时切回来的能力), 不是删掉功能。
-const SHOW_INFLATION_TOGGLES = false;
+const SHOW_INFLATION_TOGGLES = true;
 
 // 轨迹采样阈值/上限: odom 是 200Hz 的, 每帧都记会瞬间堆出几万个点且肉眼看不出
 // 区别; 按位移采样, 0.05m 一个点在 3D 里已经是平滑曲线了, 上限防止长时间挂着
