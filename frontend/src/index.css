@@ -2,10 +2,6 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
-@import "@fontsource/noto-sans-sc/400.css";
-@import "@fontsource/noto-sans-sc/500.css";
-@import "@fontsource/noto-sans-sc/600.css";
-@import "@fontsource/noto-sans-sc/700.css";
 @import "@fontsource/dm-mono/400.css";
 @import "@fontsource/dm-mono/500.css";
 
@@ -17,7 +13,9 @@ body {
 
 @theme inline {
   --font-heading: var(--font-sans);
-  --font-sans: 'Noto Sans SC', 'Geist Variable', sans-serif;
+  --font-sans: 'Geist Variable', system-ui, -apple-system, 'Segoe UI', Roboto,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC',
+    'Noto Sans SC', 'WenQuanYi Zen Hei', sans-serif;
   --font-mono: 'DM Mono', ui-monospace, monospace;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
@@ -64,7 +62,14 @@ body {
 /*
  * 配色/字体参考了 ~/work/webRvizMing 那套仪表盘风格:
  * 深色导航侧栏(#101b29) + 浅灰背景(#f6f8fb)的内容区 + 蓝色主色(#2376e5),
- * Noto Sans SC 做正文、DM Mono 做坐标/数字这类等宽数据。
+ * DM Mono 做坐标/数字这类等宽数据。
+ *
+ * **中文不再自带 webfont, 走客户端系统字体**(--font-sans 里的 PingFang SC /
+ * Microsoft YaHei / Noto Sans CJK SC 那一段)。原来 @fontsource/noto-sans-sc 引了
+ * 4 个字重, 每个字重 98 个 unicode-range 子集、每个子集 woff2+woff 两份, 一共
+ * 784 个文件 23MB —— 浏览器虽然只按需下载用到的那几十个, 但仓库里要带着这 25MB
+ * 部署, 而且 400+ 条 @font-face 会把 CSS 撑到 578KB(gzip 215KB)且阻塞渲染。
+ * 代价是各客户端中文渲染由系统字体决定(板子自己若跑浏览器, 只有 wqy-zenhei)。
  * 侧栏固定深色, 不跟随 .dark 切换 (这套设计本身就是双色调, 不是明暗模式)。
  */
 :root {
