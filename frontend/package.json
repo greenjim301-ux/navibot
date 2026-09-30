@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:board": "NAVIBOT_DEV_BACKEND=http://10.42.0.1:8000 vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"
