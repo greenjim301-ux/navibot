@@ -175,13 +175,17 @@ ok "ROS master 可达 (ROS_MASTER_URI=${ROS_MASTER_URI:-<默认>})"
 has_topic() { grep -qxF "$1" "$TMP_DIR/live_topics.txt"; }
 
 # $1 是 rosbag info 的**文本输出文件**, 不是 bag 本身。
-# rosbag info 的 topics 段落有两种排法: 第一个话题跟在 "topics:" 后面, 其余各占
-# 一行。所以不能按 $1 取话题名, 而是扫到 "msgs" 再往前两个字段取 (计数, 话题名)。
+# 两个坑都要防:
+#   1. topics 段落有两种排法 —— 第一个话题跟在 "topics:" 后面, 其余各占一行。
+#      所以不能按 $1 取话题名, 而是扫到单位词再往前两个字段取 (计数, 话题名)。
+#   2. **只有 1 条消息的话题, rosbag info 打印的是单数 "1 msg"**(复数才是 msgs)。
+#      2026-10-01 那轮真机数据上, /preset_waypoints 和 /planning/finished 都恰好只有
+#      1 条, 这里只认 msgs 就把它们判成 0 条并给了 FAIL —— 包其实是完整的。
 topic_count() {  # $1=rosbag info 输出文件 $2=话题名
     awk -v want="$2" '
-        /msgs/ {
+        /msg/ {
             for (i = 1; i <= NF; ++i) {
-                if ($i == "msgs" || $i == "msgs:") {
+                if ($i == "msg" || $i == "msgs" || $i == "msg:" || $i == "msgs:") {
                     c = $(i - 1); t = $(i - 2)
                     if (t ~ /^\// && t == want) { print c; exit }
                     break
