@@ -10,6 +10,7 @@
 #   --label NAME            会话名前缀, 只用 [A-Za-z0-9._-] (default: 无)
 #   --duration SEC          录满 SEC 秒自动停 (default: 手动 Ctrl-C)
 #   --extra T1[,T2,...]     额外话题, 逗号分隔, 可重复
+#   --minimal               只录六个必需话题 (不要默认附加的两条位姿取证)
 #   --stop-on-finish        收到 /planning/finished 就停 (无人值守跑一整轮用)
 #   --no-logs               不抓 journal 和控制器 CSV
 #   --journal-units "U ..." 要抓的 systemd unit, 空格分隔
@@ -20,13 +21,24 @@
 #
 # ============================ 录什么, 为什么是这些 ============================
 #
-# 默认六个话题:
+# 默认八个话题 (六个必需 + 两个"位姿取证"):
 #   /cmd_vel                 闭环控制器的唯一输出 (closed_loop_controller.cpp:394)
 #   /hand_lio/odom_vehicle   规划器和控制器共用的位姿源 (run.launch body_pose_topic)
 #   /planning/bspline        参考轨迹 (scan_replan_fsm.cpp:58), 每次重规划一条
 #   /preset_waypoints        navi_mode=2 的任务输入 (scan_replan_fsm.cpp:67)
 #   /planning/stop           "急停"信号, 全仓库只在 callEmergencyStop 发
 #   /planning/finished       整轮任务结束 (REACHED / EMERGENCY_STOP), 只发一次
+#
+# 另外默认加两条, 专门用来给"位姿流质量"取证 (2026-10-01 的结论: 横向摆动的
+# 主因是位姿流的不连续, 而不是控制器在过摆; 见 nav_analysis/REPORT_20261001_lou1.md):
+#   /latest_imu_odom         grodom -> hand_lio 的输入位姿 (grodom_ros1 发, 200Hz)
+#                            和 /hand_lio/odom_vehicle 逐帧比"哪些帧被保持":
+#                            两者一致 => 阶梯来自 grodom (第三方);
+#                            上游干净而 odom_vehicle 是阶梯 => 问题在 hand-lio 的转发
+#   /lidar_pose              grodom 的扫描匹配位姿 (grodom_ros1 发, ~8.5Hz, 即雷达帧率)
+#                            它是低频"测量"真值: 200Hz 流里 0.4m 的台阶如果在它上面
+#                            看不到, 说明那是高频传播/滤波的产物, 不是匹配纠正
+# 用 --minimal 可以退回只录六个必需话题 (两条会给 bag 多约 0.3~0.5 MB/s)。
 #
 # 不录点云。这六条足以定位"参考轨迹 -> 命令 -> 响应"这条执行链路:
 # 横向/纵向跟踪误差、命令饱和、cmd_vel 与 odom 的传动关系、odom 实际更新率、
@@ -57,11 +69,15 @@
 #   # 想同时看栅格(比点云小, 但仍是 5Hz 整片重发, 体积可能和点云同量级)
 #   tools/record_nav_bag.sh --extra /grid_map/occupancy,/rosout
 #
+#   # 只录六个必需话题 (点位姿流取证的两条不要)
+#   tools/record_nav_bag.sh --label corridor1 --minimal
+#
 #   # 只体检不录
 #   tools/record_nav_bag.sh --dry-run
 #
-# 注意: 录制本身会给板子加一点负载(这个最小集约 0.2~0.5 MB/s, 主要是 200Hz 的
-# odom), 建议写到有空间的盘上, 别写满根分区。脚本会先查一次剩余空间。
+# 注意: 录制本身会给板子加一点负载(默认约 0.5~1.0 MB/s: 两条 200Hz 位姿 +
+# 一条 8.5Hz 位姿 + cmd_vel; --minimal 可退回约 0.2~0.5 MB/s), 建议写到有空间的
+# 盘上, 别写满根分区。脚本会先查一次剩余空间。
 #
 # ============================================================================
 
@@ -81,6 +97,7 @@ DRY_RUN=0
 JOURNAL_UNITS="deep_bridge navi_planner hand_lio localization"
 MIN_FREE_MB=500
 EXTRA_TOPICS=()
+MINIMAL=0
 
 REQUIRED_TOPICS=(
     /cmd_vel
@@ -89,6 +106,13 @@ REQUIRED_TOPICS=(
     /preset_waypoints
     /planning/stop
     /planning/finished
+)
+
+# 默认附加话题: 不进"必需"判定 (缺了只 warn, --strict 也不会因此退出),
+# 但默认就录 —— 位姿流质量是这类问题的关键证据, 不该靠人记得加 --extra。
+DEFAULT_EXTRA_TOPICS=(
+    /latest_imu_odom
+    /lidar_pose
 )
 
 # ------------------------------------------------------------------- 输出 ---
@@ -111,6 +135,7 @@ while [ $# -gt 0 ]; do
         --duration=*)     DURATION=${1#*=}; shift ;;
         --extra)          IFS=',' read -r -a _extra <<< "${2:?--extra 需要话题}"; EXTRA_TOPICS+=("${_extra[@]}"); shift 2 ;;
         --extra=*)        IFS=',' read -r -a _extra <<< "${1#*=}"; EXTRA_TOPICS+=("${_extra[@]}"); shift ;;
+        --minimal)        MINIMAL=1; shift ;;
         --stop-on-finish) STOP_ON_FINISH=1; shift ;;
         --no-logs)        NO_LOGS=1; shift ;;
         --journal-units)  JOURNAL_UNITS=${2:?--journal-units 需要 unit 名}; shift 2 ;;
@@ -131,6 +156,9 @@ if [ -n "$LABEL" ] && ! [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 
 ALL_TOPICS=("${REQUIRED_TOPICS[@]}")
+OPT_TOPICS=()
+[ "$MINIMAL" -eq 0 ] && OPT_TOPICS+=("${DEFAULT_EXTRA_TOPICS[@]}")
+[ ${#OPT_TOPICS[@]} -gt 0 ] && ALL_TOPICS+=("${OPT_TOPICS[@]}")
 [ ${#EXTRA_TOPICS[@]} -gt 0 ] && ALL_TOPICS+=("${EXTRA_TOPICS[@]}")
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/record_nav_bag.XXXXXX")
@@ -142,15 +170,23 @@ trap cleanup_tmp EXIT
 # 走下面这条兜底, 跟 deep_bridge.sh / hand_lio.sh 的做法保持一致。
 if ! command -v rosbag >/dev/null 2>&1; then
     if command -v mamba >/dev/null 2>&1; then
+        set +u   # mamba/conda 的 hook 会碰未定义变量, 与本脚本的 set -u 冲突
         eval "$(mamba shell hook --shell bash)" 2>/dev/null || true
         mamba activate ros_host 2>/dev/null || true
+        set -u
     fi
 fi
 if ! command -v rosbag >/dev/null 2>&1; then
     for _ws in "${ROS_WS:-}" "$HOME/ros1_ws" /home/cat/ros1_ws "$HOME/catkin_ws"; do
         if [ -n "$_ws" ] && [ -f "$_ws/devel/setup.bash" ]; then
+            # ROS 的 setup.bash 里会引用 $ROS_DISTRO 之类的变量, 在 set -u 下会直接
+            # 报 "ROS_DISTRO: unbound variable" 而整脚本退出 —— 只有"当前 shell 里
+            # 没有 rosbag"(新开的 ssh / cron / 干净环境)才会走到这里, 交互式 shell
+            # 因为 .bashrc 已经 source 过而不会踩到, 所以这个坑很隐蔽。
+            set +u
             # shellcheck disable=SC1091
             . "$_ws/devel/setup.bash"
+            set -u
             break
         fi
     done
@@ -194,9 +230,12 @@ topic_count() {  # $1=rosbag info 输出文件 $2=话题名
         }' "$1"
 }
 
-MISSING=()
+MISSING=(); MISSING_OPT=()
 for t in "${ALL_TOPICS[@]}"; do
-    has_topic "$t" || MISSING+=("$t")
+    has_topic "$t" && continue
+    _is_opt=0
+    for _o in "${OPT_TOPICS[@]}"; do [ "$_o" = "$t" ] && _is_opt=1; done
+    if [ "$_is_opt" -eq 1 ]; then MISSING_OPT+=("$t"); else MISSING+=("$t"); fi
 done
 
 NODES=$(rt rosnode list 2>/dev/null || true)
@@ -256,6 +295,8 @@ if [ ${#MISSING[@]} -gt 0 ]; then
             /planning/bspline|/planning/stop|/planning/finished)
                                     why="scan_planner_node 没起, 或它启动时挂掉了" ;;
             /preset_waypoints)      why="scan_planner_node 没起, 或 navi_mode != 2" ;;
+            /latest_imu_odom)       why="grodom_ros1 没起 (定位服务), 或它这版不发这条路" ;;
+            /lidar_pose)            why="grodom_ros1 没起, 或它这版不发这条路" ;;
             *)                      why="自己确认一下谁负责发它" ;;
         esac
         printf '        %-28s %s\n' "$t" "$why"
@@ -266,6 +307,12 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     warn "缺的话题照样会录(有发布者就会进 bag), 但相应地那部分证据是空的 —— 继续"
 else
     ok "六个必需话题都在"
+fi
+if [ ${#MISSING_OPT[@]} -gt 0 ]; then
+    warn "默认附加的位姿取证话题当前不在 rostopic list 里: ${MISSING_OPT[*]}"
+    warn "  -> 照录, 但这一轮就没有'上游位姿 vs odom_vehicle'的对照证据了 (不影响必需话题的判定)"
+else
+    ok "位姿取证话题都在 (/latest_imu_odom, /lidar_pose)"
 fi
 
 # /planning/bspline 没人订阅 = 控制器不在, cmd_vel 不会有人发。
@@ -336,6 +383,9 @@ START_ISO=$(date '+%Y-%m-%d %H:%M:%S')
     echo "# 命令: rosbag ${BAG_ARGS[*]}"
     echo "# 必需话题:"
     printf '#   %s\n' "${REQUIRED_TOPICS[@]}"
+    if [ ${#OPT_TOPICS[@]} -gt 0 ]; then
+        printf '#   %s\n' "${OPT_TOPICS[@]}"
+    fi
     if [ ${#EXTRA_TOPICS[@]} -gt 0 ]; then
         echo "# 额外话题:"
         printf '#   %s\n' "${EXTRA_TOPICS[@]}"
@@ -472,6 +522,8 @@ check_topic /cmd_vel               100 yes
 check_topic /hand_lio/odom_vehicle 200 yes
 check_topic /planning/bspline          "" yes
 check_topic /preset_waypoints          "" yes
+check_topic /latest_imu_odom         200 no
+check_topic /lidar_pose               10 no
 
 # /planning/finished: 整轮任务结束才发一次。0 条不一定是错(可能是中途停的录),
 # 但必须说出来, 因为"这一轮到底怎么结束的"是这个 bag 想回答的问题之一。
