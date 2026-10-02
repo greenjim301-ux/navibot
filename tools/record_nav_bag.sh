@@ -10,7 +10,7 @@
 #   --label NAME            会话名前缀, 只用 [A-Za-z0-9._-] (default: 无)
 #   --duration SEC          录满 SEC 秒自动停 (default: 手动 Ctrl-C)
 #   --extra T1[,T2,...]     额外话题, 逗号分隔, 可重复
-#   --minimal               只录六个必需话题 (不要默认附加的两条位姿取证)
+#   --minimal               只录六个必需话题 (不要默认附加的诊断话题)
 #   --stop-on-finish        收到 /planning/finished 就停 (无人值守跑一整轮用)
 #   --no-logs               不抓 journal 和控制器 CSV
 #   --journal-units "U ..." 要抓的 systemd unit, 空格分隔
@@ -21,7 +21,7 @@
 #
 # ============================ 录什么, 为什么是这些 ============================
 #
-# 默认八个话题 (六个必需 + 两个"位姿取证"):
+# 默认十个话题 (六个必需 + 四个诊断话题):
 #   /cmd_vel                 闭环控制器的唯一输出 (closed_loop_controller.cpp:394)
 #   /hand_lio/odom_vehicle   规划器和控制器共用的位姿源 (run.launch body_pose_topic)
 #   /planning/bspline        参考轨迹 (scan_replan_fsm.cpp:58), 每次重规划一条
@@ -29,22 +29,17 @@
 #   /planning/stop           "急停"信号, 全仓库只在 callEmergencyStop 发
 #   /planning/finished       整轮任务结束 (REACHED / EMERGENCY_STOP), 只发一次
 #
-# 另外默认加两条, 专门用来给"位姿流质量"取证 (2026-10-01 的结论: 横向摆动的
-# 主因是位姿流的不连续, 而不是控制器在过摆; 见 nav_analysis/REPORT_20261001_lou1.md):
-#   /latest_imu_odom         grodom -> hand_lio 的输入位姿 (grodom_ros1 发, 200Hz)
-#                            和 /hand_lio/odom_vehicle 逐帧比"哪些帧被保持":
-#                            两者一致 => 阶梯来自 grodom (第三方);
-#                            上游干净而 odom_vehicle 是阶梯 => 问题在 hand-lio 的转发
+# 另外默认加四条诊断话题:
 #   /lidar_pose              grodom 的扫描匹配位姿 (grodom_ros1 发, ~8.5Hz, 即雷达帧率)
-#                            它是低频"测量"真值: 200Hz 流里 0.4m 的台阶如果在它上面
-#                            看不到, 说明那是高频传播/滤波的产物, 不是匹配纠正
-# 用 --minimal 可以退回只录六个必需话题 (两条会给 bag 多约 0.3~0.5 MB/s)。
+#   /hand_lio/odom_fused_shadow  融合里程计的旁路输出
+#   /hand_lio/pose_fusion_diag   位姿融合诊断
+#   /deep_bridge_node/motion_status  底盘运动状态
+# 用 --minimal 可以退回只录六个必需话题。
 #
 # 不录点云。这六条足以定位"参考轨迹 -> 命令 -> 响应"这条执行链路:
 # 横向/纵向跟踪误差、命令饱和、cmd_vel 与 odom 的传动关系、odom 实际更新率、
 # 每条轨迹的存活时间与被打断的频率。它定位不了的是"为什么这条轨迹长这样"
-# (要 /grid_map/occupancy*)和"底盘为什么拒动"(要 deep_bridge 的 journal ——
-# deep_bridge 只订阅 /cmd_vel, 一个 ROS 话题都不发, 底盘侧真值不在 ROS 上)。
+# (要 /grid_map/occupancy*)。底盘运动状态可结合 motion_status 和 deep_bridge journal 排查。
 #
 # 所以本脚本除了录 bag, 还做三件在板子上必须做的事:
 #   1. 录之前核对话题和关键参数, 并明确告诉你"现在开始录了, 去点导航"。
@@ -69,15 +64,14 @@
 #   # 想同时看栅格(比点云小, 但仍是 5Hz 整片重发, 体积可能和点云同量级)
 #   tools/record_nav_bag.sh --extra /grid_map/occupancy,/rosout
 #
-#   # 只录六个必需话题 (点位姿流取证的两条不要)
+#   # 只录六个必需话题 (不录默认诊断话题)
 #   tools/record_nav_bag.sh --label corridor1 --minimal
 #
 #   # 只体检不录
 #   tools/record_nav_bag.sh --dry-run
 #
-# 注意: 录制本身会给板子加一点负载(默认约 0.5~1.0 MB/s: 两条 200Hz 位姿 +
-# 一条 8.5Hz 位姿 + cmd_vel; --minimal 可退回约 0.2~0.5 MB/s), 建议写到有空间的
-# 盘上, 别写满根分区。脚本会先查一次剩余空间。
+# 注意: 录制本身会给板子加负载, 建议写到有空间的盘上, 别写满根分区。
+# 脚本会先查一次剩余空间。
 #
 # ============================================================================
 
@@ -109,10 +103,12 @@ REQUIRED_TOPICS=(
 )
 
 # 默认附加话题: 不进"必需"判定 (缺了只 warn, --strict 也不会因此退出),
-# 但默认就录 —— 位姿流质量是这类问题的关键证据, 不该靠人记得加 --extra。
+# 但默认就录, 方便排查位姿融合和底盘运动状态。
 DEFAULT_EXTRA_TOPICS=(
-    /latest_imu_odom
     /lidar_pose
+    /hand_lio/odom_fused_shadow
+    /hand_lio/pose_fusion_diag
+    /deep_bridge_node/motion_status
 )
 
 # ------------------------------------------------------------------- 输出 ---
@@ -295,7 +291,6 @@ if [ ${#MISSING[@]} -gt 0 ]; then
             /planning/bspline|/planning/stop|/planning/finished)
                                     why="scan_planner_node 没起, 或它启动时挂掉了" ;;
             /preset_waypoints)      why="scan_planner_node 没起, 或 navi_mode != 2" ;;
-            /latest_imu_odom)       why="grodom_ros1 没起 (定位服务), 或它这版不发这条路" ;;
             /lidar_pose)            why="grodom_ros1 没起, 或它这版不发这条路" ;;
             *)                      why="自己确认一下谁负责发它" ;;
         esac
@@ -308,11 +303,13 @@ if [ ${#MISSING[@]} -gt 0 ]; then
 else
     ok "六个必需话题都在"
 fi
-if [ ${#MISSING_OPT[@]} -gt 0 ]; then
-    warn "默认附加的位姿取证话题当前不在 rostopic list 里: ${MISSING_OPT[*]}"
-    warn "  -> 照录, 但这一轮就没有'上游位姿 vs odom_vehicle'的对照证据了 (不影响必需话题的判定)"
-else
-    ok "位姿取证话题都在 (/latest_imu_odom, /lidar_pose)"
+if [ ${#OPT_TOPICS[@]} -gt 0 ]; then
+    if [ ${#MISSING_OPT[@]} -gt 0 ]; then
+        warn "默认附加的诊断话题当前不在 rostopic list 里: ${MISSING_OPT[*]}"
+        warn "  -> 照录, 但相应的诊断数据可能缺失 (不影响必需话题的判定)"
+    else
+        ok "默认附加的诊断话题都在"
+    fi
 fi
 
 # /planning/bspline 没人订阅 = 控制器不在, cmd_vel 不会有人发。
@@ -522,8 +519,12 @@ check_topic /cmd_vel               100 yes
 check_topic /hand_lio/odom_vehicle 200 yes
 check_topic /planning/bspline          "" yes
 check_topic /preset_waypoints          "" yes
-check_topic /latest_imu_odom         200 no
-check_topic /lidar_pose               10 no
+if [ "$MINIMAL" -eq 0 ]; then
+    check_topic /lidar_pose                        10 no
+    check_topic /hand_lio/odom_fused_shadow        "" no
+    check_topic /hand_lio/pose_fusion_diag         "" no
+    check_topic /deep_bridge_node/motion_status    "" no
+fi
 
 # /planning/finished: 整轮任务结束才发一次。0 条不一定是错(可能是中途停的录),
 # 但必须说出来, 因为"这一轮到底怎么结束的"是这个 bag 想回答的问题之一。
