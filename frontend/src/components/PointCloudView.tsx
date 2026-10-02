@@ -117,6 +117,9 @@ interface Props {
 }
 
 export interface PointCloudViewHandle {
+  /** 围绕当前旋转中心缩放, 与滚轮使用相同的视距限制。 */
+  zoomIn(): void;
+  zoomOut(): void;
   /** 切换"点选新中心点"模式: 开启后鼠标变十字光标, 下一次在点云上点击(按下/
    *  抬起之间几乎没有移动, 不是拖拽旋转)会把点中的世界坐标设成新的旋转/缩放
    *  中心, 然后自动关闭这个模式; 再调用一次可以在点击前手动取消。只在
@@ -264,7 +267,10 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   // useImperativeHandle 暴露的方法本身可以是稳定引用, 不用跟着重新生成。
   const toggleRecenterRef = useRef<() => void>(() => {});
   const resetViewRef = useRef<() => void>(() => {});
+  const zoomRef = useRef<(factor: number) => void>(() => {});
   useImperativeHandle(ref, () => ({
+    zoomIn: () => zoomRef.current(1 / 1.2),
+    zoomOut: () => zoomRef.current(1.2),
     toggleRecenter: () => toggleRecenterRef.current(),
     resetView: () => resetViewRef.current(),
     toggleFollow: () => setFollowing((v) => !v),
@@ -468,6 +474,16 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     // 本来就是符合直觉的设计) —— 只要 minDistance 不趋近 0, 这个速度就不会趋近 0,
     // 不需要额外改写 _pan。
     controls.minDistance = near * 2;
+    zoomRef.current = (factor) => {
+      const offset = camera.position.clone().sub(controls.target);
+      const distance = THREE.MathUtils.clamp(
+        offset.length() * factor, controls.minDistance, controls.maxDistance,
+      );
+      offset.setLength(distance);
+      camera.position.copy(controls.target).add(offset);
+      controls.update();
+      needsRenderRef.current = true;
+    };
     // 拖拽/缩放, 以及 enableDamping 期间的惯性衰减帧, controls 都会派发 change,
     // 按需渲染就是靠这个信号驱动的(阻尼衰减到 EPS 以下之后自然停止派发)。
     controls.addEventListener("change", () => {
@@ -1059,6 +1075,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
 
     return () => {
       disposed = true;
+      zoomRef.current = () => {};
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", handleResize);
       renderer.domElement.removeEventListener("pointerdown", handlePointerDown);

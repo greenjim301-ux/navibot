@@ -216,8 +216,8 @@ export default function MapPreviewPage() {
   }, []);
 
   // 导航控制: 直接在当前视图(3D 点云或 2D 栅格, 两边都支持, 跟 viewMode 无关)
-  // 点选设置一个目标点(只要一个, 不是多途经点路线), 点「开始导航」时以机器狗
-  // 当前位置为起点、这个点为终点调用 plan_path(它只负责算), 再把规划出来的
+  // 点选设置一个目标点后立即以机器狗当前位置为起点规划并显示路径;
+  // 点「开始导航」时按最新位置重新调用 plan_path, 再把规划出来的
   // 稀疏拐点当 navi_mode=2 的途经点通过 submit_route 下发(见 handleStartNav)
   // ——实测 navi_mode=3(REFERENCE_PATH/initial_path)对全局路线的贴合度不稳定,
   // 狗不一定真的顺着那条参考线走, navi_mode=2 是逐点下发、逐点判到达的, 贴合度
@@ -244,12 +244,14 @@ export default function MapPreviewPage() {
   // 状态因此也会跟着自动复位, 不需要额外的信号。
   const navState = liveStatus?.state ?? "idle";
   const navRunning = navState === "running";
-  // plan_path 规划出来、再通过 submit_route(navi_mode=2)下发
-  // 下去的那条参考路线, 单纯用来在地图上画出来(跟"是不是正在跑"是两回事,
+  // 目标点预规划 / submit_route(navi_mode=2)下发的参考路线,
+  // 单纯用来在地图上画出来(跟"是不是正在跑"是两回事,
   // 那个用上面的 navRunning)——完成/失败之后仍然留着当"最近一次下发的路线"看,
   // 不跟着自动清空; 只有换地图、点"停止导航"或"清空目标点"才清, 做法跟上面的
   // trail 一致(跑完了也留着能回看)。
   const [dispatchedRoute, setDispatchedRoute] = useState<PlannedRoutePoint[] | null>(null);
+  // 改点、取消、开始导航或离开地图后, 忽略旧的目标点预规划响应。
+  const goalPlanVersionRef = useRef(0);
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
   // 独立的另一条链路——起终点在 2D 栅格图上跑 A* 规划(global_planner.py),
@@ -301,6 +303,7 @@ export default function MapPreviewPage() {
     setStartGoalPicking(false);
     setPlannedRoute(null);
     setDispatchedRoute(null);
+    return () => { goalPlanVersionRef.current += 1; };
   }, [name]);
 
   // 切到 2D 时 PointCloudView 会整个卸载(见下面渲染部分), "点选新中心点"/
@@ -334,8 +337,28 @@ export default function MapPreviewPage() {
    *  数组末尾追加一个点、右键从数组里删掉某个点"(本来是给多途经点路线设计
    *  的), 这里只取最新的最后一个点, 每次左键点选都直接替换掉上一个, 右键删除
    *  时数组变空、slice 结果也是空——不用改 PointCloudView/TopView 本身。 */
-  function handleChangeGoalPoint(next: Waypoint[]) {
-    setWaypoints(next.slice(-1));
+  async function handleChangeGoalPoint(next: Waypoint[]) {
+    const version = ++goalPlanVersionRef.current;
+    const goal = next.at(-1);
+    setWaypoints(goal ? [goal] : []);
+    setDispatchedRoute(null);
+    setNavError(null);
+    if (!goal) {
+      setOptimalTrajHidden(true);
+      return;
+    }
+    if (!pose || !isActive) {
+      setNavError("还没有收到机器狗位姿, 无法规划路径");
+      return;
+    }
+    try {
+      const result = await planPath(
+        name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, "preview",
+      );
+      if (version === goalPlanVersionRef.current) setDispatchedRoute(result.points);
+    } catch (e) {
+      if (version === goalPlanVersionRef.current) setNavError(String(e));
+    }
   }
 
   function cancelRegionDraft() {
@@ -455,6 +478,7 @@ export default function MapPreviewPage() {
   async function handleStartNav() {
     const goal = waypoints[0];
     if (!goal || !pose) return;
+    goalPlanVersionRef.current += 1;
     setSubmitting(true);
     setNavError(null);
     try {
@@ -489,6 +513,7 @@ export default function MapPreviewPage() {
     setNavError(null);
     try {
       await estop();
+      goalPlanVersionRef.current += 1;
       setDispatchedRoute(null);
     } catch (e) {
       setNavError(String(e));
@@ -645,16 +670,20 @@ export default function MapPreviewPage() {
             </div>
           ) : null}
 
-          {viewMode === "2d" && topview2d && (
+          {(viewMode === "3d" || topview2d) && (
             <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1 rounded-md border border-white/20 bg-black/40 px-1.5 py-1.5 text-white/80 backdrop-blur">
-              <ToolbarButton icon={ZoomOut} title="缩小" onClick={() => tvRef.current?.zoomOut()} />
-              <span className="w-12 text-center font-mono text-xs tabular-nums">{tvView.zoomPercent}%</span>
-              <ToolbarButton icon={ZoomIn} title="放大" onClick={() => tvRef.current?.zoomIn()} />
+              <ToolbarButton icon={ZoomOut} title="缩小" onClick={() => (viewMode === "3d" ? pcRef.current : tvRef.current)?.zoomOut()} />
+              {viewMode === "2d" && (
+                <span className="w-12 text-center font-mono text-xs tabular-nums">{tvView.zoomPercent}%</span>
+              )}
+              <ToolbarButton icon={ZoomIn} title="放大" onClick={() => (viewMode === "3d" ? pcRef.current : tvRef.current)?.zoomIn()} />
+              {viewMode === "2d" && (<>
               <span className="mx-1 h-4 w-px bg-white/20" />
               <ToolbarButton icon={RotateCcw} title="逆时针旋转" onClick={() => tvRef.current?.rotateCCW()} />
               <ToolbarButton icon={RotateCw} title="顺时针旋转" onClick={() => tvRef.current?.rotateCW()} />
               <span className="mx-1 h-4 w-px bg-white/20" />
               <ToolbarButton icon={RefreshCw} title="重置视图" onClick={() => tvRef.current?.reset()} />
+              </>)}
             </div>
           )}
 
@@ -848,10 +877,8 @@ export default function MapPreviewPage() {
                         // 后者是 ws 推来的、页面不持有数据, 只能记一个隐藏标记(见
                         // optimalTrajHidden 声明处的注释)。
                         onClick={() => {
-                          setWaypoints([]);
+                          void handleChangeGoalPoint([]);
                           setTrail([]);
-                          setDispatchedRoute(null);
-                          setOptimalTrajHidden(true);
                         }}
                       />
                       <PanelButton
