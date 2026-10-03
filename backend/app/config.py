@@ -640,8 +640,16 @@ SERVICE_PARAM_SCHEMAS = {
                 "key": "closed_loop_controller/max_vyaw", "label": "闭环控制器 · 偏航限速",
                 "type": "float", "unit": "rad/s", "min": 0.0, "max": 2.0, "step": 0.05,
                 "help": "闭环跟踪时的偏航角速度上限。这是控制器自己的限速, 跟 "
-                        "deep_bridge 的 max_vyaw(下发给底盘前的安全限速)是两道独立的闸,"
+                        "底盘桥接器的 max_vyaw(下发给底盘前的安全限速)是两道独立的闸,"
                         "取两者更小的那个才是实际生效值。",
+            },
+            {
+                "key": "closed_loop_controller/turn_vyaw_max", "label": "闭环控制器 · 原地转向限速",
+                "type": "float", "unit": "rad/s", "min": 0.05, "max": 2.0, "step": 0.05,
+                "help": "朝向误差较大时, 控制器先原地转向, 此参数限制该阶段的角速度。"
+                        "实际值还受上面的偏航限速和底盘桥接器限速约束。"
+                        "宇树机器狗实测 0.2 rad/s 无法驱动转向, 请按底盘实际响应设置。"
+                        "保存后需重启路线规划服务才生效。",
             },
         ],
     },
