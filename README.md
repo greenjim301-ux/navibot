@@ -108,20 +108,32 @@ cd frontend && npm install && npm run dev
 板子上不用再跑 nginx 或 vite —— 后端直接把 `frontend/dist` 挂在 `/` 上，前后端同源：
 
 ```bash
-cd frontend && npm ci && npm run build      # 产出 frontend/dist
+cd /home/cat/navibot                       # 按机器修改仓库路径
+# 复用 cat 的 ~/.local 已安装依赖, 不需要虚拟环境
+# 尚未安装依赖的机器, 以 cat 用户运行: /usr/bin/python3 -m pip install --user -r requirements.txt
+# 检查 root 在服务所用的 ROS 环境下能导入依赖
+sudo /bin/bash -c 'export PYTHONPATH=/home/cat/.local/lib/python3.8/site-packages; source /home/cat/HandBot_bash/rosmaster.bash && /usr/bin/python3 -c "import uvicorn, fastapi, numpy, rospy"'
+(cd frontend && npm ci && npm run build)   # 产出 frontend/dist
 sudo cp deploy/navibot.service /etc/systemd/system/
-sudo cp deploy/navibot.env     /etc/default/navibot   # 按机器改路径/用户
+sudo cp deploy/navibot.env     /etc/default/navibot   # 首次安装; 已有配置请保留并按需修改
 sudo systemctl daemon-reload && sudo systemctl enable --now navibot
 journalctl -u navibot -f
 ```
 
 | | |
 |---|---|
-| `deploy/navibot.service` | unit 文件。`User` / `WorkingDirectory` 按"仓库在 `/home/cat/navibot`、用户是 `cat`"写的，换机器要改 |
+| `deploy/navibot.service` | unit 文件，以 root 运行。`WorkingDirectory` / `ExecStart` 按仓库在 `/home/cat/navibot` 写的，换机器要改 |
 | `deploy/navibot.env` | 装到 `/etc/default/navibot`，端口和各种 `NAVIBOT_*` 路径都在这儿调，不用动 unit |
 
-`ExecStart` 显式起一个 shell 先 `source /opt/ros/noetic/setup.bash` 再 `exec uvicorn`
-（systemd 不会 source bash 脚本）。用 `exec` 是为了让 uvicorn 直接接管 PID，
+`ExecStart` 显式起一个 shell 先 `source /home/cat/HandBot_bash/rosmaster.bash` 再用
+`/usr/bin/python3 -m uvicorn` 启动。服务设置
+`PYTHONPATH=/home/cat/.local/lib/python3.8/site-packages`，让 root 复用 cat 用户通过
+`pip install --user` 安装的包，无需重复安装。换用户或 Python 版本时，在
+`/etc/default/navibot` 中覆盖 `PYTHONPATH`；ROS 环境脚本需要保留此路径。
+出现 `No module named uvicorn` 时，先完成上面的 root 导入检查，再重新安装 unit 并重启服务。
+更新已安装的服务时运行 `sudo systemctl daemon-reload && sudo systemctl restart navibot`。
+
+systemd 不会自动 source bash 脚本。用 `exec` 是为了让 uvicorn 直接接管 PID，
 `systemctl stop` 的信号才打得到它身上，不会把进程留下。
 
 路由规则（`main.py` 末尾的 `_SpaStaticFiles`）：`/api` `/map` `/ws` `/assets` 开头的
@@ -132,9 +144,9 @@ journalctl -u navibot -f
 
 没有 `frontend/dist` 时不挂载，只提供接口，日志里会说明——只跑后端做开发不受影响。
 
-> **这套部署没有在真实板子上跑过**（开发机上没有 board 访问权限）。`systemd-analyze verify`
-> 通过、`ExecStart` 那行命令在开发机上验过能起来，但第一次上机大概率还要调路径和
-> `After=` 依赖。
+> 2026-10-03 已在 lubancat 上验证：root 通过 `PYTHONPATH` 加载 cat 的 `.local` 依赖，
+> systemd 服务正常运行，ROS bridge 成功连接，`/api/status` 和前端首页返回 HTTP 200。
+> 此验证覆盖服务启动和 HTTP 访问；换机器仍需检查路径和 `After=` 依赖。
 
 没有实机时，用模拟器验证整条链路（它刻意复刻了真 planner 的到达判据、跳点规则、急停悬停确认行为）：
 

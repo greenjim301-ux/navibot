@@ -1,6 +1,7 @@
 # navibot 后端 (同时 host 前端页面)
 #
 # 安装:
+#   先按 README 的部署步骤检查 root 能加载 cat 的 .local 依赖
 #   sudo cp deploy/navibot.service /etc/systemd/system/
 #   sudo cp deploy/navibot.env     /etc/default/navibot     # 按机器改里面的路径/用户
 #   sudo systemctl daemon-reload && sudo systemctl enable --now navibot
@@ -8,12 +9,12 @@
 # **装之前先构建前端**: cd frontend && npm ci && npm run build
 # 没有 frontend/dist 的话后端只提供接口, 打开网页是 404(日志里会说)。
 #
-# 服务以 root 用户运行。WorkingDirectory / ExecStart 里的路径都按
+# 服务以 root 用户运行。WorkingDirectory / ExecStart / PYTHONPATH 里的路径都按
 # "仓库在 /home/cat/navibot" 写的, 换机器要改。
 # 其余可调项都在 /etc/default/navibot 里, 不用动这个文件。
 #
-# **没有在真实板子上跑过**(开发机上没有 board 访问权限), 第一次上机大概率要调
-# 路径和 After= 依赖。
+# 已在 lubancat 上验证 root 启动、ROS bridge 连接和 HTTP 接口。
+# 换机器仍需检查路径和 After= 依赖。
 
 [Unit]
 Description=navibot backend (REST + WebSocket + 前端页面)
@@ -37,7 +38,9 @@ EnvironmentFile=-/etc/default/navibot
 # systemd 不会 source bash 脚本, 所以显式起一个 shell 把 ROS 环境 source 进来再
 # exec。用 exec 是为了让 uvicorn 直接接管 PID, systemd 的信号/状态才对得上 ——
 # 不加的话 bash 是主进程, stop 会打到 bash 上, uvicorn 可能被留下。
-ExecStart=/bin/bash -c 'source /home/cat/HandBot_bash/rosmaster.bash && exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${NAVIBOT_PORT:-8000}"'
+# root 不会自动搜索 cat 的用户包, 显式复用板子上已安装的依赖。
+Environment=PYTHONPATH=/home/cat/.local/lib/python3.8/site-packages
+ExecStart=/bin/bash -c 'source /home/cat/HandBot_bash/rosmaster.bash && exec /usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${NAVIBOT_PORT:-8000}"'
 
 Restart=on-failure
 RestartSec=5
