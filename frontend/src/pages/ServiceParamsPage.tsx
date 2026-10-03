@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Loader2, RotateCw, Save } from "lucide-react";
 import {
   getServiceParams, listServices, restartService, updateServiceParams,
@@ -80,8 +80,12 @@ export default function ServiceParamsPage() {
   const [notice, setNotice] = useState<string | null>(null);
   // 保存成功之后弹"要不要现在重启", 见 RESTART_HINT。
   const [restartAsk, setRestartAsk] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const refreshingServices = useRef(false);
 
   const refreshServices = useCallback(async () => {
+    if (refreshingServices.current) return;
+    refreshingServices.current = true;
     try {
       const list = await listServices();
       setServices(list);
@@ -90,6 +94,8 @@ export default function ServiceParamsPage() {
       setSelectedId((prev) => prev ?? list.find((s) => s.configurable)?.id ?? null);
     } catch (e) {
       setError(String(e));
+    } finally {
+      refreshingServices.current = false;
     }
   }, []);
 
@@ -103,10 +109,14 @@ export default function ServiceParamsPage() {
   useEffect(() => {
     if (!selectedId) return;
     let cancelled = false;
+    const controller = new AbortController();
     setLoading(true);
+    setParams(null);
+    setForm({});
+    setRestartAsk(false);
     setError(null);
     setNotice(null);
-    getServiceParams(selectedId)
+    getServiceParams(selectedId, controller.signal)
       .then((data) => {
         if (cancelled) return;
         setParams(data);
@@ -116,8 +126,11 @@ export default function ServiceParamsPage() {
       })
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false));
-    return () => { cancelled = true; };
-  }, [selectedId]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [selectedId, loadAttempt]);
 
   const selected = services?.find((s) => s.id === selectedId) ?? null;
   const configurable = services?.filter((s) => s.configurable) ?? [];
@@ -215,7 +228,7 @@ export default function ServiceParamsPage() {
             <button
               key={svc.id}
               type="button"
-              disabled={!svc.configurable}
+              disabled={!svc.configurable || saving || restarting}
               onClick={() => setSelectedId(svc.id)}
               title={svc.configurable ? undefined : "这个服务暂无可配置参数"}
               className={cn(
@@ -235,13 +248,31 @@ export default function ServiceParamsPage() {
         </Card>
 
         <div className="space-y-3">
+          {selected && (!params || params.service_id !== selectedId) && (
+            <Card className="p-5">
+              <h2 className="text-[15px] font-medium">{selected.label}</h2>
+              {loading && (
+                <div className="py-8 text-center text-xs text-muted-foreground">加载中…</div>
+              )}
+              {!loading && error && (
+                <Button className="mt-4" variant="outline" onClick={() => setLoadAttempt((n) => n + 1)}>
+                  <RotateCw />重新加载
+                </Button>
+              )}
+            </Card>
+          )}
+          {error && (
+            <div role="alert" className="rounded-md border border-destructive/35 bg-destructive/10 p-3 text-xs text-destructive">
+              {error}
+            </div>
+          )}
           {configurable.length === 0 && services !== null && (
             <Card className="p-6 text-center text-sm text-muted-foreground">
               当前没有任何服务提供可配置参数。
             </Card>
           )}
 
-          {selected && params && (
+          {selected && params && params.service_id === selectedId && (
             <Card className="p-5">
               <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
                 <div>
@@ -426,11 +457,6 @@ export default function ServiceParamsPage() {
                 </div>
               ))}
 
-              {error && (
-                <div className="mt-4 rounded-md border border-destructive/35 bg-destructive/10 p-3 text-xs text-destructive">
-                  {error}
-                </div>
-              )}
               {notice && !error && (
                 <div className="mt-4 rounded-md border border-success/35 bg-success/10 p-3 text-xs text-success">
                   {notice}

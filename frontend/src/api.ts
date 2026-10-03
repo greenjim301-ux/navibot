@@ -42,17 +42,26 @@ const SERVICE_TIMEOUT_MS = 60_000;
 
 async function apiFetch(url: string, init: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Response> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const callerSignal = init.signal;
+  const cancel = () => ctrl.abort(callerSignal?.reason);
+  if (callerSignal?.aborted) cancel();
+  else callerSignal?.addEventListener("abort", cancel, { once: true });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, timeoutMs);
   try {
     return await fetch(url, { ...init, signal: ctrl.signal });
   } catch (e) {
-    if (ctrl.signal.aborted) {
+    if (timedOut) {
       const path = url.startsWith(BACKEND_HTTP) ? url.slice(BACKEND_HTTP.length) : url;
       throw new Error(`请求超时: ${init.method ?? "GET"} ${path} ${timeoutMs / 1000}s 内没有收到响应`);
     }
     throw e;
   } finally {
     clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", cancel);
   }
 }
 
@@ -359,8 +368,8 @@ export async function saveMapping(): Promise<MappingStatus> {
 /** 某个服务的参数 schema + 当前值。只有 `ServiceInfo.configurable` 为 true 的
  *  服务有, 其余 404。配置文件读不到不算失败——返回 200, 原因在 `file_error`
  *  里(多台板子路径不一样, 路径没配对是常态)。 */
-export async function getServiceParams(id: string): Promise<ServiceParams> {
-  return asJson(await apiFetch(`${BACKEND_HTTP}/api/services/${encodeURIComponent(id)}/params`));
+export async function getServiceParams(id: string, signal?: AbortSignal): Promise<ServiceParams> {
+  return asJson(await apiFetch(`${BACKEND_HTTP}/api/services/${encodeURIComponent(id)}/params`, { signal }));
 }
 
 /** 写回参数, 返回写完之后重新读出来的值。只传要改的键即可。
