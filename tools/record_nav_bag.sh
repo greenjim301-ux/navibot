@@ -21,7 +21,7 @@
 #
 # ============================ 录什么, 为什么是这些 ============================
 #
-# 默认十个话题 (六个必需 + 四个诊断话题):
+# 默认十一个话题 (六个必需 + 五个诊断话题):
 #   /cmd_vel                 闭环控制器的唯一输出 (closed_loop_controller.cpp:394)
 #   /hand_lio/odom_vehicle   规划器和控制器共用的位姿源 (run.launch body_pose_topic)
 #   /planning/bspline        参考轨迹 (scan_replan_fsm.cpp:58), 每次重规划一条
@@ -29,8 +29,12 @@
 #   /planning/stop           "急停"信号, 全仓库只在 callEmergencyStop 发
 #   /planning/finished       整轮任务结束 (REACHED / EMERGENCY_STOP), 只发一次
 #
-# 另外默认加四条诊断话题:
-#   /lidar_pose              grodom 的扫描匹配位姿 (grodom_ros1 发, ~8.5Hz, 即雷达帧率)
+# 另外默认加五条诊断话题:
+#   /latest_imu_odom         grodom 的 200Hz 高频位姿, hand_lio 的输入。位姿上和
+#                            /hand_lio/odom_vehicle 只差一个外参, 但只有它带滤波器自己
+#                            估的速度 (odom_vehicle 的 twist 是全零), 排查"两次激光修正
+#                            之间的前推为什么偏"要靠它
+#   /lidar_pose              grodom 的扫描匹配位姿 (grodom_ros1 发, 实测 5~8Hz, 达不到 10Hz 的雷达帧率)
 #   /hand_lio/odom_fused_shadow  融合里程计的旁路输出
 #   /hand_lio/pose_fusion_diag   位姿融合诊断
 #   /deep_bridge_node/motion_status  底盘运动状态
@@ -105,6 +109,7 @@ REQUIRED_TOPICS=(
 # 默认附加话题: 不进"必需"判定 (缺了只 warn, --strict 也不会因此退出),
 # 但默认就录, 方便排查位姿融合和底盘运动状态。
 DEFAULT_EXTRA_TOPICS=(
+    /latest_imu_odom
     /lidar_pose
     /hand_lio/odom_fused_shadow
     /hand_lio/pose_fusion_diag
@@ -291,6 +296,7 @@ if [ ${#MISSING[@]} -gt 0 ]; then
             /planning/bspline|/planning/stop|/planning/finished)
                                     why="scan_planner_node 没起, 或它启动时挂掉了" ;;
             /preset_waypoints)      why="scan_planner_node 没起, 或 navi_mode != 2" ;;
+            /latest_imu_odom)       why="grodom_ros1 没起 (定位服务), 或它这版不发这条路" ;;
             /lidar_pose)            why="grodom_ros1 没起, 或它这版不发这条路" ;;
             *)                      why="自己确认一下谁负责发它" ;;
         esac
@@ -520,7 +526,8 @@ check_topic /hand_lio/odom_vehicle 200 yes
 check_topic /planning/bspline          "" yes
 check_topic /preset_waypoints          "" yes
 if [ "$MINIMAL" -eq 0 ]; then
-    check_topic /lidar_pose                        10 no
+    check_topic /latest_imu_odom                  200 no
+    check_topic /lidar_pose                         5 no
     check_topic /hand_lio/odom_fused_shadow        "" no
     check_topic /hand_lio/pose_fusion_diag         "" no
     check_topic /deep_bridge_node/motion_status    "" no
