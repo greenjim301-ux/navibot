@@ -8,8 +8,8 @@
 # **装之前先构建前端**: cd frontend && npm ci && npm run build
 # 没有 frontend/dist 的话后端只提供接口, 打开网页是 404(日志里会说)。
 #
-# 这个文件里的 User / WorkingDirectory / ExecStart 里的路径都按
-# "仓库在 /home/cat/navibot、跑服务的用户是 cat" 写的, 换机器要改。
+# 服务以 root 用户运行。WorkingDirectory / ExecStart 里的路径都按
+# "仓库在 /home/cat/navibot" 写的, 换机器要改。
 # 其余可调项都在 /etc/default/navibot 里, 不用动这个文件。
 #
 # **没有在真实板子上跑过**(开发机上没有 board 访问权限), 第一次上机大概率要调
@@ -26,8 +26,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=cat
-Group=cat
+User=root
+Group=root
 WorkingDirectory=/home/cat/navibot/backend
 
 # 所有可调项(端口/ROS master/各种 NAVIBOT_* 路径)都从这里读。文件不存在也能起
