@@ -21,7 +21,7 @@
 #
 # ============================ 录什么, 为什么是这些 ============================
 #
-# 默认十一个话题 (六个必需 + 五个诊断话题):
+# 默认十二个话题 (六个必需 + 六个诊断话题):
 #   /cmd_vel                 闭环控制器的唯一输出 (closed_loop_controller.cpp:394)
 #   /hand_lio/odom_vehicle   规划器和控制器共用的位姿源 (run.launch body_pose_topic)
 #   /planning/bspline        参考轨迹 (scan_replan_fsm.cpp:58), 每次重规划一条
@@ -29,7 +29,7 @@
 #   /planning/stop           "急停"信号, 全仓库只在 callEmergencyStop 发
 #   /planning/finished       整轮任务结束 (REACHED / EMERGENCY_STOP), 只发一次
 #
-# 另外默认加五条诊断话题:
+# 另外默认加六条诊断话题:
 #   /latest_imu_odom         grodom 的 200Hz 高频位姿, hand_lio 的输入。位姿上和
 #                            /hand_lio/odom_vehicle 只差一个外参, 但只有它带滤波器自己
 #                            估的速度 (odom_vehicle 的 twist 是全零), 排查"两次激光修正
@@ -38,6 +38,7 @@
 #   /hand_lio/odom_fused_shadow  融合里程计的旁路输出
 #   /hand_lio/pose_fusion_diag   位姿融合诊断
 #   /deep_bridge_node/motion_status  底盘运动状态
+#   /deep_bridge_node/motion_status_raw  底盘运控状态上报的 JSON 原文 (字段含义未定, 离线对比用)
 # 用 --minimal 可以退回只录六个必需话题。
 #
 # 不录点云。这六条足以定位"参考轨迹 -> 命令 -> 响应"这条执行链路:
@@ -114,6 +115,7 @@ DEFAULT_EXTRA_TOPICS=(
     /hand_lio/odom_fused_shadow
     /hand_lio/pose_fusion_diag
     /deep_bridge_node/motion_status
+    /deep_bridge_node/motion_status_raw
 )
 
 # ------------------------------------------------------------------- 输出 ---
@@ -531,6 +533,7 @@ if [ "$MINIMAL" -eq 0 ]; then
     check_topic /hand_lio/odom_fused_shadow        "" no
     check_topic /hand_lio/pose_fusion_diag         "" no
     check_topic /deep_bridge_node/motion_status    "" no
+    check_topic /deep_bridge_node/motion_status_raw "" no
 fi
 
 # /planning/finished: 整轮任务结束才发一次。0 条不一定是错(可能是中途停的录),
