@@ -27,7 +27,16 @@ export interface RobotPose {
   cov: number;
 }
 
+export interface MultiNavigationStatus {
+  state: TaskState;
+  goals: Waypoint[];
+  current_index: number;
+  route: PlannedRoutePoint[];
+  message: string | null;
+}
+
 export interface NavStatus {
+  multi_navigation?: MultiNavigationStatus;
   state: TaskState;
   waypoints: Waypoint[];
   current_index: number;

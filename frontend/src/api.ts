@@ -77,6 +77,14 @@ export async function getStatus(): Promise<NavStatus> {
   return asJson(await apiFetch(`${BACKEND_HTTP}/api/status`));
 }
 
+export async function startMultiNavigation(goals: Waypoint[], mapName: string): Promise<NavStatus> {
+  return asJson(await apiFetch(`${BACKEND_HTTP}/api/multi_navigation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ goals, map_name: mapName }),
+  }));
+}
+
 export async function submitRoute(waypoints: Waypoint[], mapName: string, label?: string): Promise<NavStatus> {
   return asJson(
     await apiFetch(`${BACKEND_HTTP}/api/route`, {

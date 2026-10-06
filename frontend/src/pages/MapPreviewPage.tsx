@@ -8,7 +8,7 @@ import {
 import {
   addMapEdit, deleteMapEdit, estop, getMapTrajectory, listMapEdits, planPath,
   setInflationMap, setSelfInflation, setSurfCloud, submitRoute,
-  updateMapEdit,
+  updateMapEdit, startMultiNavigation,
 } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
@@ -23,6 +23,7 @@ import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { MultiRoutePreview } from "../lib/multiRoutePreview";
 
 const HEIGHT_LIMIT_STEP = 0.25;
 // 「自身膨胀」「膨胀地图」这两个图层开关先隐藏入口(订阅/渲染逻辑不动, 保留
@@ -243,7 +244,47 @@ export default function MapPreviewPage() {
   // on_planning_finished/_advance_reached_locked/estop), 「停止导航」按钮的
   // 状态因此也会跟着自动复位, 不需要额外的信号。
   const navState = liveStatus?.state ?? "idle";
-  const navRunning = navState === "running";
+  const multiStatus = liveStatus?.multi_navigation;
+  const multiRunning = multiStatus?.state === "running";
+  const navRunning = navState === "running" || multiRunning;
+  // 多点草稿/预览独立保存; 地图按当前操作栏切换标记, 不覆盖单目标点。
+  const [multiPoints, setMultiPoints] = useState<Waypoint[]>([]);
+  const [multiEditing, setMultiEditing] = useState(false);
+  const [showMulti, setShowMulti] = useState(false);
+  const [multiBusy, setMultiBusy] = useState(false);
+  const [multiPlanning, setMultiPlanning] = useState(false);
+  const [multiTracking, setMultiTracking] = useState(false);
+  const [multiError, setMultiError] = useState<string | null>(null);
+  const [multiRoute, setMultiRoute] = useState<PlannedRoutePoint[] | null>(null);
+  const multiPlanVersionRef = useRef(0);
+  const multiPreviewRef = useRef(new MultiRoutePreview());
+  const displayMultiPreview = useCallback((points: PlannedRoutePoint[]) => {
+    setMultiRoute((previous) => {
+      if (previous?.length === points.length && previous.every((p, i) =>
+        p.x === points[i].x && p.y === points[i].y && p.z === points[i].z)) return previous;
+      return points.length ? points : null;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (multiStatus?.state !== "running") return;
+    setMultiTracking(true);
+    multiPlanVersionRef.current += 1;
+    setMultiPlanning(false);
+    setMultiPoints(multiStatus.goals);
+    setMultiEditing(false);
+    setShowMulti(true);
+    const updated = multiPreviewRef.current.updateDispatched(
+      multiStatus.goals, multiStatus.current_index, multiStatus.route,
+    );
+    if (updated) displayMultiPreview(updated);
+  }, [multiStatus, displayMultiPreview]);
+  const visiblePoints = showMulti ? multiPoints : waypoints;
+  const markerStatus = showMulti && goalMarkerStatus ? {
+    ...goalMarkerStatus,
+    current_index: multiTracking ? multiStatus?.current_index ?? -1 : -1,
+    state: multiRunning ? "running" as const : "idle" as const,
+  } : goalMarkerStatus;
   // 目标点预规划 / submit_route(navi_mode=2)下发的参考路线,
   // 单纯用来在地图上画出来(跟"是不是正在跑"是两回事,
   // 那个用上面的 navRunning)——完成/失败之后仍然留着当"最近一次下发的路线"看,
@@ -252,6 +293,7 @@ export default function MapPreviewPage() {
   const [dispatchedRoute, setDispatchedRoute] = useState<PlannedRoutePoint[] | null>(null);
   // 改点、取消、开始导航或离开地图后, 忽略旧的目标点预规划响应。
   const goalPlanVersionRef = useRef(0);
+  const visibleRoute = showMulti ? multiRoute : dispatchedRoute;
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
   // 独立的另一条链路——起终点在 2D 栅格图上跑 A* 规划(global_planner.py),
@@ -298,12 +340,21 @@ export default function MapPreviewPage() {
   // 会画到不相关的地图上。
   useEffect(() => {
     setWaypoints([]);
+    setMultiTracking(false);
+    setMultiPoints([]);
+    multiPreviewRef.current.clear();
+    setMultiRoute(null);
+    setMultiEditing(false);
+    setMultiPlanning(false);
+    setShowMulti(false);
+    setMultiError(null);
+    multiPlanVersionRef.current += 1;
     setRouteEditing(false);
     setStartGoal({ start: null, goal: null });
     setStartGoalPicking(false);
     setPlannedRoute(null);
     setDispatchedRoute(null);
-    return () => { goalPlanVersionRef.current += 1; };
+    return () => { goalPlanVersionRef.current += 1; multiPlanVersionRef.current += 1; };
   }, [name]);
 
   // 切到 2D 时 PointCloudView 会整个卸载(见下面渲染部分), "点选新中心点"/
@@ -321,6 +372,8 @@ export default function MapPreviewPage() {
    *  时再点一下直接退出——没有单独的"设置完成"步骤(只需要一个点, 点选/改点
    *  都在拾取模式里直接生效, 见 handleChangeGoalPoint)。 */
   function handleToggleGoalPick() {
+    setMultiEditing(false);
+    setShowMulti(false);
     if (routeEditing) {
       setRouteEditing(false);
       return;
@@ -361,6 +414,101 @@ export default function MapPreviewPage() {
     }
   }
 
+  async function handleChangeMultiPoints(next: Waypoint[]) {
+    const version = ++multiPlanVersionRef.current;
+    const preview = multiPreviewRef.current;
+    setMultiTracking(false);
+    setMultiPoints(next);
+    setMultiError(null);
+    setMultiPlanning(false);
+    if (!next.length) {
+      preview.clear();
+      setMultiRoute(null);
+      return;
+    }
+    preview.retain(next);
+    displayMultiPreview(preview.cachedRoute(next));
+    if (!pose || pose.cov >= POSE_COV_BAD || !isActive) {
+      setMultiError("还没有有效的机器狗位姿, 无法规划路径");
+      return;
+    }
+    preview.setOrigin(pose);
+    setMultiPlanning(true);
+    try {
+      await preview.plan(next,
+        async (start, goal) => (await planPath(name, start, goal, "preview")).points,
+        () => version === multiPlanVersionRef.current,
+        displayMultiPreview,
+      );
+    } catch (e) {
+      if (version === multiPlanVersionRef.current) setMultiError(String(e));
+    } finally {
+      if (version === multiPlanVersionRef.current) setMultiPlanning(false);
+    }
+  }
+
+  function handleClearMultiPoints() {
+    void handleChangeMultiPoints([]);
+    setMultiEditing(false);
+    // 与单点栏的清空行为一致, 一并清除上一趟已走轨迹和局部规划轨迹。
+    setTrail([]);
+    setOptimalTrajHidden(true);
+  }
+
+  function handleToggleMultiPick() {
+    if (recentering) pcRef.current?.toggleRecenter();
+    setRouteEditing(false);
+    setStartGoalPicking(false);
+    cancelRegionDraft();
+    setShowMulti(true);
+    setMultiEditing((editing) => !editing);
+  }
+
+  async function handleStartMultiNav() {
+    setMultiBusy(true);
+    setMultiError(null);
+    multiPlanVersionRef.current += 1;
+    setMultiPlanning(false);
+    try {
+      const result = await startMultiNavigation(multiPoints, name);
+      setMultiTracking(true);
+      const multi = result.multi_navigation;
+      if (multi) {
+        const updated = multiPreviewRef.current.updateDispatched(multi.goals, multi.current_index, multi.route);
+        if (updated) displayMultiPreview(updated);
+      }
+      setMultiEditing(false);
+      setRouteEditing(false);
+      setStartGoalPicking(false);
+      cancelRegionDraft();
+      setShowMulti(true);
+      setTrail([]);
+    } catch (e) {
+      setMultiError(String(e));
+    } finally {
+      setMultiBusy(false);
+    }
+  }
+
+  async function handleStopMultiNav() {
+    setMultiBusy(true);
+    setMultiError(null);
+    multiPlanVersionRef.current += 1;
+    multiPreviewRef.current.clear();
+    setMultiPlanning(false);
+    try {
+      await estop();
+      goalPlanVersionRef.current += 1;
+      setDispatchedRoute(null);
+      setMultiRoute(null);
+      setOptimalTrajHidden(true);
+    } catch (e) {
+      setMultiError(String(e));
+    } finally {
+      setMultiBusy(false);
+    }
+  }
+
   function cancelRegionDraft() {
     setRegionDraftKind(null);
     setRegionDraft([]);
@@ -369,6 +517,7 @@ export default function MapPreviewPage() {
 
   /** 开始画一块区域。跟另外三个拾取模式互斥(它们在 2D/3D 里共用同一个左键手势)。 */
   function handleStartRegionDraft(kind: MapEditKind) {
+    setMultiEditing(false);
     if (regionDraftKind === kind) { cancelRegionDraft(); return; }
     if (recentering) pcRef.current?.toggleRecenter();
     if (routeEditing) setRouteEditing(false);
@@ -389,6 +538,10 @@ export default function MapPreviewPage() {
       refreshRegions();
       // 编辑区域会改变全局规划的结果, 上一次算出来的预览路线已经不作数了。
       setPlannedRoute(null);
+      multiPreviewRef.current.clear();
+      multiPlanVersionRef.current += 1;
+      setMultiPlanning(false);
+      setMultiRoute(null);
     } catch (e) {
       setRegionError(String(e));
     }
@@ -401,6 +554,10 @@ export default function MapPreviewPage() {
       setSelectedRegionId(null);
       refreshRegions();
       setPlannedRoute(null);
+      multiPreviewRef.current.clear();
+      multiPlanVersionRef.current += 1;
+      setMultiPlanning(false);
+      setMultiRoute(null);
     } catch (e) {
       setRegionError(String(e));
     }
@@ -412,12 +569,17 @@ export default function MapPreviewPage() {
       await updateMapEdit(name, id, { enabled });
       refreshRegions();
       setPlannedRoute(null);
+      multiPreviewRef.current.clear();
+      multiPlanVersionRef.current += 1;
+      setMultiPlanning(false);
+      setMultiRoute(null);
     } catch (e) {
       setRegionError(String(e));
     }
   }
 
   function handleStartStartGoalPick() {
+    setMultiEditing(false);
     // 同上, 进起终点拾取前把"点选新中心点"/"设置目标点"都取消掉。
     if (recentering) pcRef.current?.toggleRecenter();
     if (routeEditing) setRouteEditing(false);
@@ -476,6 +638,8 @@ export default function MapPreviewPage() {
    *  navi_mode=3 时代那样自己维护一个"是否在跑"的信号(见 navRunning 声明处
    *  的注释)。 */
   async function handleStartNav() {
+    setMultiEditing(false);
+    setShowMulti(false);
     const goal = waypoints[0];
     if (!goal || !pose) return;
     goalPlanVersionRef.current += 1;
@@ -515,6 +679,10 @@ export default function MapPreviewPage() {
       await estop();
       goalPlanVersionRef.current += 1;
       setDispatchedRoute(null);
+      multiPlanVersionRef.current += 1;
+      multiPreviewRef.current.clear();
+      setMultiPlanning(false);
+      setMultiRoute(null);
     } catch (e) {
       setNavError(String(e));
     } finally {
@@ -591,9 +759,9 @@ export default function MapPreviewPage() {
               mapName={name}
               meta={info.topview_meta}
               pointcloudMeta={info.pointcloud_meta}
-              waypoints={waypoints}
-              showWaypointNumbers={false}
-              status={goalMarkerStatus}
+              waypoints={visiblePoints}
+              showWaypointNumbers={showMulti}
+              status={markerStatus}
               trail={isActive ? trail : null}
               mappingTrail={mappingTrailOn ? mappingTrail : null}
               optimalTraj={isActive && !optimalTrajHidden ? optimalTraj : null}
@@ -603,13 +771,13 @@ export default function MapPreviewPage() {
               showFollowButton={false}
               onRecenterModeChange={setRecentering}
               onFollowingChange={setFollowing}
-              routeEditMode={routeEditing}
-              onChangeWaypoints={handleChangeGoalPoint}
+              routeEditMode={routeEditing || multiEditing}
+              onChangeWaypoints={multiEditing ? handleChangeMultiPoints : handleChangeGoalPoint}
               startGoalPickMode={startGoalPicking}
               startGoal={startGoal}
               onChangeStartGoal={setStartGoal}
               plannedRoute={plannedRoute}
-              navRoute={isActive ? dispatchedRoute : null}
+              navRoute={isActive ? visibleRoute : null}
               selfInflation={selfInflation}
               inflationMap={inflationMap}
               surfCloud={surfCloud}
@@ -620,10 +788,11 @@ export default function MapPreviewPage() {
                 ref={tvRef}
                 mapName={name}
                 meta={topview2d}
-                waypoints={waypoints}
-                showWaypointNumbers={false}
-                onChangeWaypoints={handleChangeGoalPoint}
-                editable={routeEditing}
+                waypoints={visiblePoints}
+                showWaypointNumbers={showMulti}
+                showWaypointConnections={false}
+                onChangeWaypoints={multiEditing ? handleChangeMultiPoints : handleChangeGoalPoint}
+                editable={routeEditing || multiEditing}
                 regionDraftKind={regionDraftKind}
                 regionDraft={regionDraft}
                 onChangeRegionDraft={setRegionDraft}
@@ -634,9 +803,9 @@ export default function MapPreviewPage() {
                 startGoal={startGoal}
                 onChangeStartGoal={setStartGoal}
                 plannedRoute={plannedRoute}
-                navRoute={isActive ? dispatchedRoute : null}
+                navRoute={isActive ? visibleRoute : null}
                 mappingTrail={mappingTrailOn ? mappingTrail : null}
-                status={goalMarkerStatus}
+                status={markerStatus}
                 maxWidth={viewportSize.width}
                 maxHeight={viewportSize.height}
                 defaultZoom={1}
@@ -655,6 +824,10 @@ export default function MapPreviewPage() {
           {viewMode === "3d" && recentering ? (
             <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
               点击点云上的一个点, 把它设为新的旋转中心
+            </div>
+          ) : multiEditing ? (
+            <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
+              设置导航点中: 左键添加导航点, 右键点击导航点删除, 按编号依次导航
             </div>
           ) : routeEditing ? (
             <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
@@ -828,7 +1001,7 @@ export default function MapPreviewPage() {
                       // 跟"设置目标点"/"设置起终点"在 3D 视图里是同一个左键
                       // 点击手势, 那两个模式开着的时候不能再切进这个模式,
                       // 得先退出各自的拾取模式。
-                      disabled={viewMode === "2d" || routeEditing || startGoalPicking}
+                      disabled={viewMode === "2d" || routeEditing || multiEditing || startGoalPicking}
                       title={
                         routeEditing ? "设置目标点中, 先点「取消设置目标点」"
                           : startGoalPicking ? "设置起终点中, 先点「设置完成」"
@@ -855,7 +1028,7 @@ export default function MapPreviewPage() {
                         icon={MapPin}
                         label={routeEditing ? "取消设置目标点" : "设置目标点"}
                         active={routeEditing}
-                        disabled={navRunning || startGoalPicking}
+                        disabled={navRunning || submitting || multiBusy || startGoalPicking}
                         title={
                           navRunning ? "导航进行中不能设置目标点"
                             : startGoalPicking ? "设置起终点中, 先点「设置完成」"
@@ -877,6 +1050,8 @@ export default function MapPreviewPage() {
                         // 后者是 ws 推来的、页面不持有数据, 只能记一个隐藏标记(见
                         // optimalTrajHidden 声明处的注释)。
                         onClick={() => {
+                          setMultiEditing(false);
+                          setShowMulti(false);
                           void handleChangeGoalPoint([]);
                           setTrail([]);
                         }}
@@ -884,7 +1059,7 @@ export default function MapPreviewPage() {
                       <PanelButton
                         icon={Play}
                         label={submitting ? "下发中…" : "开始导航"}
-                        disabled={waypoints.length === 0 || !hasPose || submitting || navRunning}
+                        disabled={waypoints.length === 0 || !hasPose || submitting || multiBusy || navRunning}
                         title={waypoints.length > 0 && !hasPose ? "还没有收到机器狗位姿" : undefined}
                         onClick={handleStartNav}
                       />
@@ -906,6 +1081,32 @@ export default function MapPreviewPage() {
                   </PanelSection>
                 )}
 
+                {isActive && (
+                  <PanelSection title="多点导航">
+                    <div className="flex flex-col gap-1.5">
+                      <PanelButton icon={MapPin} label={multiEditing ? "取消设置导航点" : "设置导航点"}
+                        active={multiEditing} disabled={navRunning || multiBusy || submitting}
+                        onClick={handleToggleMultiPick} />
+                      <PanelButton icon={Trash2} label="清空导航点"
+                        disabled={navRunning || multiBusy || submitting || (
+                          !multiPoints.length && !multiRoute?.length && !trail.length
+                          && (optimalTrajHidden || !optimalTraj?.length)
+                        )}
+                        onClick={handleClearMultiPoints} />
+                      <PanelButton icon={Play} label={multiBusy ? "处理中…" : "开始导航"}
+                        disabled={!multiPoints.length || !hasPose || (pose?.cov ?? POSE_COV_BAD) >= POSE_COV_BAD || navRunning || multiBusy || submitting || multiPlanning}
+                        onClick={handleStartMultiNav} />
+                      <PanelButton icon={OctagonX} label="停止导航"
+                        disabled={multiBusy || submitting} onClick={handleStopMultiNav} />
+                      <p className="px-2 text-xs text-white/60">
+                        {multiPlanning ? "规划路线中…" : `已设置 ${multiPoints.length} 个导航点`}
+                      </p>
+                      {multiTracking && multiStatus?.message && <p className="px-2 text-xs text-white/70">{multiStatus.message}</p>}
+                      {multiError && <p className="px-2 text-xs text-red-400">{multiError}</p>}
+                    </div>
+                  </PanelSection>
+                )}
+
                 {/* 独立于上面的"导航控制": 两边都是 global_planner.plan_path
                     算出参考路线补好 z —— 区别是这里起终点要手动点选两个, 且规划
                     结果只用来看, 不会像"导航控制"那样接着调 submit_route 真的
@@ -918,7 +1119,7 @@ export default function MapPreviewPage() {
                       icon={Flag}
                       label="设置起终点"
                       active={startGoalPicking}
-                      disabled={startGoalPicking || navRunning || routeEditing}
+                      disabled={startGoalPicking || navRunning || routeEditing || multiEditing}
                       title={
                         navRunning ? "导航进行中不能规划路线"
                           : routeEditing ? "设置目标点中, 先点「取消设置目标点」"

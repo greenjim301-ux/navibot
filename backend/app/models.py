@@ -102,6 +102,19 @@ class Pose(BaseModel):
     绝对坐标的导航点都不可信, 前端要显眼地提示。"""
 
 
+class MultiNavigationStatus(BaseModel):
+    state: TaskState = TaskState.IDLE
+    goals: List[Waypoint] = Field(default_factory=list)
+    current_index: int = -1
+    route: List[PlanPathPoint] = Field(default_factory=list)
+    message: Optional[str] = None
+
+
+class MultiNavigationRequest(BaseModel):
+    map_name: str
+    goals: List[Waypoint] = Field(min_length=1)
+
+
 class NavStatus(BaseModel):
     state: TaskState
     waypoints: List[Waypoint] = []
@@ -111,6 +124,7 @@ class NavStatus(BaseModel):
     message: Optional[str] = None
     robot_pose: Optional[Pose] = None
     updated_at: float
+    multi_navigation: MultiNavigationStatus = Field(default_factory=MultiNavigationStatus)
 
 
 class MapStatus(str, Enum):

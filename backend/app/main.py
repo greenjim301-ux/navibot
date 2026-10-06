@@ -23,7 +23,7 @@ from .models import (
     CreateRouteRequest,
     GroundZRequest, GroundZResponse,
     MapEditRegion, MapEdits, MapTrajectoryResponse,
-    MapInfo, NavStatus,
+    MapInfo, NavStatus, MultiNavigationRequest, Waypoint, Pose, XY,
     InflationMapRequest,
     MappingModeInfo, MappingStatus,
     PlanPathRequest, PlanPathResponse, PlanPathPoint,
@@ -174,6 +174,68 @@ async def submit_route(req: RouteRequest):
         raise HTTPException(503, str(e))
 
 
+def _compute_planned_path(name: str, start: XY, goal: XY) -> List[dict]:
+    """预览、单点和多点下发共用规划约束及高度计算, 避免显示和执行路径分叉。"""
+    # 把地面高程查询喂给剪枝: 它的 line-of-sight 判据是纯 2D 的, 不知道一条
+    # "x/y 上的直线"在 3D 里可能是条陡坡。楼梯上不给这个信息, 整条楼梯会被
+    # 压成一对途经点(实测水平 2.96m / 爬升 1.33m), 局部规划器没法跟。
+    def elevations(points: List[tuple]) -> List[Optional[float]]:
+        return [path_planner.ground_elevation(name, x, y) for x, y in points]
+
+    raw_points = global_planner.plan_path(
+        name, (start.x, start.y), (goal.x, goal.y),
+        elevation_fn=elevations,
+        # 人工编辑的可通行/禁行区域(见 map_edit_store.py)。只取 enabled 的。
+        edit_regions=map_edit_store.active_regions(name),
+        # 建图轨迹: 让规划优先贴着狗走过的路走, 而且轨迹压过膨胀余量
+        # (见 global_planner.plan_path 的说明)。没有轨迹数据时是 None,
+        # 退回改动前的纯代价 + 纯膨胀行为。
+        trajectory=path_planner.mapping_trajectory(name),
+    )
+    delta = route_manager.get_altitude_calibration(name)
+    # 这两条警告原来是**逐点**打的 —— 一条 300 多个点的路线就刷 300 多行,
+    # 而它们讲的是整条路线共同的前提(这张图没有轨迹数据 / 现在算不出 Δ),
+    # 每个点重复一遍没有任何新信息。整条路线各打一次就够。
+    warned_no_ground = False
+    warned_no_delta = False
+    out = []
+    for x, y in raw_points:
+        ground = path_planner.ground_elevation(name, x, y)
+        if ground is None:
+            if not warned_no_ground:
+                logger.warning(
+                    "plan_path: map=%s 没有建图轨迹数据, 查不到地面高程, 整条路线 z 按 0 兜底", name,
+                )
+                warned_no_ground = True
+            z = 0.0
+        elif delta is None:
+            if not warned_no_delta:
+                logger.warning(
+                    "plan_path: map=%s 算不出位姿标定 Δ(没连机器狗, 或它不在这张图上), "
+                    "整条路线的 z 直接用未标定的轨迹高度", name,
+                )
+                warned_no_delta = True
+            z = ground
+        else:
+            z = ground + delta
+        out.append({"x": x, "y": y, "z": z})
+    return out
+
+
+def _plan_multi_segment(name: str, pose: Pose, goal: Waypoint) -> List[PlanPathPoint]:
+    return [PlanPathPoint(**point) for point in _compute_planned_path(
+        name, XY(x=pose.x, y=pose.y), XY(x=goal.x, y=goal.y),
+    )]
+
+
+@app.post("/api/multi_navigation", response_model=NavStatus)
+async def start_multi_navigation(req: MultiNavigationRequest):
+    try:
+        return route_manager.start_multi_navigation(req.goals, req.map_name, _plan_multi_segment)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/api/estop", response_model=NavStatus)
 async def estop():
     try:
@@ -279,56 +341,8 @@ async def plan_path(name: str, req: PlanPathRequest):
         name, req.start.x, req.start.y, req.goal.x, req.goal.y, req.purpose.value,
     )
 
-    def compute() -> List[dict]:
-        # 把地面高程查询喂给剪枝: 它的 line-of-sight 判据是纯 2D 的, 不知道一条
-        # "x/y 上的直线"在 3D 里可能是条陡坡。楼梯上不给这个信息, 整条楼梯会被
-        # 压成一对途经点(实测水平 2.96m / 爬升 1.33m), 局部规划器没法跟。
-        def elevations(points: List[tuple]) -> List[Optional[float]]:
-            return [path_planner.ground_elevation(name, x, y) for x, y in points]
-
-        raw_points = global_planner.plan_path(
-            name, (req.start.x, req.start.y), (req.goal.x, req.goal.y),
-            elevation_fn=elevations,
-            # 人工编辑的可通行/禁行区域(见 map_edit_store.py)。只取 enabled 的。
-            edit_regions=map_edit_store.active_regions(name),
-            # 建图轨迹: 让规划优先贴着狗走过的路走, 而且轨迹压过膨胀余量
-            # (见 global_planner.plan_path 的说明)。没有轨迹数据时是 None,
-            # 退回改动前的纯代价 + 纯膨胀行为。
-            # **暂时屏蔽**: 固定传 None, 不再优先走建图轨迹。恢复时改回
-            # trajectory=path_planner.mapping_trajectory(name)。
-            trajectory=None,
-        )
-        delta = route_manager.get_altitude_calibration(name)
-        # 这两条警告原来是**逐点**打的 —— 一条 300 多个点的路线就刷 300 多行,
-        # 而它们讲的是整条路线共同的前提(这张图没有轨迹数据 / 现在算不出 Δ),
-        # 每个点重复一遍没有任何新信息。整条路线各打一次就够。
-        warned_no_ground = False
-        warned_no_delta = False
-        out = []
-        for x, y in raw_points:
-            ground = path_planner.ground_elevation(name, x, y)
-            if ground is None:
-                if not warned_no_ground:
-                    logger.warning(
-                        "plan_path: map=%s 没有建图轨迹数据, 查不到地面高程, 整条路线 z 按 0 兜底", name,
-                    )
-                    warned_no_ground = True
-                z = 0.0
-            elif delta is None:
-                if not warned_no_delta:
-                    logger.warning(
-                        "plan_path: map=%s 算不出位姿标定 Δ(没连机器狗, 或它不在这张图上), "
-                        "整条路线的 z 直接用未标定的轨迹高度", name,
-                    )
-                    warned_no_delta = True
-                z = ground
-            else:
-                z = ground + delta
-            out.append({"x": x, "y": y, "z": z})
-        return out
-
     try:
-        points = await run_in_threadpool(compute)
+        points = await run_in_threadpool(_compute_planned_path, name, req.start, req.goal)
     except ValueError as e:
         # global_planner.plan_path 抛的 ValueError 就是给用户看的失败原因(没有 2D
         # 栅格图 / 起终点超出范围 / 落在禁行区 / 离障碍物太近 / 两点间无可行路径)。

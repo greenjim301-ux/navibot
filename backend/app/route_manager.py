@@ -8,7 +8,7 @@ from typing import Callable, List, Optional
 import numpy as np
 
 from . import config, path_planner
-from .models import NavStatus, Pose, TaskState, Waypoint
+from .models import NavStatus, Pose, TaskState, Waypoint, MultiNavigationStatus, PlanPathPoint
 from .ros_bridge import RosBridge
 from .ws_manager import WebSocketManager
 
@@ -80,7 +80,12 @@ class RouteManager:
         # 去给别的地图算高度标定 Δ 会得到一个纯垃圾值(见 _odom_delta)。传 None
         # 就退回不做这个检查(单元测试/不关心地图的场景)。
         self._active_map_fn = active_map_fn
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._multi = MultiNavigationStatus()
+        self._multi_generation = 0
+        self._multi_event = threading.Event()
+        self._multi_reached = False
+        self._multi_dispatched = False
 
         self._state = TaskState.IDLE
         self._waypoints: List[Waypoint] = []
@@ -133,6 +138,7 @@ class RouteManager:
             message=self._message,
             robot_pose=pose,
             updated_at=time.time(),
+            multi_navigation=self._multi.model_copy(deep=True),
         )
 
     def _broadcast_locked(self) -> None:
@@ -287,6 +293,13 @@ class RouteManager:
 
     def submit_route(self, waypoints: List[Waypoint], label: Optional[str] = None,
                       map_name: Optional[str] = None) -> NavStatus:
+        with self._lock:
+            if self._multi.state == TaskState.RUNNING:
+                raise ValueError("多点导航正在执行, 请先停止导航")
+            return self._submit_route(waypoints, label, map_name)
+
+    def _submit_route(self, waypoints: List[Waypoint], label: Optional[str] = None,
+                      map_name: Optional[str] = None) -> NavStatus:
         if not waypoints:
             raise ValueError("waypoints 不能为空")
 
@@ -328,13 +341,121 @@ class RouteManager:
         话题没有订阅者(planner 根本没在跑)会直接抛 RuntimeError, 这里不用
         自己再判断"当前是不是在跑"。
         """
-        self._ros.emergency_stop()
         with self._lock:
+            # 先作废队列, 即使 ROS 停止发布失败也绝不能再下发后续点。
+            self._multi_generation += 1
+            if self._multi.state == TaskState.RUNNING:
+                self._multi.state = TaskState.STOPPED
+                self._multi.message = "多点导航已停止"
+            self._multi_dispatched = False
+            self._multi_event.set()
+            try:
+                self._ros.emergency_stop()
+            except RuntimeError:
+                self._broadcast_locked()
+                raise
             if self._state == TaskState.RUNNING:
                 self._state = TaskState.STOPPED
                 self._message = "已停止, 需要重新设置并提交路线"
             self._broadcast_locked()
             return self._status_locked()
+
+    def start_multi_navigation(self, goals: List[Waypoint], map_name: str,
+                               plan: Callable) -> NavStatus:
+        if not goals:
+            raise ValueError("导航点不能为空")
+        with self._lock:
+            if self._state == TaskState.RUNNING or self._multi.state == TaskState.RUNNING:
+                raise ValueError("导航正在执行, 请先停止导航")
+            self._require_multi_pose_locked(map_name)
+            self._multi_generation += 1
+            generation = self._multi_generation
+            self._multi = MultiNavigationStatus(
+                state=TaskState.RUNNING, goals=[g.model_copy(deep=True) for g in goals],
+                current_index=0, message="正在规划第 1 个导航点",
+            )
+            self._map_name = map_name
+            self._multi_dispatched = False
+            self._multi_event.clear()
+            self._broadcast_locked()
+            threading.Thread(target=self._run_multi_navigation,
+                             args=(generation, map_name, plan), daemon=True).start()
+            return self._status_locked()
+
+    def _require_multi_pose_locked(self, map_name: str) -> Pose:
+        if self._active_map_fn and self._active_map_fn() != map_name:
+            raise ValueError("多点导航只能在当前激活地图上执行")
+        pose = self._status_locked().robot_pose
+        if pose is None or pose.cov >= config.POSE_COV_BAD:
+            raise ValueError("没有有效的机器狗定位, 无法执行多点导航")
+        return pose
+
+    def _run_multi_navigation(self, generation: int, map_name: str, plan: Callable) -> None:
+        try:
+            while True:
+                with self._lock:
+                    if generation != self._multi_generation or self._multi.state != TaskState.RUNNING:
+                        return
+                    index = self._multi.current_index
+                    goal = self._multi.goals[index]
+                    pose = self._require_multi_pose_locked(map_name)
+                    self._multi.message = f"正在规划第 {index + 1} 个导航点"
+                    self._broadcast_locked()
+                # 耗时规划不占锁, 停止请求可以立即作废本次结果。
+                points = plan(map_name, pose, goal)
+                if not points:
+                    raise ValueError("规划结果为空")
+                corners = points[1:] or points[-1:]
+                waypoints = []
+                for i, point in enumerate(corners):
+                    prev = points[0] if i == 0 else corners[i - 1]
+                    waypoints.append(Waypoint(x=point.x, y=point.y,
+                                              yaw=math.atan2(point.y - prev.y, point.x - prev.x)))
+                with self._lock:
+                    if generation != self._multi_generation or self._multi.state != TaskState.RUNNING:
+                        return
+                    self._require_multi_pose_locked(map_name)
+                    self._multi_reached = False
+                    self._multi_event.clear()
+                    self._multi.route = points
+                    self._multi.message = f"正在前往第 {index + 1} / {len(self._multi.goals)} 个导航点"
+                    self._submit_route(waypoints, "多点导航", map_name)
+                    self._multi_dispatched = True
+                while True:
+                    self._multi_event.wait(1.0)
+                    with self._lock:
+                        if generation != self._multi_generation or self._multi.state != TaskState.RUNNING:
+                            return
+                        self._require_multi_pose_locked(map_name)
+                        if self._state == TaskState.FAILED:
+                            raise RuntimeError(self._message or "当前导航段执行失败")
+                        if self._multi_reached:
+                            self._multi_dispatched = False
+                            self._multi.current_index += 1
+                            if self._multi.current_index == len(self._multi.goals):
+                                self._multi.state = TaskState.SUCCEEDED
+                                self._multi.message = "多点导航完成"
+                                self._broadcast_locked()
+                                return
+                            # 下个点仍在规划时不能把上一段路线标成下个点的路线。
+                            self._multi.route = []
+                            break
+        except Exception as exc:
+            logger.exception("多点导航失败")
+            with self._lock:
+                if generation != self._multi_generation:
+                    return
+                self._multi.state = TaskState.FAILED
+                self._multi.message = f"多点导航失败, 已取消后续导航点: {exc}"
+                self._state = TaskState.FAILED
+                self._message = self._multi.message
+                if self._multi_dispatched:
+                    try:
+                        self._ros.emergency_stop()
+                    except RuntimeError:
+                        logger.exception("多点导航失败后停止 planner 失败")
+                self._multi_dispatched = False
+                self._broadcast_locked()
 
     # ---- 进度推断 ----
     def _reset_stuck_locked(self) -> None:
@@ -355,6 +476,10 @@ class RouteManager:
         发生了变化。这是途中点的判据; 对最后一个点只是近似, 见 config.py。"""
         moved = False
         while self._current_index < len(self._waypoints):
+            # 多点队列仅在 planner 确认整段结束后推进, 不用 odom 近似提前发下一段。
+            if (self._multi.state == TaskState.RUNNING
+                    and self._current_index == len(self._waypoints) - 1):
+                break
             if self._dist_to_locked(self._current_index) >= config.REACH_EPS_M:
                 break
             self._current_index += 1
@@ -376,6 +501,9 @@ class RouteManager:
         """
         while (self._current_index < len(self._waypoints)
                and self._dist_to_locked(self._current_index) < config.DEGENERATE_DIST_M):
+            if (self._multi.state == TaskState.RUNNING
+                    and self._current_index == len(self._waypoints) - 1):
+                break
             self._current_index += 1
         if self._current_index >= len(self._waypoints):
             self._state = TaskState.SUCCEEDED
@@ -417,6 +545,14 @@ class RouteManager:
             return
         with self._lock:
             state_changed = False
+            if self._multi.state == TaskState.RUNNING and self._multi_dispatched:
+                if status == self.FINISHED_REACHED:
+                    self._multi_reached = True
+                else:
+                    self._multi.state = TaskState.FAILED
+                    self._multi.message = "planner 自行触发急停, 已取消后续导航点"
+                self._multi_dispatched = False
+                self._multi_event.set()
             if self._state == TaskState.RUNNING:
                 if status == self.FINISHED_REACHED:
                     self._state = TaskState.SUCCEEDED

@@ -17,6 +17,8 @@ interface Props {
    *  顺序用; 只有一个目标点的场景(如 MapPreviewPage 的"设置目标点")传 false,
    *  一个点标个"1"没有意义, 纯干扰。 */
   showWaypointNumbers?: boolean;
+  /** 是否显示导航点间的直连虚线; 已有规划路线时可以关闭。 */
+  showWaypointConnections?: boolean;
   /** "设置起终点"(路线预览)模式, 跟 editable(设置路线) 互斥, 用法/手势跟
    *  PointCloudView 的同名 prop 完全一致: 左键先设起点再设终点, 两个都设好了
    *  再点不生效; 右键撤销最近设置的那个点(先撤终点, 再撤起点), 不需要点在
@@ -146,7 +148,7 @@ function centerOnOrigin(meta: Topview2D): Topview2D {
 
 export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
   mapName, meta, waypoints, onChangeWaypoints, editable, status,
-  showWaypointNumbers = true,
+  showWaypointNumbers = true, showWaypointConnections = true,
   startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
   mappingTrail = null,
   regionDraftKind = null, regionDraft = [], onChangeRegionDraft,
@@ -494,7 +496,7 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
             })()}
 
             {/* 途经点之间的直连虚线只表达顺序, 不代表真会走直线 */}
-            {linePoints.length >= 4 && (
+            {showWaypointConnections && linePoints.length >= 4 && (
               <Line
                 points={linePoints}
                 stroke="#2376e5"
@@ -510,7 +512,11 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
               const isDone = status ? idx < status.current_index : false;
               const color = isCurrent ? "#f59e0b" : isDone ? "#18a66e" : "#2376e5";
               return (
-                <Group key={idx}>
+                <Group key={idx} onContextMenu={(e) => {
+                  e.evt.preventDefault();
+                  e.cancelBubble = true;
+                  removeWaypoint(idx);
+                }}>
                   <Circle
                     x={px}
                     y={py}
@@ -534,7 +540,10 @@ export const TopView = forwardRef<TopViewHandle, Props>(function TopView({
                       y={py + WAYPOINT_LABEL_OFFSET_PX.y / zoom}
                       text={String(idx + 1)}
                       fontSize={WAYPOINT_LABEL_FONT_PX / zoom}
-                      fill="#111"
+                      fill="#fff"
+                      stroke="#111"
+                      strokeWidth={1 / zoom}
+                      fillAfterStrokeEnabled
                       rotation={-rotation}
                     />
                   )}
