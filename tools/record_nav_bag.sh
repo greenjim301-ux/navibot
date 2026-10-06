@@ -21,7 +21,7 @@
 #
 # ============================ 录什么, 为什么是这些 ============================
 #
-# 默认十二个话题 (六个必需 + 六个诊断话题):
+# 默认十三个话题 (六个必需 + 七个诊断话题):
 #   /cmd_vel                 闭环控制器的唯一输出 (closed_loop_controller.cpp:394)
 #   /hand_lio/odom_vehicle   规划器和控制器共用的位姿源 (run.launch body_pose_topic)
 #   /planning/bspline        参考轨迹 (scan_replan_fsm.cpp:58), 每次重规划一条
@@ -29,13 +29,15 @@
 #   /planning/stop           "急停"信号, 全仓库只在 callEmergencyStop 发
 #   /planning/finished       整轮任务结束 (REACHED / EMERGENCY_STOP), 只发一次
 #
-# 另外默认加六条诊断话题:
+# 另外默认加七条诊断话题:
 #   /latest_imu_odom         grodom 的 200Hz 高频位姿, hand_lio 的输入。位姿上和
 #                            /hand_lio/odom_vehicle 只差一个外参, 但只有它带滤波器自己
 #                            估的速度 (odom_vehicle 的 twist 是全零), 排查"两次激光修正
 #                            之间的前推为什么偏"要靠它
 #   /lidar_pose              grodom 的扫描匹配位姿 (grodom_ros1 发, 实测 5~8Hz, 达不到 10Hz 的雷达帧率)
-#   /hand_lio/odom_fused_shadow  融合里程计的旁路输出
+#   /hand_lio/odom_vehicle_stream  高频流直接合成的机体位姿。hand_lio 的 pose_source=fused 时
+#                            odom_vehicle 换成了融合位姿, 靠它跟原来的位姿对比 (stream 时两者相同)
+#   /hand_lio/odom_fused_shadow  融合里程计的旁路输出 (pose_source=fused 时不用再起旁路节点)
 #   /hand_lio/pose_fusion_diag   位姿融合诊断
 #   /deep_bridge_node/motion_status  底盘运动状态
 #   /deep_bridge_node/motion_status_raw  底盘运控状态上报的 JSON 原文 (字段含义未定, 离线对比用)
@@ -112,6 +114,7 @@ REQUIRED_TOPICS=(
 DEFAULT_EXTRA_TOPICS=(
     /latest_imu_odom
     /lidar_pose
+    /hand_lio/odom_vehicle_stream
     /hand_lio/odom_fused_shadow
     /hand_lio/pose_fusion_diag
     /deep_bridge_node/motion_status
@@ -530,6 +533,7 @@ check_topic /preset_waypoints          "" yes
 if [ "$MINIMAL" -eq 0 ]; then
     check_topic /latest_imu_odom                  200 no
     check_topic /lidar_pose                         5 no
+    check_topic /hand_lio/odom_vehicle_stream     200 no
     check_topic /hand_lio/odom_fused_shadow        "" no
     check_topic /hand_lio/pose_fusion_diag         "" no
     check_topic /deep_bridge_node/motion_status    "" no
