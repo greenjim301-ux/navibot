@@ -142,11 +142,26 @@ class RouteManager:
         )
 
     def _broadcast_locked(self) -> None:
+        if self._state != TaskState.RUNNING:
+            self._clear_optimal_traj_locked()
         self._ws.broadcast_threadsafe({"type": "nav_status", "data": self._status_locked().model_dump()})
+
+    def _clear_optimal_traj_locked(self) -> None:
+        if self._optimal_traj:
+            self._optimal_traj = []
+            self._ws.broadcast_threadsafe({"type": "optimal_traj", "data": {"points": []}})
+
+    def _optimal_traj_is_current_locked(self) -> bool:
+        return self._state == TaskState.RUNNING and (
+            self._active_map_fn is None or self._map_name is None
+            or self._active_map_fn() == self._map_name
+        )
 
     def get_optimal_traj(self) -> List[dict]:
         """planner 当前正在跑的局部轨迹采样点, 给新连上的 ws 客户端补发用。"""
         with self._lock:
+            if not self._optimal_traj_is_current_locked():
+                return []
             return list(self._optimal_traj)
 
     def get_self_inflation_state(self) -> dict:
@@ -313,6 +328,7 @@ class RouteManager:
         ])
 
         with self._lock:
+            self._clear_optimal_traj_locked()
             self._waypoints = list(waypoints)
             self._dispatched_z = [a.z for a in alts]
             self._label = label
@@ -576,8 +592,13 @@ class RouteManager:
         的调用本身就已经是限流后的频率, 直接存+广播, 不用再自己维护一份时间戳。
         """
         with self._lock:
+            # planner 的可视化 Marker 可能在停止后仍保留/重发旧曲线。
+            # 空闲时不缓存，换地图后也不把上一张图的轨迹交给新客户端。
+            if not self._optimal_traj_is_current_locked():
+                self._clear_optimal_traj_locked()
+                return
             self._optimal_traj = points
-        self._ws.broadcast_threadsafe({"type": "optimal_traj", "data": {"points": points}})
+            self._ws.broadcast_threadsafe({"type": "optimal_traj", "data": {"points": points}})
 
     def _self_inflation_payload_locked(self) -> dict:
         return {"enabled": self._self_inflation_enabled, "markers": list(self._self_inflation.values())}

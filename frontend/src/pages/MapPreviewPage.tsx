@@ -11,6 +11,8 @@ import {
   updateMapEdit, startMultiNavigation,
 } from "../api";
 import { useMapInfo } from "../hooks/useMapInfo";
+import { useLocalizationStatus } from "../hooks/useLocalizationStatus";
+import { POSE_COV_BAD } from "../lib/localizationStatus";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
@@ -41,7 +43,6 @@ const TRAIL_MAX_POINTS = 5000;
 // 还没收敛时会先发几帧这样的位姿)。历史上踩过的坑: 不过滤的话, 这种失败位姿
 // 会被当成正常轨迹点记进 trail, 跟它前后的真实位姿之间画出一条不存在的直线
 // (比如从原点直接拉到机器狗当前位置)。
-const POSE_COV_BAD = 0.99;
 
 // 面板背景是暗色(bg-neutral-900/90), 但 Switch 组件的默认配色走的是全局(浅色)
 // 主题 token——关闭态的滑轨(bg-input, 浅灰)跟球(bg-background, 近白)几乎同色,
@@ -103,6 +104,13 @@ export default function MapPreviewPage() {
   // 这里自然不会累积。
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const pose = displayStatus?.robot_pose;
+  const localizationState = useLocalizationStatus(pose, displayStatus?.updated_at, connected);
+  const canSetNavigationPoints = isActive && localizationState === "normal";
+  const localizationBlockReason = localizationState === "failed"
+    ? "定位失败，无法设置导航点或目标点"
+    : "无定位，无法设置导航点或目标点";
+  const navigationReadyRef = useRef(canSetNavigationPoints);
+  navigationReadyRef.current = canSetNavigationPoints;
   useEffect(() => {
     // cov >= POSE_COV_BAD 表示这一帧位姿定位失败, x/y/z 不可信——不跳过的话
     // 这一帧会被记成轨迹上的一个点, 跟前后真实位姿之间连出一条不存在的直线
@@ -294,6 +302,14 @@ export default function MapPreviewPage() {
   const [dispatchedRoute, setDispatchedRoute] = useState<PlannedRoutePoint[] | null>(null);
   // 改点、取消、开始导航或离开地图后, 忽略旧的目标点预规划响应。
   const goalPlanVersionRef = useRef(0);
+  useEffect(() => {
+    if (canSetNavigationPoints) return;
+    setRouteEditing(false);
+    setMultiEditing(false);
+    goalPlanVersionRef.current += 1;
+    multiPlanVersionRef.current += 1;
+    setMultiPlanning(false);
+  }, [canSetNavigationPoints]);
   const visibleRoute = showMulti ? multiRoute : dispatchedRoute;
 
   // 路线预览: 跟"导航控制"(navi_mode=2, preset_waypoints/RouteManager)是完全
@@ -373,6 +389,7 @@ export default function MapPreviewPage() {
    *  时再点一下直接退出——没有单独的"设置完成"步骤(只需要一个点, 点选/改点
    *  都在拾取模式里直接生效, 见 handleChangeGoalPoint)。 */
   function handleToggleGoalPick() {
+    if (!canSetNavigationPoints) return;
     setMultiEditing(false);
     setShowMulti(false);
     if (routeEditing) {
@@ -392,6 +409,7 @@ export default function MapPreviewPage() {
    *  的), 这里只取最新的最后一个点, 每次左键点选都直接替换掉上一个, 右键删除
    *  时数组变空、slice 结果也是空——不用改 PointCloudView/TopView 本身。 */
   async function handleChangeGoalPoint(next: Waypoint[]) {
+    if (next.length && !canSetNavigationPoints) return;
     const version = ++goalPlanVersionRef.current;
     const goal = next.at(-1);
     setWaypoints(goal ? [goal] : []);
@@ -401,8 +419,8 @@ export default function MapPreviewPage() {
       setOptimalTrajHidden(true);
       return;
     }
-    if (!pose || !isActive) {
-      setNavError("还没有收到机器狗位姿, 无法规划路径");
+    if (!pose || !canSetNavigationPoints) {
+      setNavError(localizationBlockReason);
       return;
     }
     try {
@@ -416,6 +434,7 @@ export default function MapPreviewPage() {
   }
 
   async function handleChangeMultiPoints(next: Waypoint[]) {
+    if (next.length && !canSetNavigationPoints) return;
     const version = ++multiPlanVersionRef.current;
     const preview = multiPreviewRef.current;
     setMultiTracking(false);
@@ -429,8 +448,8 @@ export default function MapPreviewPage() {
     }
     preview.retain(next);
     displayMultiPreview(preview.cachedRoute(next));
-    if (!pose || pose.cov >= POSE_COV_BAD || !isActive) {
-      setMultiError("还没有有效的机器狗位姿, 无法规划路径");
+    if (!pose || !canSetNavigationPoints) {
+      setMultiError(localizationBlockReason);
       return;
     }
     preview.setOrigin(pose);
@@ -457,6 +476,7 @@ export default function MapPreviewPage() {
   }
 
   function handleToggleMultiPick() {
+    if (!canSetNavigationPoints) return;
     if (recentering) pcRef.current?.toggleRecenter();
     setRouteEditing(false);
     setStartGoalPicking(false);
@@ -466,6 +486,7 @@ export default function MapPreviewPage() {
   }
 
   async function handleStartMultiNav() {
+    if (!canSetNavigationPoints) return;
     setMultiBusy(true);
     setMultiError(null);
     multiPlanVersionRef.current += 1;
@@ -639,11 +660,12 @@ export default function MapPreviewPage() {
    *  navi_mode=3 时代那样自己维护一个"是否在跑"的信号(见 navRunning 声明处
    *  的注释)。 */
   async function handleStartNav() {
+    if (!canSetNavigationPoints) return;
     setMultiEditing(false);
     setShowMulti(false);
     const goal = waypoints[0];
     if (!goal || !pose) return;
-    goalPlanVersionRef.current += 1;
+    const version = ++goalPlanVersionRef.current;
     setSubmitting(true);
     setNavError(null);
     try {
@@ -652,6 +674,10 @@ export default function MapPreviewPage() {
       const planned = await planPath(
         name, { x: pose.x, y: pose.y }, { x: goal.x, y: goal.y }, "navigate",
       );
+      if (!navigationReadyRef.current || version !== goalPlanVersionRef.current) {
+        setNavError("定位已失效，已取消导航下发");
+        return;
+      }
       const corners = planned.points.slice(1);
       const toDispatch = corners.length > 0 ? corners : planned.points.slice(-1);
       const dispatchWaypoints: Waypoint[] = toDispatch.map((p, i) => {
@@ -707,7 +733,7 @@ export default function MapPreviewPage() {
       </Link>
 
       {isActive && (
-        <LocalizationStatus pose={pose} updatedAt={displayStatus?.updated_at} connected={connected} />
+        <LocalizationStatus state={localizationState} />
       )}
 
       <div className="absolute bottom-3 left-3 z-10 rounded-md border border-white/20 bg-black/40 px-3 py-1.5 text-sm text-white/80 backdrop-blur">
@@ -769,14 +795,14 @@ export default function MapPreviewPage() {
               status={markerStatus}
               trail={isActive ? trail : null}
               mappingTrail={mappingTrailOn ? mappingTrail : null}
-              optimalTraj={isActive && !optimalTrajHidden ? optimalTraj : null}
+              optimalTraj={isActive && liveStatus?.state === "running" && !optimalTrajHidden ? optimalTraj : null}
               heightLimit={effectiveHeightLimit}
               controlMode="fixed"
               enableFollow
               showFollowButton={false}
               onRecenterModeChange={setRecentering}
               onFollowingChange={setFollowing}
-              routeEditMode={routeEditing || multiEditing}
+              routeEditMode={canSetNavigationPoints && (routeEditing || multiEditing)}
               onChangeWaypoints={multiEditing ? handleChangeMultiPoints : handleChangeGoalPoint}
               startGoalPickMode={startGoalPicking}
               startGoal={startGoal}
@@ -797,7 +823,7 @@ export default function MapPreviewPage() {
                 showWaypointNumbers={showMulti}
                 showWaypointConnections={false}
                 onChangeWaypoints={multiEditing ? handleChangeMultiPoints : handleChangeGoalPoint}
-                editable={routeEditing || multiEditing}
+                editable={canSetNavigationPoints && (routeEditing || multiEditing)}
                 regionDraftKind={regionDraftKind}
                 regionDraft={regionDraft}
                 onChangeRegionDraft={setRegionDraft}
@@ -1033,9 +1059,10 @@ export default function MapPreviewPage() {
                         icon={MapPin}
                         label={routeEditing ? "取消设置目标点" : "设置目标点"}
                         active={routeEditing}
-                        disabled={navRunning || submitting || multiBusy || startGoalPicking}
+                        disabled={!canSetNavigationPoints || navRunning || submitting || multiBusy || startGoalPicking}
                         title={
-                          navRunning ? "导航进行中不能设置目标点"
+                          !canSetNavigationPoints ? localizationBlockReason
+                            : navRunning ? "导航进行中不能设置目标点"
                             : startGoalPicking ? "设置起终点中, 先点「设置完成」"
                               : undefined
                         }
@@ -1064,8 +1091,8 @@ export default function MapPreviewPage() {
                       <PanelButton
                         icon={Play}
                         label={submitting ? "下发中…" : "开始导航"}
-                        disabled={waypoints.length === 0 || !hasPose || submitting || multiBusy || navRunning}
-                        title={waypoints.length > 0 && !hasPose ? "还没有收到机器狗位姿" : undefined}
+                        disabled={waypoints.length === 0 || !canSetNavigationPoints || submitting || multiBusy || navRunning}
+                        title={!canSetNavigationPoints ? localizationBlockReason : undefined}
                         onClick={handleStartNav}
                       />
                       {/* "停止导航"故意不按 navRunning 隐藏/切换——这是安全动作,
@@ -1090,7 +1117,8 @@ export default function MapPreviewPage() {
                   <PanelSection title="多点导航">
                     <div className="flex flex-col gap-1.5">
                       <PanelButton icon={MapPin} label={multiEditing ? "取消设置导航点" : "设置导航点"}
-                        active={multiEditing} disabled={navRunning || multiBusy || submitting}
+                        active={multiEditing} disabled={!canSetNavigationPoints || navRunning || multiBusy || submitting}
+                        title={!canSetNavigationPoints ? localizationBlockReason : undefined}
                         onClick={handleToggleMultiPick} />
                       <PanelButton icon={Trash2} label="清空导航点"
                         disabled={navRunning || multiBusy || submitting || (
@@ -1099,7 +1127,8 @@ export default function MapPreviewPage() {
                         )}
                         onClick={handleClearMultiPoints} />
                       <PanelButton icon={Play} label={multiBusy ? "处理中…" : "开始导航"}
-                        disabled={!multiPoints.length || !hasPose || (pose?.cov ?? POSE_COV_BAD) >= POSE_COV_BAD || navRunning || multiBusy || submitting || multiPlanning}
+                        disabled={!multiPoints.length || !canSetNavigationPoints || navRunning || multiBusy || submitting || multiPlanning}
+                        title={!canSetNavigationPoints ? localizationBlockReason : undefined}
                         onClick={handleStartMultiNav} />
                       <PanelButton icon={OctagonX} label="停止导航"
                         disabled={multiBusy || submitting} onClick={handleStopMultiNav} />
