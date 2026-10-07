@@ -14,6 +14,7 @@ import { useMapInfo } from "../hooks/useMapInfo";
 import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
+import { LocalizationStatus } from "../components/LocalizationStatus";
 import type {
   MapEditKind, MapEditRegion,
   PlannedRoutePoint, TrailPoint, Waypoint, XY,
@@ -74,7 +75,7 @@ export default function MapPreviewPage() {
   // 不用像 status 那样按地图过滤。
   const {
     status, optimalTraj, selfInflationEnabled, selfInflation,
-    inflationMapEnabled, inflationMap, surfCloudEnabled, surfCloud,
+    inflationMapEnabled, inflationMap, surfCloudEnabled, surfCloud, connected,
   } = useNavStatus();
   // status.map_name 只在下发路线时才会设(见 route_manager.py 的
   // submit_route), 单纯激活/预览、没提交过路线时是 null——liveStatus 优先用
@@ -705,6 +706,10 @@ export default function MapPreviewPage() {
         返回
       </Link>
 
+      {isActive && (
+        <LocalizationStatus pose={pose} updatedAt={displayStatus?.updated_at} connected={connected} />
+      )}
+
       <div className="absolute bottom-3 left-3 z-10 rounded-md border border-white/20 bg-black/40 px-3 py-1.5 text-sm text-white/80 backdrop-blur">
         {name}
       </div>
@@ -724,7 +729,7 @@ export default function MapPreviewPage() {
       </button>
 
       {navError && (
-        <div className="absolute top-16 left-1/2 z-10 -translate-x-1/2 rounded-md border border-destructive/40 bg-black/70 px-3 py-1.5 text-xs text-destructive backdrop-blur">
+        <div className={cn("absolute left-1/2 z-10 -translate-x-1/2 rounded-md border border-destructive/40 bg-black/70 px-3 py-1.5 text-xs text-destructive backdrop-blur", isActive ? "top-24" : "top-16")}>
           {navError}
         </div>
       )}
@@ -822,19 +827,19 @@ export default function MapPreviewPage() {
           )}
 
           {viewMode === "3d" && recentering ? (
-            <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
+            <div className={cn("absolute left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur", isActive ? "top-14" : "top-3")}>
               点击点云上的一个点, 把它设为新的旋转中心
             </div>
           ) : multiEditing ? (
-            <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
+            <div className={cn("absolute left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur", isActive ? "top-14" : "top-3")}>
               设置导航点中: 左键添加导航点, 右键点击导航点删除, 按编号依次导航
             </div>
           ) : routeEditing ? (
-            <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
+            <div className={cn("absolute left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur", isActive ? "top-14" : "top-3")}>
               设置目标点中: 左键点选/重新点选目标点, 右键删除
             </div>
           ) : startGoalPicking ? (
-            <div className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur">
+            <div className={cn("absolute left-1/2 z-10 -translate-x-1/2 rounded-md border border-cyan-400/40 bg-black/60 px-3 py-1.5 text-xs text-cyan-100 backdrop-blur", isActive ? "top-14" : "top-3")}>
               {!startGoal.start
                 ? "设置起终点中: 左键点选起点"
                 : !startGoal.goal
