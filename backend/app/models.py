@@ -189,6 +189,14 @@ class MapInfo(BaseModel):
     数据不区分地图, 只有明确"当前就是在这张图上跑"时叠加上去才有意义。"""
 
 
+class InitialPoseRequest(BaseModel):
+    """定位服务 map 坐标系下的位置(m)与航向(rad)。"""
+    x: float = Field(..., allow_inf_nan=False)
+    y: float = Field(..., allow_inf_nan=False)
+    z: float = Field(..., allow_inf_nan=False)
+    yaw: float = Field(..., allow_inf_nan=False)
+
+
 class ServiceInfo(BaseModel):
     """系统管理页「服务状态」卡片的一个 systemd 单元(见
     backend/app/config.py 的 SYSTEMD_SERVICES), 只有固定这几个, id 不接受任意

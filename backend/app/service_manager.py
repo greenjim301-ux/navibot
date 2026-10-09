@@ -79,6 +79,15 @@ def _find(service_id: str) -> Dict[str, str]:
 
 
 class ServiceManager:
+    def get_runtime_mode(self) -> dict:
+        """首页运行模式只看实际服务状态, 不依赖建图会话的内存记录。"""
+        if any(systemctl_status(mode["unit"])["active_state"] == "active"
+               for mode in config.MAPPING_MODES):
+            return {"mode": "mapping"}
+        if systemctl_status(config.LOCALIZATION_SERVICE_UNIT)["active_state"] == "active":
+            return {"mode": "navigation"}
+        return {"mode": "idle"}
+
     def list_status(self) -> List[dict]:
         return [self._status(svc) for svc in config.SYSTEMD_SERVICES]
 

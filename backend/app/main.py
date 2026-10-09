@@ -24,7 +24,7 @@ from .models import (
     GroundZRequest, GroundZResponse,
     MapEditRegion, MapEdits, MapTrajectoryResponse,
     MapInfo, NavStatus, MultiNavigationRequest, Waypoint, Pose, XY,
-    InflationMapRequest,
+    InflationMapRequest, InitialPoseRequest,
     MappingModeInfo, MappingStatus,
     PlanPathRequest, PlanPathResponse, PlanPathPoint,
     RouteRecord, RouteRequest,
@@ -40,7 +40,7 @@ from . import virtual_obstacles
 from .ros_bridge import RosBridge
 from .route_manager import RouteManager
 from .route_store import RouteStore, validate_route_id
-from .service_manager import ServiceManager
+from .service_manager import ServiceManager, systemctl_status
 from . import service_params
 from .ws_manager import WebSocketManager
 
@@ -234,6 +234,28 @@ async def start_multi_navigation(req: MultiNavigationRequest):
         return route_manager.start_multi_navigation(req.goals, req.map_name, _plan_multi_segment)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+def _publish_initial_pose(name: str, req: InitialPoseRequest) -> None:
+    if map_registry.get_active() != name:
+        raise ValueError("只能为当前激活地图设置初始位姿")
+    if systemctl_status(config.LOCALIZATION_SERVICE_UNIT)["active_state"] != "active":
+        raise ValueError("导航定位服务未运行，请先启动定位服务")
+    status = route_manager.get_status()
+    if status.state == "running" or (status.multi_navigation and status.multi_navigation.state == "running"):
+        raise ValueError("导航进行中，请先停止导航再设置初始位姿")
+    ros_bridge.publish_initial_pose(req.x, req.y, req.z, req.yaw)
+
+
+@app.post("/api/maps/{name}/initialpose")
+async def set_initial_pose(name: str, req: InitialPoseRequest):
+    try:
+        await run_in_threadpool(_publish_initial_pose, name, req)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    return {"published": True}
 
 
 @app.post("/api/estop", response_model=NavStatus)
@@ -614,6 +636,12 @@ async def delete_route(route_id: str):
         raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(500, str(e))
+
+
+@app.get("/api/runtime-mode")
+async def get_runtime_mode():
+    """建图优先, 其次导航定位, 其余为空闲; systemctl 查询在线程池中执行。"""
+    return await run_in_threadpool(service_manager.get_runtime_mode)
 
 
 @app.get("/api/services", response_model=List[ServiceInfo])

@@ -177,14 +177,17 @@ export default function MappingPage() {
         </AlertDialogTrigger>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>放弃当前建图?</AlertDialogTitle>
+            <AlertDialogTitle>返回地图列表?</AlertDialogTitle>
             <AlertDialogDescription>
-              返回将丢失建图进度, 已经建的图不会保存。确定要放弃吗?
+              仅返回会保留当前建图任务，建图服务继续运行；确认放弃会停止建图，未保存的建图进度将丢失。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction onClick={handleCancel} disabled={cancelling}>
+            <AlertDialogAction variant="outline" onClick={() => navigate("/maps")} disabled={cancelling}>
+              仅返回
+            </AlertDialogAction>
+            <AlertDialogAction variant="destructive" onClick={handleCancel} disabled={cancelling}>
               确认放弃
             </AlertDialogAction>
           </AlertDialogFooter>

@@ -10,12 +10,28 @@ interface Props {
   /** 数值本身的颜色, 比如"发现异常"这类需要醒目提示的统计要跟其它卡片区分开 */
   valueClassName?: string;
   action?: ReactNode;
+  onClick?: () => void;
+  busy?: boolean;
 }
 
 /** 首页/巡检结果等仪表盘页面共用的统计卡片: 图标+标签、大号数值、一句提示。 */
-export function StatCard({ label, icon, value, hint, hintClassName, valueClassName, action }: Props) {
+export function StatCard({ label, icon, value, hint, hintClassName, valueClassName, action, onClick, busy }: Props) {
   return (
-    <Card className="p-4.5">
+    <Card
+      className={`p-4.5 ${onClick ? "cursor-pointer transition-colors hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-primary" : ""}`}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      aria-label={onClick ? `${label}：${value}，进入详情` : undefined}
+      aria-busy={busy || undefined}
+      aria-disabled={onClick && busy ? true : undefined}
+      onClick={busy ? undefined : onClick}
+      onKeyDown={onClick ? (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          if (!busy) onClick();
+        }
+      } : undefined}
+    >
       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
         {icon}
         {label}

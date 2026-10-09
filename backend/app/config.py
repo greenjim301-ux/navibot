@@ -53,6 +53,11 @@ import warnings
 # SCAN-Planner 的固定坐标系名 (run.launch: world_frame_id=world)
 MAP_FRAME = os.environ.get("NAVIBOT_MAP_FRAME", "world")
 
+# 定位服务的外部初始位姿接口使用 map 坐标系, 不沿用 planner 的 world。
+INITIAL_POSE_TOPIC = "/initialpose"
+INITIAL_POSE_FRAME = "map"
+INITIAL_POSE_SUB_WAIT_S = 3.0
+
 PRESET_WAYPOINTS_TOPIC = os.environ.get("NAVIBOT_WAYPOINTS_TOPIC", "/preset_waypoints")
 # 全局规划器(global_planner.py)膨胀障碍物用的机身半径(m)。取 SCAN-Planner 自己
 # 的 grid_map/double_cylinder_radius=0.25(advanced_param.xml 里配的"双圆柱"自身

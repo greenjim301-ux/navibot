@@ -17,6 +17,7 @@ import { useNavStatus } from "../useNavStatus";
 import { PointCloudView, type PointCloudViewHandle } from "../components/PointCloudView";
 import { TopView, type TopViewHandle } from "../components/TopView";
 import { LocalizationStatus } from "../components/LocalizationStatus";
+import { InitialPoseControls } from "../components/InitialPoseControls";
 import type {
   MapEditKind, MapEditRegion,
   PlannedRoutePoint, TrailPoint, Waypoint, XY,
@@ -64,6 +65,10 @@ export default function MapPreviewPage() {
   // 2D 栅格的缩放/旋转按钮挪到页面底部居中(见下面的工具条), 不用组件自带那份
   // (TopView 传了 showControls={false})——百分比/角度靠 onViewChange 回调同步。
   const [tvView, setTvView] = useState({ zoomPercent: 100, rotationDeg: 0 });
+  const [initialPoseOpen, setInitialPoseOpen] = useState(false);
+  const [initialPosePicking, setInitialPosePicking] = useState(true);
+  const [initialPoseBusy, setInitialPoseBusy] = useState(false);
+  const [initialPose, setInitialPose] = useState<{ x: number; y: number; z: number; yaw: number } | null>(null);
 
   // 只有"激活地图"(见 backend/app/map_registry.py, 全局同时最多一张, 地图
   // 管理页可以切换)才叠加机器狗的实时状态——odom/传感器数据本身不区分地图,
@@ -105,7 +110,7 @@ export default function MapPreviewPage() {
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const pose = displayStatus?.robot_pose;
   const localizationState = useLocalizationStatus(pose, displayStatus?.updated_at, connected);
-  const canSetNavigationPoints = isActive && localizationState === "normal";
+  const canSetNavigationPoints = isActive && localizationState === "normal" && !initialPoseOpen;
   const localizationBlockReason = localizationState === "failed"
     ? "定位失败，无法设置导航点或目标点"
     : "无定位，无法设置导航点或目标点";
@@ -369,6 +374,7 @@ export default function MapPreviewPage() {
     setRouteEditing(false);
     setStartGoal({ start: null, goal: null });
     setStartGoalPicking(false);
+    setInitialPoseOpen(false); setInitialPose(null); setInitialPoseBusy(false);
     setPlannedRoute(null);
     setDispatchedRoute(null);
     return () => { goalPlanVersionRef.current += 1; multiPlanVersionRef.current += 1; };
@@ -724,6 +730,13 @@ export default function MapPreviewPage() {
     // viewportHeight 逻辑), 露出来的这圈背景要跟 topview.png 自己的"未知"灰
     // (#cdcdcd, 见 TopView.tsx 的注释)对齐, 不然黑色背景衬着图片会有明显色差。
     <div className={cn("relative h-svh overflow-hidden", viewMode === "2d" ? "bg-[#cdcdcd]" : "bg-black")}>
+      {initialPoseOpen && (
+        <InitialPoseControls key={name} mapName={name} pose={initialPose} picking={initialPosePicking}
+          onPickingChange={setInitialPosePicking} onBusyChange={setInitialPoseBusy}
+          onClear={() => setInitialPose(null)}
+          blocked={!isActive || navRunning || submitting || multiBusy}
+          onClose={() => setInitialPoseOpen(false)} />
+      )}
       <Link
         to="/maps"
         className="absolute top-3 left-3 z-10 flex items-center gap-1.5 rounded-md border border-white/20 bg-black/40 px-3 py-1.5 text-sm text-white/80 backdrop-blur transition-colors hover:bg-black/60"
@@ -807,6 +820,9 @@ export default function MapPreviewPage() {
               startGoalPickMode={startGoalPicking}
               startGoal={startGoal}
               onChangeStartGoal={setStartGoal}
+              initialPosePickMode={initialPoseOpen && initialPosePicking && !initialPoseBusy && isActive && !navRunning}
+              initialPose={initialPoseOpen ? initialPose : null}
+              onChangeInitialPose={setInitialPose}
               plannedRoute={plannedRoute}
               navRoute={isActive ? visibleRoute : null}
               selfInflation={selfInflation}
@@ -912,6 +928,7 @@ export default function MapPreviewPage() {
                         留着它会让面板一直显示"取消绘制"却没地方画。 */}
                     <Select
                       value={viewMode}
+                      disabled={initialPoseOpen}
                       onValueChange={(v) => {
                         if (v === "3d") cancelRegionDraft();
                         setViewMode(v as ViewMode);
@@ -1055,6 +1072,20 @@ export default function MapPreviewPage() {
                 {isActive && (
                   <PanelSection title="导航控制">
                     <div className="flex flex-col gap-1.5">
+                      <PanelButton
+                        icon={Target}
+                        label="外部初始位姿"
+                        disabled={navRunning || submitting || multiBusy || initialPoseOpen}
+                        title={navRunning ? "请先停止导航再设置初始位姿" : "在点云上点拖实际位置与朝向，重新定位"}
+                        onClick={() => {
+                          if (recentering) pcRef.current?.toggleRecenter();
+                          if (following) pcRef.current?.toggleFollow();
+                          setViewMode("3d");
+                          setRouteEditing(false); setMultiEditing(false); setStartGoalPicking(false);
+                          setRegionDraftKind(null);
+                          setInitialPose(null); setInitialPosePicking(true); setInitialPoseOpen(true);
+                        }}
+                      />
                       <PanelButton
                         icon={MapPin}
                         label={routeEditing ? "取消设置目标点" : "设置目标点"}

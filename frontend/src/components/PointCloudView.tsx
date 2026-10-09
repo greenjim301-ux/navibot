@@ -106,6 +106,9 @@ interface Props {
    *  waypoints/onChangeWaypoints 一致。 */
   startGoal?: { start: XY | null; goal: XY | null };
   onChangeStartGoal?: (next: { start: XY | null; goal: XY | null }) => void;
+  initialPosePickMode?: boolean;
+  initialPose?: { x: number; y: number; z: number; yaw: number } | null;
+  onChangeInitialPose?: (pose: { x: number; y: number; z: number; yaw: number } | null) => void;
   /** global_planner.plan_path 规划出来的参考路线(世界坐标 + 已补好的 z), 只
    *  负责画一条线, 不参与任何拾取逻辑——由页面在拿到 /plan_path 的响应后传入。 */
   plannedRoute?: PlannedRoutePoint[] | null;
@@ -260,8 +263,15 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
   heightLimit, controlMode = "orbit", robotMarkerStyle = "cone", onRecenterModeChange,
   routeEditMode = false, onChangeWaypoints,
   startGoalPickMode = false, startGoal, onChangeStartGoal, plannedRoute = null, navRoute = null,
+  initialPosePickMode = false, initialPose = null, onChangeInitialPose,
 }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const initialPoseModeRef = useRef(initialPosePickMode);
+  initialPoseModeRef.current = initialPosePickMode;
+  const onInitialPoseRef = useRef(onChangeInitialPose);
+  onInitialPoseRef.current = onChangeInitialPose;
+  const drawInitialPoseRef = useRef<(pose: Props["initialPose"]) => void>(() => {});
+  const syncInitialPoseModeRef = useRef<() => void>(() => {});
   // toggleRecenter/resetView 的实际实现绑定着某一套 camera/controls, 每次挂载
   // effect 重跑(meta/mapName 变化)都会换一套, 用 ref 间接调用, 这样
   // useImperativeHandle 暴露的方法本身可以是稳定引用, 不用跟着重新生成。
@@ -512,7 +522,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     let recenterMode = false;
     function syncCursor() {
       renderer.domElement.style.cursor =
-        (recenterMode || routeEditModeRef.current || startGoalPickModeRef.current) ? "crosshair" : "";
+        (recenterMode || routeEditModeRef.current || startGoalPickModeRef.current || initialPoseModeRef.current) ? "crosshair" : "";
     }
     syncCursor(); // 挂载时 routeEditMode 这个 prop 可能已经是 true(比如切完 2D 又切回 3D)
     function setRecenterMode(active: boolean) {
@@ -884,6 +894,95 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     }
     let pointerDownPos: { x: number; y: number; button: number } | null = null;
     const CLICK_MOVE_THRESHOLD_PX = 5;
+    const poseArrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1, 0xf59e0b);
+    poseArrow.visible = false;
+    [poseArrow.line, poseArrow.cone].forEach((part) => {
+      (part.material as THREE.Material).depthTest = false;
+      part.renderOrder = 999;
+    });
+    scene.add(poseArrow);
+    // 固定屏幕大小的圆点: 白色外圈 + 橙色中心, 从任意视角都能看清选点位置。
+    const poseDotGeometry = new THREE.BufferGeometry();
+    poseDotGeometry.setAttribute("position", new THREE.Float32BufferAttribute([0, 0, 0], 3));
+    const poseDotOuterMaterial = new THREE.PointsMaterial({
+      color: 0xffffff, size: 20, sizeAttenuation: false, map: dotTexture,
+      transparent: true, alphaTest: 0.5, depthTest: false, depthWrite: false,
+    });
+    const poseDotInnerMaterial = poseDotOuterMaterial.clone();
+    poseDotInnerMaterial.color.setHex(0xf59e0b);
+    poseDotInnerMaterial.size = 14;
+    const poseDotOuter = new THREE.Points(poseDotGeometry, poseDotOuterMaterial);
+    const poseDotInner = new THREE.Points(poseDotGeometry, poseDotInnerMaterial);
+    poseDotOuter.renderOrder = 1000;
+    poseDotInner.renderOrder = 1001;
+    poseDotOuter.frustumCulled = poseDotInner.frustumCulled = false;
+    poseDotOuter.visible = poseDotInner.visible = false;
+    scene.add(poseDotOuter, poseDotInner);
+    drawInitialPoseRef.current = (pose) => {
+      poseArrow.visible = Boolean(pose);
+      const position = pose ?? poseDrag?.origin;
+      poseDotOuter.visible = poseDotInner.visible = Boolean(position);
+      if (position) {
+        const attribute = poseDotGeometry.getAttribute("position") as THREE.BufferAttribute;
+        attribute.setXYZ(0, position.x, position.y, position.z);
+        attribute.needsUpdate = true;
+      }
+      if (pose) {
+        const origin = new THREE.Vector3(pose.x, pose.y, pose.z);
+        const size = 2 * camera.position.distanceTo(origin) * Math.tan(FOV * Math.PI / 360) / renderer.domElement.clientHeight * 70;
+        poseArrow.position.copy(origin);
+        poseArrow.setDirection(new THREE.Vector3(Math.cos(pose.yaw), Math.sin(pose.yaw), 0));
+        poseArrow.setLength(size, size * 0.25, size * 0.15);
+      }
+      needsRenderRef.current = true;
+    };
+    let poseDrag: { origin: THREE.Vector3; clientX: number; clientY: number; id: number } | null = null;
+    function setPoseRay(event: PointerEvent) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointerNdc.set((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1);
+      raycaster.setFromCamera(pointerNdc, camera);
+    }
+    function beginInitialPose(event: PointerEvent) {
+      if (!initialPoseModeRef.current || event.button !== 0 || !event.isPrimary) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setPoseRay(event);
+      const rect = renderer.domElement.getBoundingClientRect();
+      raycaster.params.Points!.threshold = 2 * camera.position.distanceTo(controls.target) * Math.tan(FOV * Math.PI / 360) / rect.height * 12;
+      // 初始位置必须命中可见点云, 不把空白处投影到兜底地面。
+      const pickable = points ? [points] : [];
+      loadedTiles.forEach((tile) => pickable.push(tile));
+      const hit = nearestToRayHit(raycaster.intersectObjects(pickable, false));
+      if (!hit) return;
+      const cloud = hit.object as THREE.Points;
+      const position = cloud.geometry.getAttribute("position");
+      const origin = hit.index == null ? hit.point.clone()
+        : new THREE.Vector3().fromBufferAttribute(position, hit.index).applyMatrix4(cloud.matrixWorld);
+      poseDrag = { origin, clientX: event.clientX, clientY: event.clientY, id: event.pointerId };
+      controls.enabled = false;
+      onInitialPoseRef.current?.(null);
+      drawInitialPoseRef.current(null);
+    }
+    function updateInitialPose(event: PointerEvent, finish: boolean) {
+      if (!poseDrag || event.pointerId !== poseDrag.id) return;
+      setPoseRay(event);
+      const end = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -poseDrag.origin.z), new THREE.Vector3());
+      const delta = end?.clone().sub(poseDrag.origin);
+      const valid = Math.hypot(event.clientX - poseDrag.clientX, event.clientY - poseDrag.clientY) >= 5 && delta && Math.hypot(delta.x, delta.y) > 1e-6;
+      const pose = valid ? { x: poseDrag.origin.x, y: poseDrag.origin.y, z: poseDrag.origin.z, yaw: Math.atan2(delta.y, delta.x) } : null;
+      if (finish) { poseDrag = null; controls.enabled = true; }
+      drawInitialPoseRef.current(pose);
+      if (finish) onInitialPoseRef.current?.(pose);
+    }
+    const moveInitialPose = (event: PointerEvent) => updateInitialPose(event, false);
+    const finishInitialPose = (event: PointerEvent) => updateInitialPose(event, true);
+    const cancelInitialPose = () => { if (poseDrag) { poseDrag = null; controls.enabled = true; drawInitialPoseRef.current(null); } };
+    syncInitialPoseModeRef.current = () => {
+      controls.enableRotate = !initialPoseModeRef.current;
+      if (!initialPoseModeRef.current) cancelInitialPose();
+      syncCursor();
+    };
+    syncInitialPoseModeRef.current();
 
     toggleRecenterRef.current = () => {
       setRecenterMode(!recenterMode);
@@ -971,6 +1070,7 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     }
 
     function handlePointerUp(e: PointerEvent) {
+      if (initialPoseModeRef.current) return;
       const down = pointerDownPos;
       pointerDownPos = null;
       if (!down) return;
@@ -1015,6 +1115,11 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       setRecenterMode(false);
     }
     renderer.domElement.addEventListener("pointerdown", handlePointerDown);
+    renderer.domElement.addEventListener("pointerdown", beginInitialPose, true);
+    window.addEventListener("pointermove", moveInitialPose);
+    window.addEventListener("pointerup", finishInitialPose);
+    window.addEventListener("pointercancel", cancelInitialPose);
+    window.addEventListener("blur", cancelInitialPose);
     renderer.domElement.addEventListener("pointerup", handlePointerUp);
 
     let raf = 0;
@@ -1079,6 +1184,17 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", handleResize);
       renderer.domElement.removeEventListener("pointerdown", handlePointerDown);
+      renderer.domElement.removeEventListener("pointerdown", beginInitialPose, true);
+      window.removeEventListener("pointermove", moveInitialPose);
+      window.removeEventListener("pointerup", finishInitialPose);
+      window.removeEventListener("pointercancel", cancelInitialPose);
+      window.removeEventListener("blur", cancelInitialPose);
+      poseArrow.dispose();
+      poseDotGeometry.dispose();
+      poseDotOuterMaterial.dispose();
+      poseDotInnerMaterial.dispose();
+      drawInitialPoseRef.current = () => {};
+      syncInitialPoseModeRef.current = () => {};
       renderer.domElement.removeEventListener("pointerup", handlePointerUp);
       if (tileRefreshTimer !== undefined) window.clearTimeout(tileRefreshTimer);
       loadedTiles.forEach((tilePoints) => {
@@ -1156,6 +1272,9 @@ export const PointCloudView = forwardRef<PointCloudViewHandle, Props>(function P
     if (!el) return;
     el.style.cursor = (recenterModeRef.current || routeEditMode || startGoalPickMode) ? "crosshair" : "";
   }, [routeEditMode, startGoalPickMode]);
+
+  useEffect(() => { syncInitialPoseModeRef.current(); }, [initialPosePickMode]);
+  useEffect(() => { drawInitialPoseRef.current(initialPose); }, [initialPose]);
 
   // 途经点标记 (地面高度附近的小球), waypoints 变化时更新
   useEffect(() => {

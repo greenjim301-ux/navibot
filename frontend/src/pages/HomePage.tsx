@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import {
   Battery, Bot, Camera, ChevronRight, Gauge, Pause, Play, Radar,
   Route, Satellite, Signal, Wind,
@@ -7,9 +7,16 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatCard } from "@/components/StatCard";
+import { getMappingStatus, getRuntimeMode, listMaps } from "../api";
+import type { RuntimeMode } from "../types";
 
-// 首页目前全是演示用假数据(见 PR 说明), 还没接后端——真实数据源要等
-// /api/status、电量/里程上报等接口就绪后再换。
+// 运行模式接实际 systemd 服务状态, 其余首页数据仍为演示数据。
+
+const RUNTIME_MODE_DISPLAY: Record<RuntimeMode, { value: string; hint: string }> = {
+  mapping: { value: "建图模式", hint: "建图服务运行中" },
+  navigation: { value: "导航模式", hint: "导航定位服务运行中" },
+  idle: { value: "空闲模式", hint: "建图与导航定位服务均未运行" },
+};
 
 const MODULES = [
   { name: "激光雷达", icon: Radar, ok: true },
@@ -29,7 +36,70 @@ function greeting(): string {
 }
 
 export default function HomePage() {
+  const navigate = useNavigate();
   const [taskPaused, setTaskPaused] = useState(false);
+  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode | null>(null);
+  const [modeError, setModeError] = useState(false);
+  const [openingMode, setOpeningMode] = useState(false);
+  const [modeOpenError, setModeOpenError] = useState<string | null>(null);
+
+  async function openRuntimeMode() {
+    setOpeningMode(true);
+    setModeOpenError(null);
+    try {
+      // 点击时重新查询, 避免按过期模式进入已结束的任务。
+      const { mode } = await getRuntimeMode();
+      setRuntimeMode(mode);
+      setModeError(false);
+      if (mode === "mapping") {
+        const status = await getMappingStatus();
+        if (!status.map_name || (status.state !== "running" && status.state !== "saving")) {
+          setModeOpenError("未找到正在进行的建图任务");
+          return;
+        }
+        navigate(`/mapping/${encodeURIComponent(status.map_name)}`);
+      } else if (mode === "navigation") {
+        const activeMap = (await listMaps()).find((map) => map.active);
+        if (!activeMap) {
+          setModeOpenError("没有激活地图，请先在地图管理中激活地图");
+          return;
+        }
+        navigate(`/maps/${encodeURIComponent(activeMap.name)}/preview`);
+      }
+    } catch {
+      setModeOpenError("页面打开失败，请稍后重试");
+    } finally {
+      setOpeningMode(false);
+    }
+  }
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function refreshMode() {
+      try {
+        const { mode } = await getRuntimeMode(controller.signal);
+        if (controller.signal.aborted) return;
+        setRuntimeMode(mode);
+        setModeError(false);
+      } catch {
+        if (controller.signal.aborted) return;
+        setRuntimeMode(null);
+        setModeError(true);
+      }
+      // 上次请求结束后再轮询, 避免慢查询叠加。
+      if (!controller.signal.aborted) timer = setTimeout(refreshMode, 3000);
+    }
+    void refreshMode();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, []);
+
+  const modeDisplay = runtimeMode ? RUNTIME_MODE_DISPLAY[runtimeMode] : {
+    value: "—", hint: modeError ? "服务状态获取失败" : "正在查询服务状态",
+  };
 
   return (
     <div className="px-8 py-6">
@@ -57,14 +127,11 @@ export default function HomePage() {
         <StatCard
           label="运行模式"
           icon={<Gauge className="size-4" />}
-          value="建图导航"
-          hint="自主定位与路径规划运行中"
-          hintClassName="text-success"
-          action={
-            <Button variant="ghost" size="sm" disabled title="即将上线" className="h-6 px-2 text-xs">
-              切换
-            </Button>
-          }
+          value={modeDisplay.value}
+          hint={openingMode ? "正在打开…" : modeOpenError ?? modeDisplay.hint}
+          hintClassName={modeError || modeOpenError ? "text-destructive" : runtimeMode && runtimeMode !== "idle" ? "text-success" : undefined}
+          onClick={runtimeMode === "mapping" || runtimeMode === "navigation" ? openRuntimeMode : undefined}
+          busy={openingMode}
         />
         <StatCard
           label="今日里程"
@@ -148,7 +215,7 @@ export default function HomePage() {
 }
 
 // 演示用的定位小地图: 纯装饰性网格 + 弧形路线 + 机器狗光标, 不接真实点云/栅格图
-// (首页数据现在全是假的, 真要看实际地图去"进入详情"跳地图管理)。
+// (定位小地图仍为演示数据, 实际地图可通过"进入详情"跳地图管理)。
 function MiniMapPreview() {
   return (
     <div

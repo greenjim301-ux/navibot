@@ -180,6 +180,8 @@ export function pixelToWorld(meta: Topview2D, col: number, row: number) {
  *  "navigate" 的途经点明细由随后的 submit_route 打, 这里就不重复打了。 */
 export type PlanPurpose = "preview" | "navigate";
 
+export type RuntimeMode = "mapping" | "navigation" | "idle";
+
 export type ServiceActiveState =
   | "active"
   | "inactive"

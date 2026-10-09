@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 
 import numpy as np
 import rospy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Empty
@@ -144,6 +144,7 @@ class RosBridge:
         self._on_mapping_surround_cloud = on_mapping_surround_cloud
         self._on_mapping_surf_cloud = on_mapping_surf_cloud
         self._wp_pub: Optional[rospy.Publisher] = None
+        self._initial_pose_pub: Optional[rospy.Publisher] = None
         self._estop_pub: Optional[rospy.Publisher] = None
         self._virtual_obstacle_pub: Optional[rospy.Publisher] = None
         # 最近一次发布的虚拟障碍点, 供 ROS 连上之后补发一次(latch 只对"已经发过"
@@ -177,6 +178,10 @@ class RosBridge:
 
         def _spin():
             rospy.init_node(config.ROS_NODE_NAME, anonymous=False, disable_signals=True)
+            # 一次性重定位请求不 latch, 避免定位服务重启后收到旧位姿。
+            self._initial_pose_pub = rospy.Publisher(
+                config.INITIAL_POSE_TOPIC, PoseWithCovarianceStamped, queue_size=1, latch=False,
+            )
             # queue_size=1 + 不 latch: 对齐 planner 侧的订阅方式。latch 在这里是有害的 ——
             # planner 重启后会立刻收到上一轮的路线并自己跑起来, 用户没下任何指令。
             self._wp_pub = rospy.Publisher(config.PRESET_WAYPOINTS_TOPIC, Path, queue_size=1)
@@ -472,6 +477,34 @@ class RosBridge:
             if self._mapping_tf_timer is not None:
                 self._mapping_tf_timer.shutdown()
                 self._mapping_tf_timer = None
+
+    def publish_initial_pose(self, x: float, y: float, z: float, yaw: float) -> None:
+        """发送一次外部初始位姿, 仅表示已发布, 不代表定位成功。"""
+        if self._initial_pose_pub is None:
+            raise RuntimeError("ROS bridge 尚未启动")
+        deadline = time.monotonic() + config.INITIAL_POSE_SUB_WAIT_S
+        while self._initial_pose_pub.get_num_connections() == 0:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("没有节点订阅 /initialpose，请检查定位服务")
+            time.sleep(0.05)
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = config.INITIAL_POSE_FRAME
+        msg.header.stamp = rospy.Time.now()
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.position.z = z
+        qx, qy, qz, qw = tft.quaternion_from_euler(0, 0, yaw)
+        msg.pose.pose.orientation.x = qx
+        msg.pose.pose.orientation.y = qy
+        msg.pose.pose.orientation.z = qz
+        msg.pose.pose.orientation.w = qw
+        # 与 RViz 2D Pose Estimate 的默认 XY/航向不确定度一致。
+        msg.pose.covariance[0] = 0.25
+        msg.pose.covariance[7] = 0.25
+        msg.pose.covariance[35] = (15.0 * np.pi / 180.0) ** 2
+        self._initial_pose_pub.publish(msg)
+        logger.info("initialpose published: frame=%s xyz=(%.3f, %.3f, %.3f) yaw=%.3f",
+                    config.INITIAL_POSE_FRAME, x, y, z, yaw)
 
     def publish_waypoints(self, waypoints: List[dict]) -> None:
         """下发一整轮路线。waypoints 里的 z 必须已经是 odom 系机体高度。

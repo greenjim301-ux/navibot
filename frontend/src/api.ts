@@ -2,7 +2,7 @@ import type {
   MapEditKind, MapEditRegion, MapEdits,
   MapInfo, MappingModeInfo, MappingStatus, NavStatus, PlannedRoutePoint,
   PlanPurpose, RoutePoint, RouteRecord, RouteSchedule, ServiceInfo, TrailPoint, Waypoint, XY,
-  ServiceParams,
+  RuntimeMode, ServiceParams,
 } from "./types";
 
 // 默认**同源**: 部署时前端是后端自己 host 的(见 backend/app/main.py 末尾那个
@@ -147,6 +147,15 @@ export async function listMaps(): Promise<MapInfo[]> {
 
 export async function getMap(name: string): Promise<MapInfo> {
   return asJson(await apiFetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(name)}`));
+}
+
+/** map 坐标系下的外部初始位姿; yaw 使用弧度。发布成功不等于定位成功。 */
+export async function setInitialPose(name: string, pose: { x: number; y: number; z: number; yaw: number }): Promise<{ published: boolean }> {
+  return asJson(await apiFetch(`${BACKEND_HTTP}/api/maps/${encodeURIComponent(name)}/initialpose`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(pose),
+  }));
 }
 
 export async function preprocessMap(name: string): Promise<MapInfo> {
@@ -325,8 +334,13 @@ export async function deleteRoute(id: string): Promise<void> {
   }
 }
 
-/** 系统管理页「服务状态」卡片: lidar/相机/导航定位/路线规划这几个固定的
- *  systemd 单元(见 backend/app/config.py 的 SYSTEMD_SERVICES)。 */
+/** 首页运行模式: 依据实际建图与导航定位服务状态, 建图优先。 */
+export async function getRuntimeMode(signal?: AbortSignal): Promise<{ mode: RuntimeMode }> {
+  // 最多查询 4 个建图服务和 1 个定位服务, 每次 systemctl 最长 5 秒。
+  return asJson(await apiFetch(`${BACKEND_HTTP}/api/runtime-mode`, { signal }, SERVICE_TIMEOUT_MS));
+}
+
+/** 系统管理页「服务状态」卡片: config.SYSTEMD_SERVICES 中的固定 systemd 单元。 */
 export async function listServices(): Promise<ServiceInfo[]> {
   return asJson(await apiFetch(`${BACKEND_HTTP}/api/services`));
 }
