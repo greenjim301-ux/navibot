@@ -164,6 +164,7 @@ class MultiNavigationTests(unittest.TestCase):
         self.manager.on_planning_finished(RouteManager.FINISHED_EMERGENCY_STOP)
         self.assertEqual(self.manager.get_status().multi_navigation.state, TaskState.FAILED)
         self.assertEqual(len(self.ros.routes), 1)
+        self.assertEqual(self.ros.stops, 0)
 
     def test_plan_failure_never_dispatches(self):
         def failing_plan(*_):
@@ -220,24 +221,77 @@ class MultiNavigationTests(unittest.TestCase):
         wait_for(lambda: len(self.ros.routes) == 2)
         self.assertEqual([r[-1]["x"] for r in self.ros.routes], [0, 3])
 
-    def test_stuck_segment_cancels_queue(self):
+    def test_no_progress_for_ten_minutes_still_dispatches_next_segment_on_confirmation(self):
         self.start()
         wait_for(lambda: len(self.ros.routes) == 1)
-        self.pose(0)
-        with self.manager._lock:
-            self.manager._best_dist_at = time.time() - 61
-        self.pose(0)
-        wait_for(lambda: self.manager.get_status().multi_navigation.state == TaskState.FAILED)
-        self.assertEqual(len(self.ros.routes), 1)
-        self.assertGreater(self.ros.stops, 0)
+        real_time = time.time
+        with patch('backend.app.route_manager.time.time', side_effect=lambda: real_time() + 600):
+            self.pose(0)
+            status = self.manager.get_status()
+            self.assertEqual(status.state, TaskState.RUNNING)
+            self.assertEqual(status.multi_navigation.state, TaskState.RUNNING)
+            self.assertEqual(self.ros.stops, 0)
+            self.pose(3)
+            self.manager.on_planning_finished(RouteManager.FINISHED_REACHED)
+            wait_for(lambda: len(self.ros.routes) == 2)
+        self.assertEqual(self.ros.routes[-1][-1]['x'], 6)
+        self.assertEqual(self.ros.stops, 0)
 
-    def test_localization_loss_during_execution_cancels_queue(self):
+    def test_missed_intermediate_waypoint_does_not_block_next_segment(self):
+        def segmented_plan(name, pose, goal):
+            return [PlanPathPoint(x=pose.x, y=0, z=0),
+                    PlanPathPoint(x=goal.x - 1, y=0, z=0),
+                    PlanPathPoint(x=goal.x, y=0, z=0)]
+        self.start(segmented_plan)
+        wait_for(lambda: len(self.ros.routes) == 1)
+        # Planner bypassed the first intermediate point; backend display lags.
+        self.pose(3)
+        self.assertEqual(self.manager.get_status().current_index, 0)
+        self.manager.on_planning_finished(RouteManager.FINISHED_REACHED)
+        wait_for(lambda: len(self.ros.routes) == 2)
+        self.assertEqual(self.ros.routes[-1][-1]['x'], 6)
+        self.assertEqual(self.ros.stops, 0)
+
+    def test_single_navigation_has_no_no_progress_timeout(self):
+        self.manager.submit_route([Waypoint(x=3, y=0)], map_name='test')
+        real_time = time.time
+        with patch('backend.app.route_manager.time.time', side_effect=lambda: real_time() + 600):
+            self.pose(0)
+            self.assertEqual(self.manager.get_status().state, TaskState.RUNNING)
+        self.assertEqual(self.ros.stops, 0)
+
+    def test_localization_loss_during_execution_does_not_publish_stop(self):
         self.start()
         wait_for(lambda: len(self.ros.routes) == 1)
         self.pose(0, cov=0.99)
         wait_for(lambda: self.manager.get_status().multi_navigation.state == TaskState.FAILED)
         self.assertEqual(len(self.ros.routes), 1)
-        self.assertGreater(self.ros.stops, 0)
+        self.assertEqual(self.ros.stops, 0)
+        self.assertIn('未发送停止指令', self.manager.get_status().message)
+        self.pose(0)
+        # The current planner segment remains active until user stop or finish.
+        with self.assertRaises(ValueError):
+            self.start()
+        with self.assertRaises(ValueError):
+            self.manager.submit_route([Waypoint(x=9, y=0)], map_name='test')
+        self.manager.estop()
+        self.assertEqual(self.ros.stops, 1)
+        self.assertEqual(self.manager.get_status().state, TaskState.STOPPED)
+        self.assertEqual(self.manager.get_status().multi_navigation.state, TaskState.STOPPED)
+
+    def test_failed_segment_can_finish_without_dispatching_cancelled_goals(self):
+        self.start()
+        wait_for(lambda: len(self.ros.routes) == 1)
+        self.pose(0, cov=0.99)
+        wait_for(lambda: self.manager.get_status().multi_navigation.state == TaskState.FAILED)
+        self.pose(3)
+        self.manager.on_planning_finished(RouteManager.FINISHED_REACHED)
+        self.assertEqual(len(self.ros.routes), 1)
+        self.assertEqual(self.ros.stops, 0)
+        self.assertEqual(self.manager.get_status().state, TaskState.SUCCEEDED)
+        self.assertEqual(self.manager.get_status().multi_navigation.state, TaskState.FAILED)
+        self.start()
+        wait_for(lambda: len(self.ros.routes) == 2)
 
     def test_multi_endpoint_and_shared_stop(self):
         from backend.app import main

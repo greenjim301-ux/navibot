@@ -41,7 +41,7 @@ src/planner/plan_manage/src/scan_replan_fsm.cpp 核对过:
     的那一刻——不管急停是后端调用 EMERGENCY_STOP_TOPIC 触发的, 还是 planner 内部
     fail-safe 自己触发的, 都会走这条。route_manager 只在自己还处于 RUNNING(不是
     自己发起的 estop(), 那条路径已经同步置成 STOPPED 了)时才把这个当 FAILED 处理,
-    不用再干等 STUCK_TIMEOUT_S。
+    后端不做无进展超时检测，也不会因此自动发布急停。
   - planNextWaypoint() 里另有一个 kDegenerateDist=0.05m, 只是"这个途经点和机器狗
     当前位置几乎重合, 规划出来的轨迹退化"的保护, 不是"已经到过了"的意思——正常
     间距的途经点基本不会触发。跟 REACH_EPS_M 是两个不同的常量, 对应

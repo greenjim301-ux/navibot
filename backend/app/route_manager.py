@@ -55,11 +55,10 @@ class RouteManager:
     停止靠 /planning/emergency_stop (见 estop()), 不做暂停/继续 —— 用不上,
     也没有必要维护"冻结轨迹时间"这条额外状态。
 
-    一个刻意的取舍: 途中点的"进度"是**推断**出来的, 不是 planner 逐点告诉我们
-    的。planner 可能因为局部不可达而卡在某个点上, 我们看不出区别 —— 只能看到狗
-    不动了。所以有一个卡住超时兜底, 报 FAILED 而不是一直显示"执行中"; 如果卡住
-    是因为 planner 自己触发了 fail-safe 急停, on_planning_finished 能立刻发现,
-    不用干等这个超时。
+    途中点进度仅供展示，不能用于无进展检测或自动停止：planner 可能调整目标或
+    跳点，后端的距离推断会落后。多点导航按 /planning/finished 的到达确认下发
+    下一段。后端只有用户调用 estop() 时才发布急停；执行异常只报告错误并取消
+    后续下发，已经交给 planner 的当前段可能仍在执行。
     """
 
     # scan_planner/PlanFinished 的状态常量, 照抄过来(不在这里 import ROS 消息
@@ -67,10 +66,6 @@ class RouteManager:
     # 跟 on_pose/on_optimal_traj 等其它回调是同一个规矩)。
     FINISHED_REACHED = 0
     FINISHED_EMERGENCY_STOP = 1
-
-    # 距离目标点这么久没有明显靠近就认为卡住了 (planner 侧无反馈, 只能靠超时)
-    STUCK_TIMEOUT_S = 60.0
-    STUCK_PROGRESS_EPS_M = 0.15
 
     def __init__(self, ros_bridge: RosBridge, ws_manager: WebSocketManager,
                  active_map_fn: Optional[Callable[[], Optional[str]]] = None) -> None:
@@ -95,8 +90,6 @@ class RouteManager:
         self._map_name: Optional[str] = None
         self._message: Optional[str] = None
         self._robot_pose: Optional[Pose] = None
-        self._best_dist: float = math.inf
-        self._best_dist_at: float = 0.0
         self._optimal_traj: List[dict] = []
         self._last_pose_broadcast_at: float = 0.0
         self._self_inflation_enabled: bool = False
@@ -309,7 +302,7 @@ class RouteManager:
     def submit_route(self, waypoints: List[Waypoint], label: Optional[str] = None,
                       map_name: Optional[str] = None) -> NavStatus:
         with self._lock:
-            if self._multi.state == TaskState.RUNNING:
+            if self._multi.state == TaskState.RUNNING or self._multi_dispatched:
                 raise ValueError("多点导航正在执行, 请先停止导航")
             return self._submit_route(waypoints, label, map_name)
 
@@ -336,7 +329,6 @@ class RouteManager:
             self._message = None
             self._state = TaskState.RUNNING
             self._current_index = 0
-            self._reset_stuck_locked()
             self._skip_degenerate_locked()
             self._broadcast_locked()
             status = self._status_locked()
@@ -358,9 +350,11 @@ class RouteManager:
         自己再判断"当前是不是在跑"。
         """
         with self._lock:
+            logger.info("emergency stop requested: source=user_api")
+            had_dispatched_segment = self._multi_dispatched
             # 先作废队列, 即使 ROS 停止发布失败也绝不能再下发后续点。
             self._multi_generation += 1
-            if self._multi.state == TaskState.RUNNING:
+            if self._multi.state == TaskState.RUNNING or had_dispatched_segment:
                 self._multi.state = TaskState.STOPPED
                 self._multi.message = "多点导航已停止"
             self._multi_dispatched = False
@@ -370,7 +364,7 @@ class RouteManager:
             except RuntimeError:
                 self._broadcast_locked()
                 raise
-            if self._state == TaskState.RUNNING:
+            if self._state == TaskState.RUNNING or had_dispatched_segment:
                 self._state = TaskState.STOPPED
                 self._message = "已停止, 需要重新设置并提交路线"
             self._broadcast_locked()
@@ -381,7 +375,8 @@ class RouteManager:
         if not goals:
             raise ValueError("导航点不能为空")
         with self._lock:
-            if self._state == TaskState.RUNNING or self._multi.state == TaskState.RUNNING:
+            if (self._state == TaskState.RUNNING or self._multi.state == TaskState.RUNNING
+                    or self._multi_dispatched):
                 raise ValueError("导航正在执行, 请先停止导航")
             self._require_multi_pose_locked(map_name)
             self._multi_generation += 1
@@ -463,21 +458,15 @@ class RouteManager:
                     return
                 self._multi.state = TaskState.FAILED
                 self._multi.message = f"多点导航失败, 已取消后续导航点: {exc}"
+                if self._multi_dispatched:
+                    self._multi.message += "；当前导航段未发送停止指令，如需停止请点击停止导航"
                 self._state = TaskState.FAILED
                 self._message = self._multi.message
-                if self._multi_dispatched:
-                    try:
-                        self._ros.emergency_stop()
-                    except RuntimeError:
-                        logger.exception("多点导航失败后停止 planner 失败")
-                self._multi_dispatched = False
+                # 保留已下发标志，直到 planner 完成/退出或用户停止。异常不能停止
+                # 机器狗，也不能把仍在执行的段当作空闲而接受一轮新导航。
                 self._broadcast_locked()
 
     # ---- 进度推断 ----
-    def _reset_stuck_locked(self) -> None:
-        self._best_dist = math.inf
-        self._best_dist_at = time.time()
-
     def _dist_to_locked(self, idx: int) -> float:
         """到第 idx 个途经点的 3D 距离, 和 planner 的到达判据用同一个度量。"""
         p = self._robot_pose
@@ -500,7 +489,6 @@ class RouteManager:
                 break
             self._current_index += 1
             moved = True
-            self._reset_stuck_locked()
         if moved and self._current_index >= len(self._waypoints):
             self._state = TaskState.SUCCEEDED
             self._message = "路线执行完成"
@@ -532,9 +520,8 @@ class RouteManager:
             state_before = self._state
             index_before = self._current_index
             if self._state == TaskState.RUNNING:
-                if not self._advance_reached_locked():
-                    self._check_stuck_locked()
-            # 状态机变化(到达途经点、成功、卡住失败)不受限流影响, 立刻推送;
+                self._advance_reached_locked()
+            # 到达途经点等状态机变化不受限流影响, 立刻推送;
             # 单纯的位姿刷新按 POSE_BROADCAST_HZ 限流, odom 200Hz 转发太浪费
             notable = self._state != state_before or self._current_index != index_before
             now = time.time()
@@ -555,21 +542,24 @@ class RouteManager:
             estop() 主动触发的, 那条路径已经同步把状态置成了 STOPPED, 这里的
             RUNNING 检查天然跳过, 不会把主动停止误判成失败; 能走到这里的都是
             planner 自己触发的 fail-safe(比如避障反复重规划失败), 直接判
-            FAILED, 不用再干等 STUCK_TIMEOUT_S。
+            FAILED；后端不会再向 planner 发布停止指令。
         """
         if status not in (self.FINISHED_REACHED, self.FINISHED_EMERGENCY_STOP):
             return
         with self._lock:
             state_changed = False
-            if self._multi.state == TaskState.RUNNING and self._multi_dispatched:
-                if status == self.FINISHED_REACHED:
-                    self._multi_reached = True
-                else:
-                    self._multi.state = TaskState.FAILED
-                    self._multi.message = "planner 自行触发急停, 已取消后续导航点"
+            had_dispatched_segment = self._multi_dispatched
+            if self._multi_dispatched:
+                if self._multi.state == TaskState.RUNNING:
+                    if status == self.FINISHED_REACHED:
+                        self._multi_reached = True
+                    else:
+                        self._multi.state = TaskState.FAILED
+                        self._multi.message = "planner 自行触发急停, 已取消后续导航点"
                 self._multi_dispatched = False
                 self._multi_event.set()
-            if self._state == TaskState.RUNNING:
+            if (self._state == TaskState.RUNNING
+                    or (self._state == TaskState.FAILED and had_dispatched_segment)):
                 if status == self.FINISHED_REACHED:
                     self._state = TaskState.SUCCEEDED
                     self._message = "路线执行完成 (planner 确认到达)"
@@ -682,22 +672,3 @@ class RouteManager:
             payload = self._surf_cloud_payload_locked()
         self._ws.broadcast_threadsafe({"type": "surf_cloud", "data": payload})
         return payload
-
-    def _check_stuck_locked(self) -> None:
-        """planner 不报失败, 只能靠"长时间没靠近目标"来判卡住。
-
-        比较的是历史最近距离而不是上一帧距离: 绕障时会先远离再靠近, 拿上一帧比会
-        误报。
-        """
-        d = self._dist_to_locked(self._current_index)
-        if d + self.STUCK_PROGRESS_EPS_M < self._best_dist:
-            self._best_dist = d
-            self._best_dist_at = time.time()
-            return
-        if time.time() - self._best_dist_at > self.STUCK_TIMEOUT_S:
-            self._state = TaskState.FAILED
-            self._message = (
-                f"{self.STUCK_TIMEOUT_S:.0f}s 内没有靠近第 {self._current_index + 1} 个途经点, "
-                f"当前距离 {d:.2f}m。可能是局部规划失败, 或该点的 z 不对导致到达判据永远不成立"
-            )
-            logger.warning(self._message)
