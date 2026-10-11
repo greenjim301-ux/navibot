@@ -22,8 +22,10 @@ Documentation=https://github.com/greenjim301-ux/navibot
 # 后端一起来就 rospy.init_node 连 ROS master。master 没起来时 rospy 会一直阻塞在
 # 那儿等(不是立刻失败), 所以这里不是硬依赖 —— 但 roscore 如果也是个 unit, 把它
 # 加进 After=/Wants= 能少一段"启动了但连不上"的窗口期。
-After=network-online.target
+After=network-online.target mid360.service
 Wants=network-online.target
+# 启动 navibot 时同时启动 mid360，并在 mid360 启动后再启动后端。
+Requires=mid360.service
 
 [Service]
 Type=simple
